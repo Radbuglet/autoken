@@ -7,10 +7,12 @@ use rustc_driver::{
     catch_with_exit_code, init_rustc_env_logger, install_ice_hook, Callbacks, Compilation,
     RunCompiler, DEFAULT_BUG_REPORT_URL,
 };
+use rustc_hir::def_id::DefId;
 use rustc_interface::{interface::Compiler, Queries};
 use rustc_middle::{
+    mir::Body,
     query::{ExternProviders, LocalCrate},
-    ty::TyCtxt,
+    ty::{InstanceDef, TyCtxt},
 };
 use rustc_session::{config::ErrorOutputType, search_paths::PathKind, EarlyErrorHandler};
 
@@ -18,7 +20,8 @@ use rustc_session::{config::ErrorOutputType, search_paths::PathKind, EarlyErrorH
 
 fn validate_sysroot(handler: &EarlyErrorHandler, args: &[String]) {
     if !args.iter().any(|v| v.as_str() == "--sysroot") {
-        handler.early_error("a sysroot for the analysis must be specified");
+        // TODO: Make a hard error
+        handler.early_warn("a sysroot for the analysis must be specified");
     }
 }
 
@@ -170,5 +173,17 @@ impl Callbacks for AnalyzeMirCallbacks {
         });
 
         Compilation::Stop
+    }
+}
+
+// === MIR helpers === //
+
+pub trait TyCtxtExt<'tcx> {
+    fn any_mir_body(&self, id: DefId) -> &'tcx Body<'tcx>;
+}
+
+impl<'tcx> TyCtxtExt<'tcx> for TyCtxt<'tcx> {
+    fn any_mir_body(&self, id: DefId) -> &'tcx Body<'tcx> {
+        self.instance_mir(InstanceDef::Item(id))
     }
 }
