@@ -1,9 +1,10 @@
 use std::{cell::RefCell, collections::hash_map};
 
+use rustc_data_structures::stable_hasher::Hash128;
 use smallvec::{smallvec, SmallVec};
 
 use rustc_driver::EXIT_SUCCESS;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
@@ -36,8 +37,14 @@ pub struct Analyzer<'tcx> {
 
 enum MaybeFunctionFacts {
     Pending { my_depth: u32 },
-    Done(FunctionFacts),
+    Done(FactMap<FunctionFacts>),
 }
+
+type FactMap<T> = FxHashMap<Hash128, T>;
+
+type FunctionFactsMap = FactMap<FunctionFacts>;
+
+type LeakFactsMap = FactMap<LeakFacts>;
 
 #[derive(Copy, Clone, Default)]
 struct FunctionFacts {
@@ -115,9 +122,14 @@ impl<'tcx> Analyzer<'tcx> {
             };
 
             if let Some(facts) = facts {
-                self.fn_facts
-                    .borrow_mut()
-                    .insert(my_body_id, MaybeFunctionFacts::Done(facts));
+                self.fn_facts.borrow_mut().insert(
+                    my_body_id,
+                    MaybeFunctionFacts::Done(FunctionFactsMap::from_iter([(
+                        self.tcx.type_id_hash(my_body_id.args[0].expect_ty()),
+                        facts,
+                    )])),
+                );
+
                 return u32::MAX;
             }
         }
@@ -126,7 +138,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut min_recurse_into = u32::MAX;
 
         // Also keep track of whether we are allowed to borrow things mutably in this function.
-        let mut cannot_have_mutables = false;
+        let mut cannot_have_mutables_of = FxHashSet::<Hash128>::default();
 
         // Create a blank fact entry for us. If a facts entry already exists, handle it as either a
         // cycle or a memoized result.
@@ -150,7 +162,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
         }
 
-        let mut my_facts = FunctionFacts::default();
+        let mut my_facts = FunctionFactsMap::default();
 
         // Acquire the function body
         let my_body = self.tcx.instance_mir(my_body_id.def);
@@ -159,15 +171,15 @@ impl<'tcx> Analyzer<'tcx> {
         // which components are being borrowed and the function's leaked effects.
         let mut process_stack = vec![START_BLOCK];
         let mut bb_facts = (0..my_body.basic_blocks.len())
-            .map(|_| None::<LeakFacts>)
+            .map(|_| None::<LeakFactsMap>)
             .collect::<Vec<_>>();
 
-        bb_facts[START_BLOCK.as_usize()] = Some(LeakFacts::default());
+        bb_facts[START_BLOCK.as_usize()] = Some(LeakFactsMap::default());
         bb_facts.push(None); // We use the last bb as a fake bb for all returns.
 
         while let Some(curr_id) = process_stack.pop() {
             let curr = &my_body.basic_blocks[curr_id];
-            let curr_facts = bb_facts[curr_id.as_usize()].unwrap();
+            let curr_facts = bb_facts[curr_id.as_usize()].as_ref().unwrap();
 
             // Determine whether this block could possibly call another function and collect the
             // list of basic-block targets.
@@ -255,9 +267,12 @@ impl<'tcx> Analyzer<'tcx> {
                 // ongoing mutable borrows and that, if we do have ongoing immutable borrows,
                 // then we don't be doing any mutable borrowing.
                 if this_min_recurse_level <= my_depth {
-                    assert_eq!(curr_facts.leaked_muts, 0);
-                    if curr_facts.leaked_refs > 0 {
-                        cannot_have_mutables = true;
+                    for (&comp_ty, curr_facts) in curr_facts {
+                        assert_eq!(curr_facts.leaked_muts, 0);
+
+                        if curr_facts.leaked_refs > 0 {
+                            cannot_have_mutables_of.insert(comp_ty);
+                        }
                     }
                 }
 
@@ -272,33 +287,52 @@ impl<'tcx> Analyzer<'tcx> {
                     //
                     // We also pretend as if the function did not borrow anything because the fact
                     // that it borrowed something can come from a different directly-observed call.
-                    MaybeFunctionFacts::Pending { .. } => FunctionFacts::default(),
-                    MaybeFunctionFacts::Done(facts) => *facts,
+                    MaybeFunctionFacts::Pending { .. } => FunctionFactsMap::default(),
+                    MaybeFunctionFacts::Done(facts) => facts.clone(),
                 }
             } else {
-                FunctionFacts::default()
+                FunctionFactsMap::default()
             };
 
-            // Ensure that our borrow state is consistent with what is needed by our callee.
-            if call_facts.borrows_immutably {
-                assert_eq!(curr_facts.leaked_muts, 0);
-            }
+            // Validate the facts.
+            for (comp_ty, &call_facts) in call_facts.iter() {
+                let my_facts = my_facts.entry(*comp_ty).or_default();
 
-            if call_facts.borrows_mutably {
-                assert_eq!(curr_facts.leaked_refs, 0);
-                assert_eq!(curr_facts.leaked_muts, 0);
-            }
+                // Ensure that our borrow state is consistent with what is needed by our callee.
+                if call_facts.borrows_immutably {
+                    assert_eq!(curr_facts.get(comp_ty).map_or(0, |v| v.leaked_muts), 0);
+                }
 
-            // Propagate this access fact to the current function.
-            my_facts.borrows_immutably |= call_facts.borrows_immutably;
-            my_facts.borrows_mutably |= call_facts.borrows_mutably;
+                if call_facts.borrows_mutably {
+                    let curr_facts = curr_facts
+                        .get(comp_ty)
+                        .copied()
+                        .unwrap_or(LeakFacts::default());
+
+                    assert_eq!(curr_facts.leaked_refs, 0);
+                    assert_eq!(curr_facts.leaked_muts, 0);
+                }
+
+                // Propagate this access fact to the current function.
+                my_facts.borrows_immutably |= call_facts.borrows_immutably;
+                my_facts.borrows_mutably |= call_facts.borrows_mutably;
+            }
 
             // Propagate the leak facts to the target basic blocks and determine which targets we
             // still need to process.
-            let leak_expectation = LeakFacts {
-                leaked_refs: curr_facts.leaked_refs + call_facts.leaks.leaked_refs,
-                leaked_muts: curr_facts.leaked_muts + call_facts.leaks.leaked_muts,
-            };
+            let mut leak_expectation = LeakFactsMap::default();
+
+            for (comp_ty, call_facts) in &call_facts {
+                let leak_facts = leak_expectation.entry(*comp_ty).or_default();
+                leak_facts.leaked_refs += call_facts.leaks.leaked_refs;
+                leak_facts.leaked_muts += call_facts.leaks.leaked_muts;
+            }
+
+            for (comp_ty, curr_facts) in curr_facts {
+                let leak_facts = leak_expectation.entry(*comp_ty).or_default();
+                leak_facts.leaked_refs += curr_facts.leaked_refs;
+                leak_facts.leaked_muts += curr_facts.leaked_muts;
+            }
 
             for &target in &targets {
                 let bb_target = &mut bb_facts[target.as_usize()];
@@ -306,10 +340,10 @@ impl<'tcx> Analyzer<'tcx> {
                     Some(target_facts) => {
                         // If not all paths result in the same number of leaks, there's nothing we
                         // can do to save this program.
-                        assert_eq!(*target_facts, leak_expectation);
+                        assert_eq!(target_facts, &leak_expectation);
                     }
                     None => {
-                        *bb_target = Some(leak_expectation);
+                        *bb_target = Some(leak_expectation.clone());
 
                         // It doesn't make sense to push the return basic block.
                         if target.as_usize() < bb_facts.len() - 1 {
@@ -321,22 +355,29 @@ impl<'tcx> Analyzer<'tcx> {
         }
 
         // Gather the functions leaks from the leaks of the terminator block.
-        my_facts.leaks = bb_facts
+        for (comp_ty, bb_facts) in bb_facts
             .last()
-            .copied()
             .unwrap()
-            .unwrap_or(LeakFacts::default());
+            .as_ref()
+            .unwrap_or(&LeakFactsMap::default())
+        {
+            let my_facts = my_facts.entry(*comp_ty).or_default();
 
-        // If we are self-recursive, we know that we mustn't have leaked anything. See above for
-        // an explanation of why.
-        if min_recurse_into <= my_depth {
-            assert_eq!(my_facts.leaks, LeakFacts::default());
+            my_facts.leaks = *bb_facts;
+
+            // If we are self-recursive, we know that we mustn't have leaked anything. See above for
+            // an explanation of why.
+            if min_recurse_into <= my_depth {
+                assert_eq!(my_facts.leaks, LeakFacts::default());
+            }
         }
 
         // Ensure that, if we deemed that this function is disallowed from borrowing mutably, then the
         // rule is actually enforced.
-        if cannot_have_mutables {
-            assert!(!my_facts.borrows_mutably);
+        for forbidden in cannot_have_mutables_of {
+            assert!(!my_facts
+                .get(&forbidden)
+                .is_some_and(|fact| fact.borrows_mutably));
         }
 
         // Finally, save our resolved facts.
