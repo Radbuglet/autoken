@@ -240,7 +240,20 @@ impl<'tcx> Analyzer<'tcx> {
                             _ => unreachable!(),
                         }
                     }
-                    TerminatorKind::Drop { .. } => todo!(),
+                    TerminatorKind::Drop { place, target, .. } => {
+                        let place = place.ty(&my_body.local_decls, self.tcx).ty;
+                        let place = my_body_id.subst_mir_and_normalize_erasing_regions(
+                            self.tcx,
+                            ParamEnv::reveal_all(),
+                            EarlyBinder::bind(place),
+                        );
+
+                        let dtor = place
+                            .needs_drop(self.tcx, ParamEnv::reveal_all())
+                            .then(|| Instance::resolve_drop_in_place(self.tcx, place));
+
+                        (dtor, smallvec![*target])
+                    }
 
                     //> The following terminators never happen:
 
