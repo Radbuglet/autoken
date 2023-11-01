@@ -236,8 +236,19 @@ impl<'tcx> Analyzer<'tcx> {
             // If we call a function, analyze and propagate their leaked borrows.
             let call_facts = if let Some(callee_id) = calls {
                 // Analyze the callees and determine the `min_recurse_into` depth.
-                min_recurse_into =
-                    min_recurse_into.min(self.analyze_inner(my_depth + 1, callee_id));
+                let this_min_recurse_level = self.analyze_inner(my_depth + 1, callee_id);
+
+                min_recurse_into = min_recurse_into.min(this_min_recurse_level);
+
+                // For self-recursion, we do actually have to ensure that we don't have any
+                // ongoing mutable borrows and that, if we do have ongoing immutable borrows,
+                // then we don't be doing any mutable borrowing.
+                if this_min_recurse_level <= my_depth {
+                    assert_eq!(curr_facts.leaked_muts, 0);
+                    if curr_facts.leaked_refs > 0 {
+                        cannot_have_mutables = true;
+                    }
+                }
 
                 // Determine the facts of this callee.
                 match &self.fn_facts.borrow()[&callee_id] {
@@ -250,17 +261,7 @@ impl<'tcx> Analyzer<'tcx> {
                     //
                     // We also pretend as if the function did not borrow anything because the fact
                     // that it borrowed something can come from a different directly-observed call.
-                    MaybeFunctionFacts::Pending { .. } => {
-                        // For self-recursion, we do actually have to ensure that we don't have any
-                        // ongoing mutable borrows and that, if we do have ongoing immutable borrows,
-                        // then we don't be doing any mutable borrowing.
-                        assert_eq!(curr_facts.leaked_muts, 0);
-                        if curr_facts.leaked_refs > 0 {
-                            cannot_have_mutables = true;
-                        }
-
-                        FunctionFacts::default()
-                    }
+                    MaybeFunctionFacts::Pending { .. } => FunctionFacts::default(),
                     MaybeFunctionFacts::Done(facts) => *facts,
                 }
             } else {
