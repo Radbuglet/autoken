@@ -8,11 +8,9 @@ use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
     mir::{BasicBlock, TerminatorKind, START_BLOCK},
-    ty::{TyCtxt, TyKind},
+    ty::{EarlyBinder, Instance, ParamEnv, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
-
-use crate::mir_reader::TyCtxtExt;
 
 // === Driver === //
 
@@ -33,7 +31,7 @@ impl AnalyzerConfig {
 
 pub struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
-    fn_facts: RefCell<FxHashMap<DefId, MaybeFunctionFacts>>,
+    fn_facts: RefCell<FxHashMap<Instance<'tcx>, MaybeFunctionFacts>>,
 }
 
 enum MaybeFunctionFacts {
@@ -64,7 +62,7 @@ impl<'tcx> Analyzer<'tcx> {
 
     /// Analyzes every function which is reachable from `body_id`.
     pub fn analyze(&self, body_id: DefId) {
-        let _ = self.analyze_inner(0, body_id);
+        let _ = self.analyze_inner(0, Instance::mono(self.tcx, body_id));
     }
 
     /// Attempts to discover the facts about the provided function.
@@ -72,10 +70,10 @@ impl<'tcx> Analyzer<'tcx> {
     /// Returns the inclusive depth of the lowest function on the stack we were able able to cycle
     /// back into or `u32::MAX` if the target never called a function which was already being analyzed.
     #[must_use]
-    fn analyze_inner(&self, my_depth: u32, my_body_id: DefId) -> u32 {
+    fn analyze_inner(&self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
         // If `my_body_id` corresponds to an autoken primitive, just hardcode its value.
         {
-            let item_name = self.tcx.item_name(my_body_id);
+            let item_name = self.tcx.item_name(my_body_id.def_id());
             let facts = if item_name == Symbol::intern("__autoken_borrow_mutably") {
                 Some(FunctionFacts {
                     borrows_immutably: true,
@@ -155,7 +153,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut my_facts = FunctionFacts::default();
 
         // Acquire the function body
-        let my_body = self.tcx.any_mir_body(my_body_id);
+        let my_body = self.tcx.instance_mir(my_body_id.def);
 
         // Now, we have to analyze the basic blocks' calling in some arbitrary order to determine both
         // which components are being borrowed and the function's leaked effects.
@@ -177,7 +175,7 @@ impl<'tcx> Analyzer<'tcx> {
             // N.B. we intentionally ignore panics because they complicate analysis a lot and the
             // program is already broken by that point so we probably shouldn't bother ensuring that
             // those are safe.
-            let (calls, targets): (Option<DefId>, SmallVec<[_; 2]>) =
+            let (calls, targets): (_, SmallVec<[_; 2]>) =
                 match &curr.terminator.as_ref().unwrap().kind {
                     //> The following terminators have no effects and are just connectors to other blocks.
                     TerminatorKind::Goto { target } | TerminatorKind::Assert { target, .. } => {
@@ -209,9 +207,22 @@ impl<'tcx> Analyzer<'tcx> {
                     //> The following terminators may call into other functions and, therefore, may
                     //> have effects.
                     TerminatorKind::Call { func, target, .. } => {
-                        match func.ty(&my_body.local_decls, self.tcx).kind() {
-                            TyKind::FnDef(callee_id, _) => {
-                                (Some(*callee_id), (*target).into_iter().collect())
+                        let func = func.ty(&my_body.local_decls, self.tcx);
+                        let func = my_body_id.subst_mir_and_normalize_erasing_regions(
+                            self.tcx,
+                            ParamEnv::reveal_all(),
+                            EarlyBinder::bind(func),
+                        );
+                        match func.kind() {
+                            TyKind::FnDef(callee_id, generics) => {
+                                let callee_id = Instance::expect_resolve(
+                                    self.tcx,
+                                    ParamEnv::reveal_all(),
+                                    *callee_id,
+                                    generics,
+                                );
+
+                                (Some(callee_id), (*target).into_iter().collect())
                             }
                             TyKind::FnPtr(_) => todo!(),
                             _ => unreachable!(),
@@ -223,7 +234,7 @@ impl<'tcx> Analyzer<'tcx> {
 
                     // Yield is not permitted after generator lowering, which we force before our
                     // analysis.
-                    TerminatorKind::Yield { .. } | TerminatorKind::GeneratorDrop => {
+                    TerminatorKind::Yield { .. } | TerminatorKind::GeneratorDrop { .. } => {
                         unreachable!("generators should have been lowered by this point")
                     }
 
