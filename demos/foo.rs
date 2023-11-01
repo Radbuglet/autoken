@@ -1,23 +1,24 @@
 fn main() {
-    let foo = Foo;
-    let woo_fn = if dummy() { woo } else { waz };
-    woo_fn();
-
-    std::process::exit(1);
+    woo();
 }
 
-fn woo() {}
+fn woo() {
+    __autoken_borrow_mutably();
+    __autoken_unborrow_mutably();
 
-fn waz() {}
-
-fn dummy() -> bool {
-    std::hint::black_box(true)
+    war();
 }
 
-struct Foo;
-
-impl Drop for Foo {
-    fn drop(&mut self) {
-        waz();
-    }
+fn war() {
+    __autoken_borrow_immutably();
+    woo();
+    __autoken_unborrow_immutably();
 }
+
+fn __autoken_borrow_mutably() {}
+
+fn __autoken_borrow_immutably() {}
+
+fn __autoken_unborrow_mutably() {}
+
+fn __autoken_unborrow_immutably() {}

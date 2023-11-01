@@ -7,4 +7,4 @@ edition = "2021"
 rustc_private = true
 
 [dependencies]
-petgraph = "0.6.4"
+smallvec = "1.11.1"
