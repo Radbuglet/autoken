@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::hash_map};
 use rustc_data_structures::stable_hasher::Hash128;
 use smallvec::{smallvec, SmallVec};
 
-use rustc_driver::{EXIT_FAILURE, EXIT_SUCCESS};
+use rustc_driver::EXIT_SUCCESS;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
@@ -20,8 +20,7 @@ pub struct AnalyzerConfig {}
 impl AnalyzerConfig {
     pub fn analyze(&mut self, _compiler: &Compiler, tcx: TyCtxt<'_>) -> i32 {
         let Some((main_fn, _)) = tcx.entry_fn(()) else {
-            tcx.sess.err("no analysis entrypoint found");
-            return EXIT_FAILURE;
+            return EXIT_SUCCESS;
         };
         let analyzer = Analyzer::new(tcx);
 
