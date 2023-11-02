@@ -1,6 +1,5 @@
 use std::{cell::RefCell, collections::hash_map};
 
-use rustc_data_structures::stable_hasher::Hash128;
 use smallvec::{smallvec, SmallVec};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -8,7 +7,7 @@ use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
     mir::{BasicBlock, TerminatorKind, START_BLOCK},
-    ty::{EarlyBinder, Instance, ParamEnv, TyCtxt, TyKind},
+    ty::{EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
 
@@ -34,19 +33,19 @@ impl AnalyzerConfig {
 
 pub struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
-    fn_facts: RefCell<FxHashMap<Instance<'tcx>, MaybeFunctionFacts>>,
+    fn_facts: RefCell<FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>>,
 }
 
-enum MaybeFunctionFacts {
+enum MaybeFunctionFacts<'tcx> {
     Pending { my_depth: u32 },
-    Done(FactMap<FunctionFacts>),
+    Done(FactMap<'tcx, FunctionFacts>),
 }
 
-type FactMap<T> = FxHashMap<Hash128, T>;
+type FactMap<'tcx, T> = FxHashMap<Ty<'tcx>, T>;
 
-type FunctionFactsMap = FactMap<FunctionFacts>;
+type FunctionFactsMap<'tcx> = FactMap<'tcx, FunctionFacts>;
 
-type LeakFactsMap = FactMap<LeakFacts>;
+type LeakFactsMap<'tcx> = FactMap<'tcx, LeakFacts>;
 
 #[derive(Copy, Clone)]
 struct FunctionFacts {
@@ -146,7 +145,7 @@ impl<'tcx> Analyzer<'tcx> {
                 self.fn_facts.borrow_mut().insert(
                     my_body_id,
                     MaybeFunctionFacts::Done(FunctionFactsMap::from_iter([(
-                        self.tcx.type_id_hash(my_body_id.args[0].expect_ty()),
+                        self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty()),
                         facts,
                     )])),
                 );
@@ -159,7 +158,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut min_recurse_into = u32::MAX;
 
         // Also keep track of whether we are allowed to borrow things mutably in this function.
-        let mut cannot_have_mutables_of = FxHashSet::<Hash128>::default();
+        let mut cannot_have_mutables_of = FxHashSet::<Ty>::default();
 
         // Create a blank fact entry for us. If a facts entry already exists, handle it as either a
         // cycle or a memoized result.
