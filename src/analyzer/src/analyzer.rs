@@ -48,11 +48,21 @@ type FunctionFactsMap = FactMap<FunctionFacts>;
 
 type LeakFactsMap = FactMap<LeakFacts>;
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone)]
 struct FunctionFacts {
-    borrows_immutably: bool,
-    borrows_mutably: bool,
+    max_enter_immutable_borrows: i32,
+    max_enter_mutable_borrows: i32,
     leaks: LeakFacts,
+}
+
+impl Default for FunctionFacts {
+    fn default() -> Self {
+        Self {
+            max_enter_immutable_borrows: i32::MAX,
+            max_enter_mutable_borrows: i32::MAX,
+            leaks: LeakFacts::default(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -85,8 +95,8 @@ impl<'tcx> Analyzer<'tcx> {
             let item_name = self.tcx.item_name(my_body_id.def_id());
             let facts = if item_name == Symbol::intern("__autoken_borrow_mutably") {
                 Some(FunctionFacts {
-                    borrows_immutably: true,
-                    borrows_mutably: true,
+                    max_enter_mutable_borrows: 0,
+                    max_enter_immutable_borrows: 0,
                     leaks: LeakFacts {
                         leaked_muts: 1,
                         leaked_refs: 0,
@@ -94,8 +104,8 @@ impl<'tcx> Analyzer<'tcx> {
                 })
             } else if item_name == Symbol::intern("__autoken_unborrow_mutably") {
                 Some(FunctionFacts {
-                    borrows_immutably: false,
-                    borrows_mutably: false,
+                    max_enter_mutable_borrows: i32::MAX,
+                    max_enter_immutable_borrows: i32::MAX,
                     leaks: LeakFacts {
                         leaked_muts: -1,
                         leaked_refs: 0,
@@ -103,8 +113,8 @@ impl<'tcx> Analyzer<'tcx> {
                 })
             } else if item_name == Symbol::intern("__autoken_borrow_immutably") {
                 Some(FunctionFacts {
-                    borrows_immutably: true,
-                    borrows_mutably: false,
+                    max_enter_immutable_borrows: i32::MAX,
+                    max_enter_mutable_borrows: 0,
                     leaks: LeakFacts {
                         leaked_muts: 0,
                         leaked_refs: 1,
@@ -112,8 +122,8 @@ impl<'tcx> Analyzer<'tcx> {
                 })
             } else if item_name == Symbol::intern("__autoken_unborrow_immutably") {
                 Some(FunctionFacts {
-                    borrows_immutably: false,
-                    borrows_mutably: false,
+                    max_enter_mutable_borrows: i32::MAX,
+                    max_enter_immutable_borrows: i32::MAX,
                     leaks: LeakFacts {
                         leaked_muts: 0,
                         leaked_refs: -1,
@@ -312,25 +322,26 @@ impl<'tcx> Analyzer<'tcx> {
             // Validate the facts.
             for (comp_ty, &call_facts) in call_facts.iter() {
                 let my_facts = my_facts.entry(*comp_ty).or_default();
+                let curr_facts = curr_facts.get(comp_ty).copied().unwrap_or_default();
 
-                // Ensure that our borrow state is consistent with what is needed by our callee.
-                if call_facts.borrows_immutably {
-                    assert_eq!(curr_facts.get(comp_ty).map_or(0, |v| v.leaked_muts), 0);
-                }
+                // Adjust the max enter borrow counters appropriately.
+                //
+                // my_facts.max_enter_(im)mutable_borrows + curr_facts.leaked_(im)mutables
+                // 	  <= call_facts.max_enter_(im)mutable_borrows
+                //
+                // So:
+                //
+                // my_facts.max_enter_(im)mutable_borrows <=
+                //    call_facts.max_enter_(im)mutable_borrows - curr_facts.leaked_(im)mutables
+                //
+                my_facts.max_enter_mutable_borrows = (my_facts.max_enter_mutable_borrows)
+                    .min(call_facts.max_enter_mutable_borrows - curr_facts.leaked_muts);
 
-                if call_facts.borrows_mutably {
-                    let curr_facts = curr_facts
-                        .get(comp_ty)
-                        .copied()
-                        .unwrap_or(LeakFacts::default());
+                my_facts.max_enter_immutable_borrows = (my_facts.max_enter_immutable_borrows)
+                    .min(call_facts.max_enter_immutable_borrows - curr_facts.leaked_refs);
 
-                    assert_eq!(curr_facts.leaked_refs, 0);
-                    assert_eq!(curr_facts.leaked_muts, 0);
-                }
-
-                // Propagate this access fact to the current function.
-                my_facts.borrows_immutably |= call_facts.borrows_immutably;
-                my_facts.borrows_mutably |= call_facts.borrows_mutably;
+                assert!(my_facts.max_enter_mutable_borrows >= 0);
+                assert!(my_facts.max_enter_immutable_borrows >= 0);
             }
 
             // Propagate the leak facts to the target basic blocks and determine which targets we
@@ -411,7 +422,8 @@ impl<'tcx> Analyzer<'tcx> {
         for forbidden in cannot_have_mutables_of {
             assert!(!my_facts
                 .get(&forbidden)
-                .is_some_and(|fact| fact.borrows_mutably));
+                // TODO: Verify validity of this claim.
+                .is_some_and(|fact| fact.max_enter_mutable_borrows != i32::MAX));
         }
 
         // Finally, save our resolved facts.
