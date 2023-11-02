@@ -5,39 +5,44 @@ use std::{path::PathBuf, process, rc::Rc};
 
 use rustc_driver::{
     catch_with_exit_code, init_rustc_env_logger, install_ice_hook, Callbacks, Compilation,
-    RunCompiler, DEFAULT_BUG_REPORT_URL,
+    RunCompiler,
 };
-use rustc_hir::def_id::DefId;
+
 use rustc_interface::{interface::Compiler, Queries};
 use rustc_middle::{
-    mir::Body,
     query::{ExternProviders, LocalCrate},
-    ty::{InstanceDef, TyCtxt},
+    ty::TyCtxt,
 };
 use rustc_session::{config::ErrorOutputType, search_paths::PathKind, EarlyErrorHandler};
 
-// === `compile_collect_mir` === //
+type AnalyzerFn = Box<dyn FnMut(&Compiler, TyCtxt<'_>) + Send>;
 
-/// Runs the rustc compiler as usual but hooks the query system to ensure that the MIR for non-local
-/// crates is also saved.
-pub fn compile_collect_mir(rustc_args: &[String]) -> ! {
+/// Runs a regular session of `rustc` but ensures that external MIR is stored away in each crate's
+/// `.rlib` file and gives an `AnalyzerFn` the opportunity to analyze the code after the MIR has been
+/// successfully constructed.
+pub fn compile_analyze_mir(
+    rustc_args: &[String],
+    ice_url: &'static str,
+    analyzer: AnalyzerFn,
+) -> ! {
     // Install rustc's default logger
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
 
-    // Install rustc's default ICE reporting systems. We report ICEs to them because we're essentially
-    // running a regular rustc invocation with a special config.
-    install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
+    // Install rustc's default ICE reporting systems.
+    install_ice_hook(ice_url, |_| ());
 
     // Run the compiler with the user's specified arguments
     process::exit(catch_with_exit_code(|| {
-        RunCompiler::new(rustc_args, &mut CollectMirCallbacks).run()
+        RunCompiler::new(rustc_args, &mut AnalyzeMirCallbacks { analyzer }).run()
     }));
 }
 
-struct CollectMirCallbacks;
+struct AnalyzeMirCallbacks {
+    analyzer: AnalyzerFn,
+}
 
-impl Callbacks for CollectMirCallbacks {
+impl Callbacks for AnalyzeMirCallbacks {
     fn config(&mut self, config: &mut rustc_interface::Config) {
         use rustc_hir as hir;
         use rustc_middle::middle::exported_symbols as sym;
@@ -47,9 +52,9 @@ impl Callbacks for CollectMirCallbacks {
             return;
         }
 
-        // Queries overridden here affect the data stored in `rmeta` files of dependencies, which
-        // will be used later in a later program invocation running `compile_analyze_mir`.
-        config.override_queries = Some(|_session, local_providers, _extern_providers| {
+        // Override the queries such that external symbols are exported to and imported from the
+        // crate's rlib file.
+        config.override_queries = Some(|_sess, local_providers, extern_providers| {
             local_providers.exported_symbols = |tcx, LocalCrate| {
                 let reachable_set = tcx
                     .with_stable_hashing_context(|hcx| tcx.reachable_set(()).to_sorted(&hcx, true));
@@ -91,40 +96,8 @@ impl Callbacks for CollectMirCallbacks {
                         ))
                     }),
                 )
-            }
-        });
-    }
-}
+            };
 
-// === `compile_analyze_mir` === //
-
-type AnalyzerFn = Box<dyn FnMut(&Compiler, TyCtxt<'_>) -> i32 + Send>;
-
-pub fn compile_analyze_mir(
-    rustc_args: &[String],
-    ice_url: &'static str,
-    analyzer: AnalyzerFn,
-) -> ! {
-    // Install rustc's default logger
-    let handler = EarlyErrorHandler::new(ErrorOutputType::default());
-    init_rustc_env_logger(&handler);
-
-    // Install rustc's default ICE reporting systems.
-    install_ice_hook(ice_url, |_| ());
-
-    // Run the compiler with the user's specified arguments
-    process::exit(catch_with_exit_code(|| {
-        RunCompiler::new(rustc_args, &mut AnalyzeMirCallbacks { analyzer }).run()
-    }));
-}
-
-struct AnalyzeMirCallbacks {
-    analyzer: AnalyzerFn,
-}
-
-impl Callbacks for AnalyzeMirCallbacks {
-    fn config(&mut self, config: &mut rustc_interface::Config) {
-        config.override_queries = Some(|_sess, _local_providers, extern_providers| {
             extern_providers.used_crate_source = |tcx, cnum| {
                 let mut providers = ExternProviders::default();
                 rustc_metadata::provide_extern(&mut providers);
@@ -146,27 +119,12 @@ impl Callbacks for AnalyzeMirCallbacks {
     ) -> Compilation {
         queries.global_ctxt().unwrap().enter(|tcx| {
             // Ensure that this is valid MIR
-            if tcx.sess.compile_status().is_err() {
-                tcx.sess
-                    .fatal("cannot analyze programs which failed compilation");
+            if tcx.sess.compile_status().is_ok() {
+                // Run the user-provided analyzer
+                (self.analyzer)(compiler, tcx);
             }
-
-            // Run the user-provided analyzer
-            process::exit((self.analyzer)(compiler, tcx));
         });
 
-        Compilation::Stop
-    }
-}
-
-// === MIR helpers === //
-
-pub trait TyCtxtExt<'tcx> {
-    fn any_mir_body(&self, id: DefId) -> &'tcx Body<'tcx>;
-}
-
-impl<'tcx> TyCtxtExt<'tcx> for TyCtxt<'tcx> {
-    fn any_mir_body(&self, id: DefId) -> &'tcx Body<'tcx> {
-        self.instance_mir(InstanceDef::Item(id))
+        Compilation::Continue
     }
 }

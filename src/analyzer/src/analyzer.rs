@@ -3,7 +3,6 @@ use std::{cell::RefCell, collections::hash_map};
 use rustc_data_structures::stable_hasher::Hash128;
 use smallvec::{smallvec, SmallVec};
 
-use rustc_driver::EXIT_SUCCESS;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
@@ -18,15 +17,16 @@ use rustc_span::Symbol;
 pub struct AnalyzerConfig {}
 
 impl AnalyzerConfig {
-    pub fn analyze(&mut self, _compiler: &Compiler, tcx: TyCtxt<'_>) -> i32 {
+    pub fn analyze(&mut self, _compiler: &Compiler, tcx: TyCtxt<'_>) {
         let Some((main_fn, _)) = tcx.entry_fn(()) else {
-            return EXIT_SUCCESS;
+            return;
         };
         let analyzer = Analyzer::new(tcx);
 
         analyzer.analyze(main_fn);
 
-        EXIT_SUCCESS
+        // FIXME: This should not be necessary but currently is because `cc` doesn't work properly.
+        std::process::exit(0);
     }
 }
 
