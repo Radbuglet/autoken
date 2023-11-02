@@ -339,7 +339,7 @@ impl<'tcx> Analyzer<'tcx> {
             let mut leak_expectation = LeakFactsMap::default();
 
             for (comp_ty, call_facts) in &call_facts {
-                if call_facts.leaks.leaked_refs > 0 || call_facts.leaks.leaked_muts > 0 {
+                if call_facts.leaks.leaked_refs != 0 || call_facts.leaks.leaked_muts != 0 {
                     let leak_facts = leak_expectation.entry(*comp_ty).or_default();
                     leak_facts.leaked_refs = call_facts.leaks.leaked_refs;
                     leak_facts.leaked_muts = call_facts.leaks.leaked_muts;
@@ -361,7 +361,7 @@ impl<'tcx> Analyzer<'tcx> {
                         }
                     }
                     hash_map::Entry::Vacant(leak_facts) => {
-                        if curr_facts.leaked_refs > 0 || curr_facts.leaked_muts > 0 {
+                        if curr_facts.leaked_refs != 0 || curr_facts.leaked_muts != 0 {
                             leak_facts.insert(*curr_facts);
                         }
                     }
