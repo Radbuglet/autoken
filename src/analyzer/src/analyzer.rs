@@ -313,12 +313,18 @@ impl<'tcx> Analyzer<'tcx> {
                 if this_min_recurse_level <= my_depth {
                     for (&comp_ty, curr_facts) in curr_facts {
                         if curr_facts.leaked_muts > 0 {
+                            let leaked_muts = curr_facts.leaked_muts;
+
                             self.tcx.sess.span_err(
-								span,
-								"this function calls itself recursively while holding a net-positive \
-								 number of mutable borrows meaning that, if it does reach this same \
-								 path again, it may mutably borrow the same component more than once",
-							);
+                                span,
+                                format!(
+                                    "this function calls itself recursively while holding at least
+                                     {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
+                                     it does reach this same call again, it may mutably borrow the \
+                                     same component more than once",
+                                    s_pluralize(leaked_muts),
+                                ),
+                            );
                         }
 
                         if curr_facts.leaked_refs > 0 {
@@ -375,7 +381,7 @@ impl<'tcx> Analyzer<'tcx> {
                         span,
                         format!(
                             "called a function expecting at most {max_enter_mut} mutable borrow{} of \
-							type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
+                            type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
                             s_pluralize(max_enter_mut),
                         ),
                     );
@@ -394,10 +400,10 @@ impl<'tcx> Analyzer<'tcx> {
                     self.tcx.sess.span_err(
                         span,
                         format!(
-							"called a function expecting at most {max_enter_ref} immutable borrow{} of \
-							type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
-							s_pluralize(max_enter_ref),
-						),
+                            "called a function expecting at most {max_enter_ref} immutable borrow{} of \
+                            type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
+                            s_pluralize(max_enter_ref),
+                        ),
                     );
                 }
 
@@ -453,8 +459,8 @@ impl<'tcx> Analyzer<'tcx> {
                             // produce useful diagnostics.
                             self.tcx.sess.span_err(
                                 span,
-                                "not all control-flow paths to this statement are guaranteed to borrow
-								 the same number of components",
+                                "not all control-flow paths to this statement are guaranteed to borrow \
+                                 the same number of components",
                             );
                         }
                     }
@@ -486,8 +492,10 @@ impl<'tcx> Analyzer<'tcx> {
             if min_recurse_into <= my_depth && my_facts.leaks != LeakFacts::default() {
                 self.tcx.sess.span_err(
                     my_body.span,
-                    "this function self-recurses yet has the ability to leak borrows, meaning that \
-					 it could theoretically leak an arbitrary number of borrows",
+                    format!(
+                        "this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
+                         meaning that it could theoretically leak an arbitrary number of borrows",
+                    ),
                 );
             }
         }
@@ -502,10 +510,10 @@ impl<'tcx> Analyzer<'tcx> {
                 self.tcx.sess.span_err(
                     my_body.span,
                     format!(
-						"this function self-recurses while holding an immutable borrow to {forbidden:?} \
-						 but holds the potential of borrowing that same component mutably somewhere \
-						 in the function body",
-					),
+                        "this function self-recurses while holding an immutable borrow to {forbidden:?} \
+                         but holds the potential of borrowing that same component mutably somewhere \
+                         in the function body",
+                    ),
                 );
             }
         }
