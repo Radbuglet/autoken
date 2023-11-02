@@ -10,7 +10,7 @@ use rustc_middle::{
     mir::{BasicBlock, TerminatorKind, START_BLOCK},
     ty::{EarlyBinder, Instance, ParamEnv, TyCtxt, TyKind},
 };
-use rustc_span::{Span, Symbol};
+use rustc_span::Symbol;
 
 // === Driver === //
 
@@ -83,7 +83,7 @@ impl<'tcx> Analyzer<'tcx> {
 
     /// Analyzes every function which is reachable from `body_id`.
     pub fn analyze(&self, body_id: DefId) {
-        let _ = self.analyze_inner(0, Instance::mono(self.tcx, body_id), Span::default());
+        let _ = self.analyze_inner(0, Instance::mono(self.tcx, body_id));
     }
 
     /// Attempts to discover the facts about the provided function.
@@ -91,12 +91,7 @@ impl<'tcx> Analyzer<'tcx> {
     /// Returns the inclusive depth of the lowest function on the stack we were able able to cycle
     /// back into or `u32::MAX` if the target never called a function which was already being analyzed.
     #[must_use]
-    fn analyze_inner(
-        &self,
-        my_depth: u32,
-        my_body_id: Instance<'tcx>,
-        last_safe_span: Span,
-    ) -> u32 {
+    fn analyze_inner(&self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
         // If `my_body_id` corresponds to an autoken primitive, just hardcode its value.
         'hardcode: {
             let Some(item_name) = self.tcx.opt_item_name(my_body_id.def_id()) else {
@@ -302,29 +297,30 @@ impl<'tcx> Analyzer<'tcx> {
                 }
             };
 
-            // Ensure that the span we chose is actually in the local crate source. If it isn't, fall
-            // back to the last safe span.
-            let contained_in = if !my_body_id.def_id().is_local() {
-                span = last_safe_span;
-                true
-            } else {
-                false
-            };
-
             // If we call a function, analyze and propagate their leaked borrows.
             let call_facts = if let Some(callee_id) = calls {
                 // Analyze the callees and determine the `min_recurse_into` depth.
-                let this_min_recurse_level = self.analyze_inner(my_depth + 1, callee_id, span);
+                let this_min_recurse_level = self.analyze_inner(my_depth + 1, callee_id);
 
                 min_recurse_into = min_recurse_into.min(this_min_recurse_level);
 
                 // For self-recursion, we do actually have to ensure that we don't have any
                 // ongoing mutable borrows and that, if we do have ongoing immutable borrows,
                 // then we don't be doing any mutable borrowing.
+                //
+                // N.B. we only care about the counts of borrows relative to this current
+                // function. If the outside scope already has some active borrows, it will
+                // yield the error using regular maximum allowable borrow semantics.
                 if this_min_recurse_level <= my_depth {
-                    // FIXME: This analysis of concurrent borrows might be wrong.
                     for (&comp_ty, curr_facts) in curr_facts {
-                        assert_eq!(curr_facts.leaked_muts, 0);
+                        if curr_facts.leaked_muts > 0 {
+                            self.tcx.sess.span_err(
+								span,
+								"this function calls itself recursively while holding a net-positive \
+								 number of mutable borrows meaning that, if it does reach this same \
+								 path again, it may mutably borrow the same component more than once",
+							);
+                        }
 
                         if curr_facts.leaked_refs > 0 {
                             cannot_have_mutables_of.insert(comp_ty);
@@ -379,9 +375,8 @@ impl<'tcx> Analyzer<'tcx> {
                     self.tcx.sess.span_err(
                         span,
                         format!(
-                            "{}called a function expecting at most {max_enter_mut} mutable borrow{} of \
+                            "called a function expecting at most {max_enter_mut} mutable borrow{} of \
 							type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
-                            if contained_in { "this function " } else { "" },
                             s_pluralize(max_enter_mut),
                         ),
                     );
@@ -400,9 +395,8 @@ impl<'tcx> Analyzer<'tcx> {
                     self.tcx.sess.span_err(
                         span,
                         format!(
-							"{}called a function expecting at most {max_enter_ref} immutable borrow{} of \
+							"called a function expecting at most {max_enter_ref} immutable borrow{} of \
 							type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
-							if contained_in { "this function " } else { "" },
 							s_pluralize(max_enter_ref),
 						),
                     );
@@ -460,11 +454,8 @@ impl<'tcx> Analyzer<'tcx> {
                             // produce useful diagnostics.
                             self.tcx.sess.span_err(
                                 span,
-                                format!(
-                                    "not all control-flow paths {} this statement are guaranteed to \
-									 borrow the same number of components",
-                                    if contained_in { "in functions called by" } else { "to" },
-                                ),
+                                "not all control-flow paths to this statement are guaranteed to borrow
+								 the same number of components",
                             );
                         }
                     }
