@@ -1,13 +1,28 @@
-use autoken::{analyzer::AnalyzerConfig, mir_reader::compile_analyze_mir};
+use autoken::{
+    analyzer::AnalyzerConfig,
+    mir_reader::{compile_analyze_mir, compile_collect_mir},
+};
+
+const MULTIPLEX_ENV: &str = "AUTOKEN_DRIVER_MODE";
+const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
 
 fn main() {
-    let mut analyzer = AnalyzerConfig {};
+    let rustc_args = std::env::args().collect::<Vec<_>>();
 
-    let second_arg = std::env::args().nth(1).expect("missing path");
-
-    compile_analyze_mir(
-        &["autoken".into(), second_arg],
-        "example.com",
-        Box::new(move |compiler, tcx| analyzer.analyze(compiler, tcx)),
-    );
+    match std::env::var(MULTIPLEX_ENV) {
+        Ok(var) if var == "compile" => {
+            compile_collect_mir(&rustc_args);
+        }
+        Ok(var) if var == "analyze" => {
+            compile_analyze_mir(
+                &rustc_args,
+                ICE_URL,
+                Box::new(|compiler, tcx| AnalyzerConfig {}.analyze(compiler, tcx)),
+            );
+        }
+        _ => panic!(
+			"the environment variable {MULTIPLEX_ENV} was set to neither `compile` nor `analyze` so \
+		     we have no clue how to handle this request",
+		),
+    }
 }

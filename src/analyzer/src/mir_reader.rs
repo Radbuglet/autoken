@@ -16,15 +16,6 @@ use rustc_middle::{
 };
 use rustc_session::{config::ErrorOutputType, search_paths::PathKind, EarlyErrorHandler};
 
-// === Helpers === //
-
-fn validate_sysroot(handler: &EarlyErrorHandler, args: &[String]) {
-    if !args.iter().any(|v| v.as_str() == "--sysroot") {
-        // TODO: Make a hard error
-        handler.early_warn("a sysroot for the analysis must be specified");
-    }
-}
-
 // === `compile_collect_mir` === //
 
 /// Runs the rustc compiler as usual but hooks the query system to ensure that the MIR for non-local
@@ -33,10 +24,6 @@ pub fn compile_collect_mir(rustc_args: &[String]) -> ! {
     // Install rustc's default logger
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
-
-    // Ensure that we have a sysroot specified because, otherwise, our target directory may get
-    // really clobbered!
-    validate_sysroot(&handler, rustc_args);
 
     // Install rustc's default ICE reporting systems. We report ICEs to them because we're essentially
     // running a regular rustc invocation with a special config.
@@ -121,10 +108,6 @@ pub fn compile_analyze_mir(
     // Install rustc's default logger
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
-
-    // Ensure that we have a sysroot specified because, otherwise, our target directory may get
-    // really clobbered!
-    validate_sysroot(&handler, rustc_args);
 
     // Install rustc's default ICE reporting systems.
     install_ice_hook(ice_url, |_| ());
