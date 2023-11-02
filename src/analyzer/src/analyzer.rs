@@ -334,19 +334,38 @@ impl<'tcx> Analyzer<'tcx> {
             }
 
             // Propagate the leak facts to the target basic blocks and determine which targets we
-            // still need to process.
+            // still need to process. We make sure to strip our `leak_expectation` map of empty
+            // entries to ensure that there's only one valid encoding of it.
             let mut leak_expectation = LeakFactsMap::default();
 
             for (comp_ty, call_facts) in &call_facts {
-                let leak_facts = leak_expectation.entry(*comp_ty).or_default();
-                leak_facts.leaked_refs += call_facts.leaks.leaked_refs;
-                leak_facts.leaked_muts += call_facts.leaks.leaked_muts;
+                if call_facts.leaks.leaked_refs > 0 || call_facts.leaks.leaked_muts > 0 {
+                    let leak_facts = leak_expectation.entry(*comp_ty).or_default();
+                    leak_facts.leaked_refs = call_facts.leaks.leaked_refs;
+                    leak_facts.leaked_muts = call_facts.leaks.leaked_muts;
+                }
             }
 
             for (comp_ty, curr_facts) in curr_facts {
-                let leak_facts = leak_expectation.entry(*comp_ty).or_default();
-                leak_facts.leaked_refs += curr_facts.leaked_refs;
-                leak_facts.leaked_muts += curr_facts.leaked_muts;
+                match leak_expectation.entry(*comp_ty) {
+                    hash_map::Entry::Occupied(mut leak_facts) => {
+                        let new_facts = LeakFacts {
+                            leaked_refs: leak_facts.get().leaked_refs + curr_facts.leaked_refs,
+                            leaked_muts: leak_facts.get().leaked_muts + curr_facts.leaked_muts,
+                        };
+
+                        if new_facts == LeakFacts::default() {
+                            leak_facts.remove();
+                        } else {
+                            *leak_facts.get_mut() = new_facts;
+                        }
+                    }
+                    hash_map::Entry::Vacant(leak_facts) => {
+                        if curr_facts.leaked_refs > 0 || curr_facts.leaked_muts > 0 {
+                            leak_facts.insert(*curr_facts);
+                        }
+                    }
+                }
             }
 
             for &target in &targets {
