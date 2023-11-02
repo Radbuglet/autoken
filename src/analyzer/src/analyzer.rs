@@ -318,7 +318,7 @@ impl<'tcx> Analyzer<'tcx> {
                             self.tcx.sess.span_err(
                                 span,
                                 format!(
-                                    "this function calls itself recursively while holding at least
+                                    "this function calls itself recursively while holding at least \
                                      {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
                                      it does reach this same call again, it may mutably borrow the \
                                      same component more than once",
