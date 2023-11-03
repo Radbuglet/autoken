@@ -26,7 +26,7 @@ impl AnalyzerConfig {
 
         let mut analyzer = Analyzer::new(tcx);
         analyzer.collect_dyn(Instance::mono(tcx, main_fn));
-        analyzer.analyze(main_fn);
+        // analyzer.analyze(main_fn);
 
         // FIXME: This should not be necessary but currently is because `cc` doesn't work properly.
         std::process::exit(0);
@@ -42,7 +42,7 @@ pub struct Analyzer<'tcx> {
     visited_fns_during_collection: FxHashSet<Instance<'tcx>>,
 
     // Maps from function pointers to specific function instances.
-    collected_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+    collected_fn_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
 
     // Stores analysis facts about each analyzed function monomorphization.
     fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
@@ -89,7 +89,7 @@ impl<'tcx> Analyzer<'tcx> {
         Self {
             tcx,
             visited_fns_during_collection: Default::default(),
-            collected_impls: Default::default(),
+            collected_fn_impls: Default::default(),
             fn_facts: Default::default(),
         }
     }
@@ -141,7 +141,7 @@ impl<'tcx> Analyzer<'tcx> {
                             generics,
                         );
 
-                        self.collected_impls
+                        self.collected_fn_impls
                             .entry(from_ty)
                             .or_default()
                             .insert(instance);
@@ -160,7 +160,7 @@ impl<'tcx> Analyzer<'tcx> {
                             generics,
                         );
 
-                        self.collected_impls
+                        self.collected_fn_impls
                             .entry(from_ty)
                             .or_default()
                             .insert(instance);
@@ -174,11 +174,8 @@ impl<'tcx> Analyzer<'tcx> {
                         // - https://github.com/rust-lang/rust/blob/a2f5f9691b6ce64c1703feaf9363710dfd7a56cf/compiler/rustc_middle/src/ty/vtable.rs#L50
 
                         // Finds the type the coercion actually changed.
-                        let (from_ty, to_ty) = self.tcx.struct_lockstep_tails_erasing_lifetimes(
-                            from_ty,
-                            to_ty,
-                            ParamEnv::reveal_all(),
-                        );
+                        // TODO: Handle other CoerceUnsized structures
+                        let (from_ty, to_ty) = (from_ty.peel_refs(), to_ty.peel_refs());
 
                         // Ensures that we're analyzing a dynamic type unsizing coercion.
                         let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
@@ -203,11 +200,17 @@ impl<'tcx> Analyzer<'tcx> {
                             };
 
                             // Now, get the concrete implementation of this method.
-                            // TODO
+                            let concrete = Instance::expect_resolve(
+                                self.tcx,
+                                ParamEnv::reveal_all(),
+                                vtbl_method.def_id(),
+                                self.tcx.mk_args(&[from_ty.into()]),
+                            );
 
                             // Add it to the set and recurse into it to ensure its latent dynamic
-                            // coercions are also captured
-                            // TODO
+                            // coercions are also captured.
+                            // TODO: Don't forget to collect into a map
+                            self.collect_dyn(concrete);
                         }
                     }
                     _ => {}
@@ -215,7 +218,47 @@ impl<'tcx> Analyzer<'tcx> {
             }
 
             // Recurse into the things this block could call.
-            // TODO
+            match &my_block.terminator.as_ref().unwrap().kind {
+                TerminatorKind::Call { func, .. } => {
+                    let func = func.ty(&my_body.local_decls, self.tcx);
+                    let func = my_body_id.subst_mir_and_normalize_erasing_regions(
+                        self.tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(func),
+                    );
+
+                    let TyKind::FnDef(callee_id, generics) = func.kind() else {
+                        continue;
+                    };
+
+                    let callee_id = Instance::expect_resolve(
+                        self.tcx,
+                        ParamEnv::reveal_all(),
+                        *callee_id,
+                        generics,
+                    );
+
+                    self.collect_dyn(callee_id);
+                }
+                TerminatorKind::Drop { place, .. } => {
+                    let place = place.ty(&my_body.local_decls, self.tcx).ty;
+                    let place = my_body_id.subst_mir_and_normalize_erasing_regions(
+                        self.tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(place),
+                    );
+
+                    let Some(dtor) = place
+                        .needs_drop(self.tcx, ParamEnv::reveal_all())
+                        .then(|| Instance::resolve_drop_in_place(self.tcx, place))
+                    else {
+                        continue;
+                    };
+
+                    self.collect_dyn(dtor);
+                }
+                _ => {}
+            }
         }
     }
 
