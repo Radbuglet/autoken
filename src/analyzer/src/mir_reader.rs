@@ -29,7 +29,7 @@ pub fn compile_analyze_mir(
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
 
-    // Install rustc's default ICE reporting systems.
+    // Install a custom ICE hook for ourselves
     install_ice_hook(ice_url, |_| ());
 
     // Run the compiler with the user's specified arguments

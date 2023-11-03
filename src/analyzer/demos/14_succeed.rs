@@ -1,6 +1,9 @@
 fn main() {
     let foo: &dyn Demo = &();
     foo.do_something();
+
+    let bar: Box<dyn Demo> = Box::new(());
+    bar.do_something();
 }
 
 trait Demo {

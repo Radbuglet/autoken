@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::hash_map};
+use std::collections::hash_map;
 
 use smallvec::{smallvec, SmallVec};
 
@@ -6,8 +6,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
-    mir::{BasicBlock, TerminatorKind, START_BLOCK},
-    ty::{EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind},
+    mir::{BasicBlock, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
+    ty::{
+        adjustment::PointerCoercion, EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind, VtblEntry,
+    },
 };
 use rustc_span::Symbol;
 
@@ -17,11 +19,13 @@ pub struct AnalyzerConfig {}
 
 impl AnalyzerConfig {
     pub fn analyze(&mut self, _compiler: &Compiler, tcx: TyCtxt<'_>) {
+        // Only run our analysis if this binary has an entry point.
         let Some((main_fn, _)) = tcx.entry_fn(()) else {
             return;
         };
-        let analyzer = Analyzer::new(tcx);
 
+        let mut analyzer = Analyzer::new(tcx);
+        analyzer.collect_dyn(Instance::mono(tcx, main_fn));
         analyzer.analyze(main_fn);
 
         // FIXME: This should not be necessary but currently is because `cc` doesn't work properly.
@@ -33,7 +37,15 @@ impl AnalyzerConfig {
 
 pub struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
-    fn_facts: RefCell<FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>>,
+
+    // The set of instances visited during collection.
+    visited_fns_during_collection: FxHashSet<Instance<'tcx>>,
+
+    // Maps from function pointers to specific function instances.
+    collected_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+
+    // Stores analysis facts about each analyzed function monomorphization.
+    fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
 }
 
 enum MaybeFunctionFacts<'tcx> {
@@ -76,12 +88,139 @@ impl<'tcx> Analyzer<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
+            visited_fns_during_collection: Default::default(),
+            collected_impls: Default::default(),
             fn_facts: Default::default(),
         }
     }
 
+    /// Collects dynamic dispatch targets reachable from `my_body_id`.
+    pub fn collect_dyn(&mut self, my_body_id: Instance<'tcx>) {
+        // Ensure that we haven't analyzed this function yet.
+        if !self.visited_fns_during_collection.insert(my_body_id) {
+            return;
+        }
+
+        // TODO: Ensure that we can actually get the MIR for this body.
+        let my_body = self.tcx.instance_mir(my_body_id.def);
+
+        for my_block in my_body.basic_blocks.iter() {
+            // Look for coercions which can introduce new dynamic callees.
+            for stmt in &my_block.statements {
+                let StatementKind::Assign(stmt) = &stmt.kind else {
+                    continue;
+                };
+                let (_place, rvalue) = &**stmt;
+
+                let Rvalue::Cast(CastKind::PointerCoercion(kind), from_op, to_ty) = rvalue else {
+                    continue;
+                };
+
+                let from_ty = my_body_id.subst_mir_and_normalize_erasing_regions(
+                    self.tcx,
+                    ParamEnv::reveal_all(),
+                    EarlyBinder::bind(from_op.ty(&my_body.local_decls, self.tcx)),
+                );
+
+                let to_ty = my_body_id.subst_mir_and_normalize_erasing_regions(
+                    self.tcx,
+                    ParamEnv::reveal_all(),
+                    EarlyBinder::bind(*to_ty),
+                );
+
+                match kind {
+                    PointerCoercion::ReifyFnPointer => {
+                        let TyKind::FnDef(def, generics) = from_ty.kind() else {
+                            unreachable!()
+                        };
+
+                        let instance = Instance::expect_resolve(
+                            self.tcx,
+                            ParamEnv::reveal_all(),
+                            *def,
+                            generics,
+                        );
+
+                        self.collected_impls
+                            .entry(from_ty)
+                            .or_default()
+                            .insert(instance);
+
+                        self.collect_dyn(instance);
+                    }
+                    PointerCoercion::ClosureFnPointer(_) => {
+                        let TyKind::Closure(def, generics) = from_ty.kind() else {
+                            unreachable!()
+                        };
+
+                        let instance = Instance::expect_resolve(
+                            self.tcx,
+                            ParamEnv::reveal_all(),
+                            *def,
+                            generics,
+                        );
+
+                        self.collected_impls
+                            .entry(from_ty)
+                            .or_default()
+                            .insert(instance);
+
+                        self.collect_dyn(instance);
+                    }
+                    PointerCoercion::Unsize => {
+                        // This code is largely copied from:
+                        // - https://github.com/rust-lang/rust/blob/master/compiler/rustc_codegen_cranelift/src/unsize.rs
+                        // - https://github.com/rust-lang/rust/blob/master/compiler/rustc_codegen_cranelift/src/vtable.rs#L90
+                        // - https://github.com/rust-lang/rust/blob/a2f5f9691b6ce64c1703feaf9363710dfd7a56cf/compiler/rustc_middle/src/ty/vtable.rs#L50
+
+                        // Finds the type the coercion actually changed.
+                        let (from_ty, to_ty) = self.tcx.struct_lockstep_tails_erasing_lifetimes(
+                            from_ty,
+                            to_ty,
+                            ParamEnv::reveal_all(),
+                        );
+
+                        // Ensures that we're analyzing a dynamic type unsizing coercion.
+                        let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
+                            continue;
+                        };
+
+                        // Extract the principal non-auto-type from the dynamic type.
+                        let Some(binder) = binders.principal() else {
+                            continue;
+                        };
+
+                        // Do some magic with binders... I guess.
+                        let binder = self.tcx.erase_regions(binder.with_self_ty(self.tcx, to_ty));
+
+                        // Get the actual methods which make up the trait's vtable since those are
+                        // the things we can actually call.
+                        let vtable_entries = self.tcx.vtable_entries(binder);
+
+                        for vtable_entry in vtable_entries {
+                            let VtblEntry::Method(vtbl_method) = vtable_entry else {
+                                continue;
+                            };
+
+                            // Now, get the concrete implementation of this method.
+                            // TODO
+
+                            // Add it to the set and recurse into it to ensure its latent dynamic
+                            // coercions are also captured
+                            // TODO
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Recurse into the things this block could call.
+            // TODO
+        }
+    }
+
     /// Analyzes every function which is reachable from `body_id`.
-    pub fn analyze(&self, body_id: DefId) {
+    pub fn analyze(&mut self, body_id: DefId) {
         let _ = self.analyze_inner(0, Instance::mono(self.tcx, body_id));
     }
 
@@ -90,7 +229,7 @@ impl<'tcx> Analyzer<'tcx> {
     /// Returns the inclusive depth of the lowest function on the stack we were able able to cycle
     /// back into or `u32::MAX` if the target never called a function which was already being analyzed.
     #[must_use]
-    fn analyze_inner(&self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
+    fn analyze_inner(&mut self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
         // If `my_body_id` corresponds to an autoken primitive, just hardcode its value.
         'hardcode: {
             let Some(item_name) = self.tcx.opt_item_name(my_body_id.def_id()) else {
@@ -142,7 +281,7 @@ impl<'tcx> Analyzer<'tcx> {
             };
 
             if let Some(facts) = facts {
-                self.fn_facts.borrow_mut().insert(
+                self.fn_facts.insert(
                     my_body_id,
                     MaybeFunctionFacts::Done(FunctionFactsMap::from_iter([(
                         self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty()),
@@ -162,7 +301,7 @@ impl<'tcx> Analyzer<'tcx> {
 
         // Create a blank fact entry for us. If a facts entry already exists, handle it as either a
         // cycle or a memoized result.
-        match self.fn_facts.borrow_mut().entry(my_body_id) {
+        match self.fn_facts.entry(my_body_id) {
             hash_map::Entry::Occupied(entry) => {
                 return match entry.get() {
                     // This may not actually be the true depth of the lowest function we could cycle
@@ -334,7 +473,7 @@ impl<'tcx> Analyzer<'tcx> {
                 }
 
                 // Determine the facts of this callee.
-                match &self.fn_facts.borrow()[&callee_id] {
+                match &self.fn_facts[&callee_id] {
                     // If the function was pending, we know that it calls itself recursively. We can
                     // assume that the only valid choice for a recursively called function is to not
                     // leak anything because, if it did leak a borrow, one could construct an MIR
@@ -519,8 +658,7 @@ impl<'tcx> Analyzer<'tcx> {
         }
 
         // Finally, save our resolved facts.
-        *self.fn_facts.borrow_mut().get_mut(&my_body_id).unwrap() =
-            MaybeFunctionFacts::Done(my_facts);
+        *self.fn_facts.get_mut(&my_body_id).unwrap() = MaybeFunctionFacts::Done(my_facts);
 
         min_recurse_into
     }
