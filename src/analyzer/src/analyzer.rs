@@ -7,8 +7,10 @@ use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
     mir::{BasicBlock, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
+    traits::util::supertraits,
     ty::{
-        adjustment::PointerCoercion, EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind, VtblEntry,
+        adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, ParamEnv, Ty, TyCtxt,
+        TyKind, VtblEntry,
     },
 };
 use rustc_span::Symbol;
@@ -26,7 +28,7 @@ impl AnalyzerConfig {
 
         let mut analyzer = Analyzer::new(tcx);
         analyzer.collect_dyn(Instance::mono(tcx, main_fn));
-        // analyzer.analyze(main_fn);
+        analyzer.analyze(main_fn);
 
         // FIXME: This should not be necessary but currently is because `cc` doesn't work properly.
         std::process::exit(0);
@@ -43,6 +45,9 @@ pub struct Analyzer<'tcx> {
 
     // Maps from function pointers to specific function instances.
     collected_fn_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+
+    // Maps from trait methods to specific implementations.
+    collected_trait_impls: FxHashMap<Instance<'tcx>, FxHashSet<Instance<'tcx>>>,
 
     // Stores analysis facts about each analyzed function monomorphization.
     fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
@@ -90,6 +95,7 @@ impl<'tcx> Analyzer<'tcx> {
             tcx,
             visited_fns_during_collection: Default::default(),
             collected_fn_impls: Default::default(),
+            collected_trait_impls: Default::default(),
             fn_facts: Default::default(),
         }
     }
@@ -142,7 +148,7 @@ impl<'tcx> Analyzer<'tcx> {
                         );
 
                         self.collected_fn_impls
-                            .entry(from_ty)
+                            .entry(to_ty)
                             .or_default()
                             .insert(instance);
 
@@ -161,7 +167,7 @@ impl<'tcx> Analyzer<'tcx> {
                         );
 
                         self.collected_fn_impls
-                            .entry(from_ty)
+                            .entry(to_ty)
                             .or_default()
                             .insert(instance);
 
@@ -188,29 +194,44 @@ impl<'tcx> Analyzer<'tcx> {
                         };
 
                         // Do some magic with binders... I guess.
-                        let binder = self.tcx.erase_regions(binder.with_self_ty(self.tcx, to_ty));
+                        let base_binder =
+                            self.tcx.erase_regions(binder.with_self_ty(self.tcx, to_ty));
 
-                        // Get the actual methods which make up the trait's vtable since those are
-                        // the things we can actually call.
-                        let vtable_entries = self.tcx.vtable_entries(binder);
+                        for binder in supertraits(self.tcx, base_binder) {
+                            let trait_id = self.tcx.erase_late_bound_regions(binder);
 
-                        for vtable_entry in vtable_entries {
-                            let VtblEntry::Method(vtbl_method) = vtable_entry else {
-                                continue;
-                            };
+                            // Get the actual methods which make up the trait's vtable since those are
+                            // the things we can actually call.
+                            let vtable_entries = self.tcx.vtable_entries(binder);
 
-                            // Now, get the concrete implementation of this method.
-                            let concrete = Instance::expect_resolve(
-                                self.tcx,
-                                ParamEnv::reveal_all(),
-                                vtbl_method.def_id(),
-                                self.tcx.mk_args(&[from_ty.into()]),
-                            );
+                            for vtable_entry in vtable_entries {
+                                let VtblEntry::Method(vtbl_method) = vtable_entry else {
+                                    continue;
+                                };
 
-                            // Add it to the set and recurse into it to ensure its latent dynamic
-                            // coercions are also captured.
-                            // TODO: Don't forget to collect into a map
-                            self.collect_dyn(concrete);
+                                // Now, get the concrete implementation of this method.
+                                let concrete = Instance::expect_resolve(
+                                    self.tcx,
+                                    ParamEnv::reveal_all(),
+                                    vtbl_method.def_id(),
+                                    self.tcx.mk_args(
+                                        [GenericArg::from(from_ty)]
+                                            .into_iter()
+                                            .chain(trait_id.args.iter().skip(1))
+                                            .collect::<Vec<_>>()
+                                            .as_slice(),
+                                    ),
+                                );
+
+                                // Add it to the set and recurse into it to ensure its latent dynamic
+                                // coercions are also captured.
+                                self.collected_trait_impls
+                                    .entry(*vtbl_method)
+                                    .or_default()
+                                    .insert(concrete);
+
+                                self.collect_dyn(concrete);
+                            }
                         }
                     }
                     _ => {}
@@ -367,6 +388,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut my_facts = FunctionFactsMap::default();
 
         // Acquire the function body
+        // TODO: Ensure that this actually works.
         let my_body = self.tcx.instance_mir(my_body_id.def);
 
         // Now, we have to analyze the basic blocks' calling in some arbitrary order to determine both

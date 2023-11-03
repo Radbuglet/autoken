@@ -1,14 +1,15 @@
 fn main() {
-    let foo: &dyn Demo = &();
+    let foo: &dyn Demo<_> = &();
 }
 
-trait Demo {
-    fn do_something(&self);
+trait Demo<T> {
+    fn do_something(&self) -> T;
 }
 
-impl Demo for () {
-    fn do_something(&self) {
+impl Demo<f32> for () {
+    fn do_something(&self) -> f32 {
         kaz();
+        3.14
     }
 }
 
