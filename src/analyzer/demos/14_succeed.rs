@@ -1,5 +1,6 @@
 fn main() {
     let foo: &dyn Demo<_> = &();
+    foo.do_something();
 }
 
 trait Demo<T> {

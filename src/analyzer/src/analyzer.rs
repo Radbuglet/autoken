@@ -6,11 +6,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
-    mir::{BasicBlock, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
+    mir::{BasicBlock, Body, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
     traits::util::supertraits,
     ty::{
-        adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, ParamEnv, Ty, TyCtxt,
-        TyKind, VtblEntry,
+        adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, InstanceDef, ParamEnv, Ty,
+        TyCtxt, TyKind, VtblEntry,
     },
 };
 use rustc_span::Symbol;
@@ -107,8 +107,11 @@ impl<'tcx> Analyzer<'tcx> {
             return;
         }
 
-        // TODO: Ensure that we can actually get the MIR for this body.
-        let my_body = self.tcx.instance_mir(my_body_id.def);
+        // Grab the MIR for this instance. If it's an unavailable dynamic dispatch shim, just ignore
+        // it because we handle dynamic dispatch ourselves.
+        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, false) else {
+            return;
+        };
 
         for my_block in my_body.basic_blocks.iter() {
             // Look for coercions which can introduce new dynamic callees.
@@ -248,6 +251,7 @@ impl<'tcx> Analyzer<'tcx> {
                         EarlyBinder::bind(func),
                     );
 
+                    // We can ignore function pointers since they are visited in a different way.
                     let TyKind::FnDef(callee_id, generics) = func.kind() else {
                         continue;
                     };
@@ -388,8 +392,11 @@ impl<'tcx> Analyzer<'tcx> {
         let mut my_facts = FunctionFactsMap::default();
 
         // Acquire the function body
-        // TODO: Ensure that this actually works.
-        let my_body = self.tcx.instance_mir(my_body_id.def);
+        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, true) else {
+            // Because of the true flag to `safeishly_grab_instance_mir`, we know that if it finds
+            // unavailable MIR, that MIR will not be able to call back into the userland.
+            return u32::MAX;
+        };
 
         // Now, we have to analyze the basic blocks' calling in some arbitrary order to determine both
         // which components are being borrowed and the function's leaked effects.
@@ -567,8 +574,8 @@ impl<'tcx> Analyzer<'tcx> {
                 //
                 // So:
                 //
-                // my_facts.max_enter_(im)mutable_borrows <=
-                //    call_facts.max_enter_(im)mutable_borrows - curr_facts.leaked_(im)mutables
+                // my_facts.max_enter_(im)mutable_borrows
+                //    <= call_facts.max_enter_(im)mutable_borrows - curr_facts.leaked_(im)mutables
                 //
 
                 let constrict_max_enter_mut = call_facts
@@ -735,4 +742,43 @@ fn s_pluralize(v: i32) -> &'static str {
     } else {
         "s"
     }
+}
+
+fn safeishly_grab_instance_mir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: InstanceDef<'tcx>,
+    bug_if_unavailable_but_can_return_to_user: bool,
+) -> Option<&'tcx Body<'tcx>> {
+    let is_safe = match instance {
+        // Items are defined by users and thus have MIR... even if they're from an external crate.
+        InstanceDef::Item(_) => true,
+
+        // All the remaining things here require shims. We referenced...
+        //
+        // https://github.com/rust-lang/rust/blob/9c20ddd956426d577d77cb3f57a7db2227a3c6e9/compiler/rustc_mir_transform/src/shim.rs#L29
+        //
+        // ...to figure out which instance def types support this operation.
+
+        // These are always supported.
+        InstanceDef::ThreadLocalShim(_)
+        | InstanceDef::DropGlue(_, _)
+        | InstanceDef::ClosureOnceShim { .. }
+        | InstanceDef::CloneShim(_, _)
+        | InstanceDef::FnPtrAddrShim(_, _) => true,
+
+        // These are never supported and will never return to the user.
+        InstanceDef::Intrinsic(_) => false,
+
+        // These are dynamic dispatches and should not be analyzed since we analyze them in a
+        // different way.
+        InstanceDef::VTableShim(_)
+        | InstanceDef::ReifyShim(_)
+        | InstanceDef::FnPtrShim(_, _)
+        | InstanceDef::Virtual(_, _) => {
+            assert!(!bug_if_unavailable_but_can_return_to_user);
+            false
+        }
+    };
+
+    is_safe.then(|| tcx.instance_mir(instance))
 }
