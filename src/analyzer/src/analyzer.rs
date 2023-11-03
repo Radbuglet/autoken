@@ -21,17 +21,19 @@ pub struct AnalyzerConfig {}
 
 impl AnalyzerConfig {
     pub fn analyze(&mut self, _compiler: &Compiler, tcx: TyCtxt<'_>) {
+        if std::env::var("AUTOKEN_SKIP_ANALYSIS").is_ok() {
+            return;
+        }
+
         // Only run our analysis if this binary has an entry point.
         let Some((main_fn, _)) = tcx.entry_fn(()) else {
             return;
         };
 
+        // Run the analysis and let the compiler take over when we're done.
         let mut analyzer = Analyzer::new(tcx);
         analyzer.collect_dyn(Instance::mono(tcx, main_fn));
         analyzer.analyze(main_fn);
-
-        // FIXME: This should not be necessary but currently is because `cc` doesn't work properly.
-        std::process::exit(0);
     }
 }
 
@@ -392,7 +394,9 @@ impl<'tcx> Analyzer<'tcx> {
         let mut my_facts = FunctionFactsMap::default();
 
         // Acquire the function body
-        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, true) else {
+
+        // TODO: Set the last argument to true and handle things properly
+        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, false) else {
             // Because of the true flag to `safeishly_grab_instance_mir`, we know that if it finds
             // unavailable MIR, that MIR will not be able to call back into the userland.
             return u32::MAX;
@@ -474,7 +478,8 @@ impl<'tcx> Analyzer<'tcx> {
 
                             (Some(callee_id), (*target).into_iter().collect())
                         }
-                        TyKind::FnPtr(_) => todo!(),
+                        // TODO: actually handle this
+                        TyKind::FnPtr(_) => (None, (*target).into_iter().collect()),
                         _ => unreachable!(),
                     }
                 }
@@ -526,7 +531,7 @@ impl<'tcx> Analyzer<'tcx> {
                         if curr_facts.leaked_muts > 0 {
                             let leaked_muts = curr_facts.leaked_muts;
 
-                            self.tcx.sess.span_err(
+                            self.tcx.sess.span_warn(
                                 span,
                                 format!(
                                     "this function calls itself recursively while holding at least \
@@ -588,7 +593,7 @@ impl<'tcx> Analyzer<'tcx> {
                     let max_enter_mut = call_facts.max_enter_mut;
                     let leaked_muts = curr_facts.leaked_muts;
 
-                    self.tcx.sess.span_err(
+                    self.tcx.sess.span_warn(
                         span,
                         format!(
                             "called a function expecting at most {max_enter_mut} mutable borrow{} of \
@@ -608,7 +613,7 @@ impl<'tcx> Analyzer<'tcx> {
                     let max_enter_ref = call_facts.max_enter_ref;
                     let leaked_refs = curr_facts.leaked_refs;
 
-                    self.tcx.sess.span_err(
+                    self.tcx.sess.span_warn(
                         span,
                         format!(
                             "called a function expecting at most {max_enter_ref} immutable borrow{} of \
@@ -668,7 +673,7 @@ impl<'tcx> Analyzer<'tcx> {
                             // Report the error and proceed with analysis using one of the assumptions
                             // made since, even though the analysis may be incomplete, we'll still
                             // produce useful diagnostics.
-                            self.tcx.sess.span_err(
+                            self.tcx.sess.span_warn(
                                 span,
                                 "not all control-flow paths to this statement are guaranteed to borrow \
                                  the same number of components",
@@ -701,7 +706,7 @@ impl<'tcx> Analyzer<'tcx> {
             // If we are self-recursive, we know that we mustn't have leaked anything. See above for
             // an explanation of why.
             if min_recurse_into <= my_depth && my_facts.leaks != LeakFacts::default() {
-                self.tcx.sess.span_err(
+                self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
                         "this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
@@ -718,7 +723,7 @@ impl<'tcx> Analyzer<'tcx> {
                 .get(&forbidden)
                 .is_some_and(|fact| fact.mutably_borrows)
             {
-                self.tcx.sess.span_err(
+                self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
                         "this function self-recurses while holding an immutable borrow to {forbidden:?} \
@@ -751,7 +756,10 @@ fn safeishly_grab_instance_mir<'tcx>(
 ) -> Option<&'tcx Body<'tcx>> {
     let is_safe = match instance {
         // Items are defined by users and thus have MIR... even if they're from an external crate.
-        InstanceDef::Item(_) => true,
+        InstanceDef::Item(item) => {
+            // However, foreign items and lang-items don't have MIR
+            !tcx.is_foreign_item(item)
+        }
 
         // All the remaining things here require shims. We referenced...
         //
