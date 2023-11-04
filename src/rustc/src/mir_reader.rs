@@ -1,4 +1,4 @@
-use std::process;
+use std::{path::PathBuf, process};
 
 use rustc_driver::{
     catch_with_exit_code, init_rustc_env_logger, install_ice_hook, Callbacks, Compilation,
@@ -45,6 +45,12 @@ impl Callbacks for AnalyzeMirCallbacks {
         // break with clever `#[no_mangle]` hacks. Luckily, this analysis also only looks at functions
         // which are reachable from the main function so this is an okay limitation.
         config.opts.unstable_opts.always_encode_mir = true;
+
+        // We also have to hack in a little environment variable to override the sysroot.
+        // TODO: We should try to remove this.
+        if let Ok(ovr) = std::env::var("RUSTC_AUTOKEN_OVERRIDE_SYSROOT") {
+            config.opts.maybe_sysroot = Some(PathBuf::from(ovr));
+        }
     }
 
     fn after_analysis<'tcx>(

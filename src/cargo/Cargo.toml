@@ -1,0 +1,11 @@
+[package]
+name = "cargo-autoken"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.75"
+autoken-rustc = { version = "0.1.0", path = "../rustc" }
+directories = "5.0.1"
+rustc-build-sysroot = "0.4.2"
+rustc_tools_util = "0.3.0"

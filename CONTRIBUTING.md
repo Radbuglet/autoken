@@ -9,7 +9,8 @@ In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/se
 ```json
 {
     "rust-analyzer.linkedProjects": [
-        "src/analyzer/Cargo.toml",
+        "src/cargo/Cargo.toml",
+        "src/rustc/Cargo.toml",
         "src/userland/Cargo.toml",
     ]
 }

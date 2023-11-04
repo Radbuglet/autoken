@@ -15,6 +15,20 @@ use rustc_middle::{
 };
 use rustc_span::Symbol;
 
+use crate::mir_reader::compile_analyze_mir;
+
+// === Entry === //
+
+const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
+
+pub fn main_inner(args: Vec<String>) -> ! {
+    compile_analyze_mir(
+        &args,
+        ICE_URL,
+        Box::new(|compiler, tcx| AnalyzerConfig {}.analyze(compiler, tcx)),
+    );
+}
+
 // === Driver === //
 
 pub struct AnalyzerConfig {}
