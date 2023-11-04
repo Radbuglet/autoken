@@ -1,7 +1,5 @@
 # Contribution Guide
 
-TODO: Write this guide
-
 ## Rust-Analyzer Setup
 
 In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/settings.json` at the root directory of this project with:
@@ -17,6 +15,17 @@ In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/se
 ```
 
 ...to ensure that all projects in this repository can be properly discovered and given IntelliSense.
+
+## Organization
+
+There are three major components to AuToken:
+
+- The `userland` crate people include in their projects to interface with AuToken.
+- The `rustc` wrapper, which is a modified version of `rustc` which adds AuToken's analysis phase and configures the `rustc` compiler to always emit the full MIR for every crate it compiles.
+- The `cargo` wrapper, which...
+  - validates the `cargo` toolchain version to avoid ABI issues
+  - compiles a version of the Rust standard library using our custom version of `rustc` for use as a sysroot
+  - ...and re-executes the appropriate `cargo` command with `rustc` overwritten to point to our custom wrapper and with the appropriate sysroot specified.
 
 ## Manual Execution
 

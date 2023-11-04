@@ -9,8 +9,8 @@ use rustc_middle::{
     mir::{BasicBlock, Body, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
     traits::util::supertraits,
     ty::{
-        adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, InstanceDef, ParamEnv, Ty,
-        TyCtxt, TyKind, VtblEntry,
+        adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, InstanceDef, List,
+        ParamEnv, Ty, TyCtxt, TyKind, VtblEntry,
     },
 };
 use rustc_span::Symbol;
@@ -45,74 +45,36 @@ impl AnalyzerConfig {
         };
 
         // Run the analysis and let the compiler take over when we're done.
-        let mut analyzer = Analyzer::new(tcx);
-        analyzer.collect_dyn(Instance::mono(tcx, main_fn));
-        analyzer.analyze(main_fn);
+        let mut collect_analyzer = CollectAnalyzer::new(tcx);
+        collect_analyzer.collect_dyn(Instance::mono(tcx, main_fn));
+
+        let mut fact_analyzer = FactAnalyzer::new(&collect_analyzer);
+        fact_analyzer.analyze(main_fn);
     }
 }
 
-// === Analyzer === //
+// === CollectAnalyzer === //
 
-pub struct Analyzer<'tcx> {
+pub struct CollectAnalyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
 
     // The set of instances visited during collection.
     visited_fns_during_collection: FxHashSet<Instance<'tcx>>,
 
     // Maps from function pointers to specific function instances.
-    collected_fn_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+    fn_impls: FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
 
     // Maps from trait methods to specific implementations.
-    collected_trait_impls: FxHashMap<Instance<'tcx>, FxHashSet<Instance<'tcx>>>,
-
-    // Stores analysis facts about each analyzed function monomorphization.
-    fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
+    trait_impls: FxHashMap<(DefId, &'tcx List<GenericArg<'tcx>>), FxHashSet<Instance<'tcx>>>,
 }
 
-enum MaybeFunctionFacts<'tcx> {
-    Pending { my_depth: u32 },
-    Done(FactMap<'tcx, FunctionFacts>),
-}
-
-type FactMap<'tcx, T> = FxHashMap<Ty<'tcx>, T>;
-
-type FunctionFactsMap<'tcx> = FactMap<'tcx, FunctionFacts>;
-
-type LeakFactsMap<'tcx> = FactMap<'tcx, LeakFacts>;
-
-#[derive(Copy, Clone)]
-struct FunctionFacts {
-    max_enter_ref: i32,
-    max_enter_mut: i32,
-    mutably_borrows: bool,
-    leaks: LeakFacts,
-}
-
-impl Default for FunctionFacts {
-    fn default() -> Self {
-        Self {
-            max_enter_ref: i32::MAX,
-            max_enter_mut: i32::MAX,
-            mutably_borrows: false,
-            leaks: LeakFacts::default(),
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-struct LeakFacts {
-    leaked_muts: i32,
-    leaked_refs: i32,
-}
-
-impl<'tcx> Analyzer<'tcx> {
+impl<'tcx> CollectAnalyzer<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
             visited_fns_during_collection: Default::default(),
-            collected_fn_impls: Default::default(),
-            collected_trait_impls: Default::default(),
-            fn_facts: Default::default(),
+            fn_impls: Default::default(),
+            trait_impls: Default::default(),
         }
     }
 
@@ -125,7 +87,8 @@ impl<'tcx> Analyzer<'tcx> {
 
         // Grab the MIR for this instance. If it's an unavailable dynamic dispatch shim, just ignore
         // it because we handle dynamic dispatch ourselves.
-        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, false) else {
+        let MirGrabResult::Found(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def)
+        else {
             return;
         };
 
@@ -166,10 +129,7 @@ impl<'tcx> Analyzer<'tcx> {
                             generics,
                         );
 
-                        self.collected_fn_impls
-                            .entry(to_ty)
-                            .or_default()
-                            .insert(instance);
+                        self.fn_impls.entry(to_ty).or_default().insert(instance);
 
                         self.collect_dyn(instance);
                     }
@@ -185,10 +145,7 @@ impl<'tcx> Analyzer<'tcx> {
                             generics,
                         );
 
-                        self.collected_fn_impls
-                            .entry(to_ty)
-                            .or_default()
-                            .insert(instance);
+                        self.fn_impls.entry(to_ty).or_default().insert(instance);
 
                         self.collect_dyn(instance);
                     }
@@ -244,8 +201,8 @@ impl<'tcx> Analyzer<'tcx> {
 
                                 // Add it to the set and recurse into it to ensure its latent dynamic
                                 // coercions are also captured.
-                                self.collected_trait_impls
-                                    .entry(*vtbl_method)
+                                self.trait_impls
+                                    .entry((vtbl_method.def_id(), vtbl_method.args))
                                     .or_default()
                                     .insert(concrete);
 
@@ -302,10 +259,68 @@ impl<'tcx> Analyzer<'tcx> {
             }
         }
     }
+}
+
+// === FactAnalyzer === //
+
+pub struct FactAnalyzer<'cl, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    fn_impls: &'cl FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+    trait_impls: &'cl FxHashMap<(DefId, &'tcx List<GenericArg<'tcx>>), FxHashSet<Instance<'tcx>>>,
+
+    // Stores analysis facts about each analyzed function monomorphization.
+    fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
+}
+
+enum MaybeFunctionFacts<'tcx> {
+    Pending { my_depth: u32 },
+    Done(FactMap<'tcx, FunctionFacts>),
+}
+
+type FactMap<'tcx, T> = FxHashMap<Ty<'tcx>, T>;
+
+type FunctionFactsMap<'tcx> = FactMap<'tcx, FunctionFacts>;
+
+type LeakFactsMap<'tcx> = FactMap<'tcx, LeakFacts>;
+
+#[derive(Copy, Clone)]
+struct FunctionFacts {
+    max_enter_ref: i32,
+    max_enter_mut: i32,
+    mutably_borrows: bool,
+    leaks: LeakFacts,
+}
+
+impl Default for FunctionFacts {
+    fn default() -> Self {
+        Self {
+            max_enter_ref: i32::MAX,
+            max_enter_mut: i32::MAX,
+            mutably_borrows: false,
+            leaks: LeakFacts::default(),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+struct LeakFacts {
+    leaked_muts: i32,
+    leaked_refs: i32,
+}
+
+impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
+    pub fn new(collect_analyzer: &'cl CollectAnalyzer<'tcx>) -> Self {
+        Self {
+            tcx: collect_analyzer.tcx,
+            fn_impls: &collect_analyzer.fn_impls,
+            trait_impls: &collect_analyzer.trait_impls,
+            fn_facts: FxHashMap::default(),
+        }
+    }
 
     /// Analyzes every function which is reachable from `body_id`.
     pub fn analyze(&mut self, body_id: DefId) {
-        let _ = self.analyze_inner(0, Instance::mono(self.tcx, body_id));
+        let _ = self.analyze_instance(0, Instance::mono(self.tcx, body_id));
     }
 
     /// Attempts to discover the facts about the provided function.
@@ -313,76 +328,7 @@ impl<'tcx> Analyzer<'tcx> {
     /// Returns the inclusive depth of the lowest function on the stack we were able able to cycle
     /// back into or `u32::MAX` if the target never called a function which was already being analyzed.
     #[must_use]
-    fn analyze_inner(&mut self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
-        // If `my_body_id` corresponds to an autoken primitive, just hardcode its value.
-        'hardcode: {
-            let Some(item_name) = self.tcx.opt_item_name(my_body_id.def_id()) else {
-                break 'hardcode;
-            };
-
-            let facts = if item_name == Symbol::intern("__autoken_borrow_mutably") {
-                Some(FunctionFacts {
-                    max_enter_mut: 0,
-                    max_enter_ref: 0,
-                    mutably_borrows: true,
-                    leaks: LeakFacts {
-                        leaked_muts: 1,
-                        leaked_refs: 0,
-                    },
-                })
-            } else if item_name == Symbol::intern("__autoken_unborrow_mutably") {
-                Some(FunctionFacts {
-                    max_enter_mut: i32::MAX,
-                    max_enter_ref: i32::MAX,
-                    mutably_borrows: false,
-                    leaks: LeakFacts {
-                        leaked_muts: -1,
-                        leaked_refs: 0,
-                    },
-                })
-            } else if item_name == Symbol::intern("__autoken_borrow_immutably") {
-                Some(FunctionFacts {
-                    max_enter_mut: 0,
-                    max_enter_ref: i32::MAX,
-                    mutably_borrows: false,
-                    leaks: LeakFacts {
-                        leaked_muts: 0,
-                        leaked_refs: 1,
-                    },
-                })
-            } else if item_name == Symbol::intern("__autoken_unborrow_immutably") {
-                Some(FunctionFacts {
-                    max_enter_mut: i32::MAX,
-                    max_enter_ref: i32::MAX,
-                    mutably_borrows: false,
-                    leaks: LeakFacts {
-                        leaked_muts: 0,
-                        leaked_refs: -1,
-                    },
-                })
-            } else {
-                None
-            };
-
-            if let Some(facts) = facts {
-                self.fn_facts.insert(
-                    my_body_id,
-                    MaybeFunctionFacts::Done(FunctionFactsMap::from_iter([(
-                        self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty()),
-                        facts,
-                    )])),
-                );
-
-                return u32::MAX;
-            }
-        }
-
-        // Keep track of the minimum recursion depth.
-        let mut min_recurse_into = u32::MAX;
-
-        // Also keep track of whether we are allowed to borrow things mutably in this function.
-        let mut cannot_have_mutables_of = FxHashSet::<Ty>::default();
-
+    fn analyze_instance(&mut self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
         // Create a blank fact entry for us. If a facts entry already exists, handle it as either a
         // cycle or a memoized result.
         match self.fn_facts.entry(my_body_id) {
@@ -405,16 +351,41 @@ impl<'tcx> Analyzer<'tcx> {
             }
         }
 
+        // If this function has a hardcoded fact set, use it.
+        if let Some(facts) = self.get_hardcoded_facts(my_body_id) {
+            self.fn_facts
+                .insert(my_body_id, MaybeFunctionFacts::Done(facts));
+
+            return u32::MAX;
+        }
+
+        // Acquire the function body or, if it's a dynamic dispatch, analyze its potential targets.
+        let my_body = match safeishly_grab_instance_mir(self.tcx, my_body_id.def) {
+            MirGrabResult::Found(body) => body,
+            MirGrabResult::Dynamic => {
+                let (min_recursion_into, my_facts) = self.analyze_multi(
+                    my_depth,
+                    self.trait_impls
+                        .get(&(my_body_id.def_id(), my_body_id.args))
+                        .unwrap_or(&FxHashSet::default())
+                        .iter()
+                        .copied(),
+                );
+
+                self.fn_facts
+                    .insert(my_body_id, MaybeFunctionFacts::Done(my_facts));
+
+                return min_recursion_into;
+            }
+            MirGrabResult::BottomsOut => return u32::MAX,
+        };
+
+        // Keep track of the minimum recursion depth.
+        let mut min_recurse_into = u32::MAX;
         let mut my_facts = FunctionFactsMap::default();
 
-        // Acquire the function body
-
-        // TODO: Set the last argument to true and handle things properly
-        let Some(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def, false) else {
-            // Because of the true flag to `safeishly_grab_instance_mir`, we know that if it finds
-            // unavailable MIR, that MIR will not be able to call back into the userland.
-            return u32::MAX;
-        };
+        // Also keep track of whether we are allowed to borrow things mutably in this function.
+        let mut cannot_have_mutables_of = FxHashSet::<Ty>::default();
 
         // Now, we have to analyze the basic blocks' calling in some arbitrary order to determine both
         // which components are being borrowed and the function's leaked effects.
@@ -527,9 +498,10 @@ impl<'tcx> Analyzer<'tcx> {
             };
 
             // If we call a function, analyze and propagate their leaked borrows.
+            let empty_fact_map = FunctionFactsMap::default();
             let call_facts = if let Some(callee_id) = calls {
                 // Analyze the callees and determine the `min_recurse_into` depth.
-                let this_min_recurse_level = self.analyze_inner(my_depth + 1, callee_id);
+                let this_min_recurse_level = self.analyze_instance(my_depth + 1, callee_id);
 
                 min_recurse_into = min_recurse_into.min(this_min_recurse_level);
 
@@ -548,12 +520,12 @@ impl<'tcx> Analyzer<'tcx> {
                             self.tcx.sess.span_warn(
                                 span,
                                 format!(
-                                    "this function calls itself recursively while holding at least \
-                                     {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
-                                     it does reach this same call again, it may mutably borrow the \
-                                     same component more than once",
-                                    s_pluralize(leaked_muts),
-                                ),
+										"this function calls itself recursively while holding at least \
+										 {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
+										 it does reach this same call again, it may mutably borrow the \
+										 same component more than once",
+										s_pluralize(leaked_muts),
+									),
                             );
                         }
 
@@ -574,11 +546,11 @@ impl<'tcx> Analyzer<'tcx> {
                     //
                     // We also pretend as if the function did not borrow anything because the fact
                     // that it borrowed something can come from a different directly-observed call.
-                    MaybeFunctionFacts::Pending { .. } => FunctionFactsMap::default(),
-                    MaybeFunctionFacts::Done(facts) => facts.clone(),
+                    MaybeFunctionFacts::Pending { .. } => &empty_fact_map,
+                    MaybeFunctionFacts::Done(facts) => facts,
                 }
             } else {
-                FunctionFactsMap::default()
+                &empty_fact_map
             };
 
             // Validate the facts.
@@ -610,10 +582,10 @@ impl<'tcx> Analyzer<'tcx> {
                     self.tcx.sess.span_warn(
                         span,
                         format!(
-                            "called a function expecting at most {max_enter_mut} mutable borrow{} of \
-                            type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
-                            s_pluralize(max_enter_mut),
-                        ),
+								"called a function expecting at most {max_enter_mut} mutable borrow{} of \
+								type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
+								s_pluralize(max_enter_mut),
+							),
                     );
                 }
 
@@ -630,10 +602,10 @@ impl<'tcx> Analyzer<'tcx> {
                     self.tcx.sess.span_warn(
                         span,
                         format!(
-                            "called a function expecting at most {max_enter_ref} immutable borrow{} of \
-                            type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
-                            s_pluralize(max_enter_ref),
-                        ),
+								"called a function expecting at most {max_enter_ref} immutable borrow{} of \
+								type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
+								s_pluralize(max_enter_ref),
+							),
                     );
                 }
 
@@ -645,7 +617,7 @@ impl<'tcx> Analyzer<'tcx> {
             // entries to ensure that there's only one valid encoding of it.
             let mut leak_expectation = LeakFactsMap::default();
 
-            for (comp_ty, call_facts) in &call_facts {
+            for (comp_ty, call_facts) in call_facts {
                 if call_facts.leaks.leaked_refs != 0 || call_facts.leaks.leaked_muts != 0 {
                     let leak_facts = leak_expectation.entry(*comp_ty).or_default();
                     leak_facts.leaked_refs = call_facts.leaks.leaked_refs;
@@ -688,10 +660,10 @@ impl<'tcx> Analyzer<'tcx> {
                             // made since, even though the analysis may be incomplete, we'll still
                             // produce useful diagnostics.
                             self.tcx.sess.span_warn(
-                                span,
-                                "not all control-flow paths to this statement are guaranteed to borrow \
-                                 the same number of components",
-                            );
+									span,
+									"not all control-flow paths to this statement are guaranteed to borrow \
+									 the same number of components",
+								);
                         }
                     }
                     None => {
@@ -723,9 +695,9 @@ impl<'tcx> Analyzer<'tcx> {
                 self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
-                        "this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
-                         meaning that it could theoretically leak an arbitrary number of borrows",
-                    ),
+							"this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
+							 meaning that it could theoretically leak an arbitrary number of borrows",
+						),
                 );
             }
         }
@@ -740,10 +712,10 @@ impl<'tcx> Analyzer<'tcx> {
                 self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
-                        "this function self-recurses while holding an immutable borrow to {forbidden:?} \
-                         but holds the potential of borrowing that same component mutably somewhere \
-                         in the function body",
-                    ),
+							"this function self-recurses while holding an immutable borrow to {forbidden:?} \
+							 but holds the potential of borrowing that same component mutably somewhere \
+							 in the function body",
+						),
                 );
             }
         }
@@ -753,7 +725,94 @@ impl<'tcx> Analyzer<'tcx> {
 
         min_recurse_into
     }
+
+    fn analyze_multi(
+        &mut self,
+        my_depth: u32,
+        callees: impl IntoIterator<Item = Instance<'tcx>>,
+    ) -> (u32, FunctionFactsMap<'tcx>) {
+        let mut min_recurse_into = u32::MAX;
+        let mut my_facts = FunctionFactsMap::default();
+
+        for callee in callees {
+            min_recurse_into = min_recurse_into.min(self.analyze_instance(my_depth, callee));
+
+            // This analysis is largely copied from what happens on below.
+            let empty_fact_map = FunctionFactsMap::default();
+            let call_facts = match &self.fn_facts[&callee] {
+                MaybeFunctionFacts::Pending { .. } => &empty_fact_map,
+                MaybeFunctionFacts::Done(facts) => facts,
+            };
+
+            for (comp_ty, &call_facts) in call_facts.iter() {
+                let my_facts = my_facts.entry(*comp_ty).or_default();
+
+                // TODO: Handle disparities in leak counts.
+                my_facts.leaks = call_facts.leaks;
+                my_facts.max_enter_mut = my_facts.max_enter_mut.min(call_facts.max_enter_mut);
+                my_facts.max_enter_ref = my_facts.max_enter_ref.min(call_facts.max_enter_ref);
+                my_facts.mutably_borrows |= call_facts.mutably_borrows;
+            }
+        }
+
+        (min_recurse_into, my_facts)
+    }
+
+    fn get_hardcoded_facts(&self, my_body_id: Instance<'tcx>) -> Option<FunctionFactsMap<'tcx>> {
+        let item_name = self.tcx.opt_item_name(my_body_id.def_id())?;
+
+        let facts = if item_name == Symbol::intern("__autoken_borrow_mutably") {
+            FunctionFacts {
+                max_enter_mut: 0,
+                max_enter_ref: 0,
+                mutably_borrows: true,
+                leaks: LeakFacts {
+                    leaked_muts: 1,
+                    leaked_refs: 0,
+                },
+            }
+        } else if item_name == Symbol::intern("__autoken_unborrow_mutably") {
+            FunctionFacts {
+                max_enter_mut: i32::MAX,
+                max_enter_ref: i32::MAX,
+                mutably_borrows: false,
+                leaks: LeakFacts {
+                    leaked_muts: -1,
+                    leaked_refs: 0,
+                },
+            }
+        } else if item_name == Symbol::intern("__autoken_borrow_immutably") {
+            FunctionFacts {
+                max_enter_mut: 0,
+                max_enter_ref: i32::MAX,
+                mutably_borrows: false,
+                leaks: LeakFacts {
+                    leaked_muts: 0,
+                    leaked_refs: 1,
+                },
+            }
+        } else if item_name == Symbol::intern("__autoken_unborrow_immutably") {
+            FunctionFacts {
+                max_enter_mut: i32::MAX,
+                max_enter_ref: i32::MAX,
+                mutably_borrows: false,
+                leaks: LeakFacts {
+                    leaked_muts: 0,
+                    leaked_refs: -1,
+                },
+            }
+        } else {
+            return None;
+        };
+
+        Some(FunctionFactsMap::from_iter([(
+            self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty()),
+            facts,
+        )]))
+    }
 }
+
+// === Helpers === //
 
 fn s_pluralize(v: i32) -> &'static str {
     if v == 1 {
@@ -763,16 +822,25 @@ fn s_pluralize(v: i32) -> &'static str {
     }
 }
 
+enum MirGrabResult<'tcx> {
+    Found(&'tcx Body<'tcx>),
+    Dynamic,
+    BottomsOut,
+}
+
 fn safeishly_grab_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: InstanceDef<'tcx>,
-    bug_if_unavailable_but_can_return_to_user: bool,
-) -> Option<&'tcx Body<'tcx>> {
-    let is_safe = match instance {
+) -> MirGrabResult<'tcx> {
+    match instance {
         // Items are defined by users and thus have MIR... even if they're from an external crate.
         InstanceDef::Item(item) => {
             // However, foreign items and lang-items don't have MIR
-            !tcx.is_foreign_item(item)
+            if !tcx.is_foreign_item(item) {
+                MirGrabResult::Found(tcx.instance_mir(instance))
+            } else {
+                MirGrabResult::BottomsOut
+            }
         }
 
         // All the remaining things here require shims. We referenced...
@@ -786,21 +854,16 @@ fn safeishly_grab_instance_mir<'tcx>(
         | InstanceDef::DropGlue(_, _)
         | InstanceDef::ClosureOnceShim { .. }
         | InstanceDef::CloneShim(_, _)
-        | InstanceDef::FnPtrAddrShim(_, _) => true,
+        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
 
         // These are never supported and will never return to the user.
-        InstanceDef::Intrinsic(_) => false,
+        InstanceDef::Intrinsic(_) => MirGrabResult::BottomsOut,
 
         // These are dynamic dispatches and should not be analyzed since we analyze them in a
         // different way.
         InstanceDef::VTableShim(_)
         | InstanceDef::ReifyShim(_)
         | InstanceDef::FnPtrShim(_, _)
-        | InstanceDef::Virtual(_, _) => {
-            assert!(!bug_if_unavailable_but_can_return_to_user);
-            false
-        }
-    };
-
-    is_safe.then(|| tcx.instance_mir(instance))
+        | InstanceDef::Virtual(_, _) => MirGrabResult::Dynamic,
+    }
 }
