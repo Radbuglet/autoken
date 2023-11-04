@@ -265,11 +265,21 @@ impl<'tcx> CollectAnalyzer<'tcx> {
 
 pub struct FactAnalyzer<'cl, 'tcx> {
     tcx: TyCtxt<'tcx>,
+
+    // Reference to an identically-named field in `CollectAnalyzer`
     fn_impls: &'cl FxHashMap<Ty<'tcx>, FxHashSet<Instance<'tcx>>>,
+
+    // Reference to an identically-named field in `CollectAnalyzer`
     trait_impls: &'cl FxHashMap<(DefId, &'tcx List<GenericArg<'tcx>>), FxHashSet<Instance<'tcx>>>,
 
     // Stores analysis facts about each analyzed function monomorphization.
-    fn_facts: FxHashMap<Instance<'tcx>, MaybeFunctionFacts<'tcx>>,
+    fn_facts: FxHashMap<AnalysisSubject<'tcx>, MaybeFunctionFacts<'tcx>>,
+}
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+enum AnalysisSubject<'tcx> {
+    Instance(Instance<'tcx>),
+    FnPtr(Ty<'tcx>),
 }
 
 enum MaybeFunctionFacts<'tcx> {
@@ -320,7 +330,10 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
 
     /// Analyzes every function which is reachable from `body_id`.
     pub fn analyze(&mut self, body_id: DefId) {
-        let _ = self.analyze_instance(0, Instance::mono(self.tcx, body_id));
+        let _ = self.analyze_single(
+            0,
+            AnalysisSubject::Instance(Instance::mono(self.tcx, body_id)),
+        );
     }
 
     /// Attempts to discover the facts about the provided function.
@@ -328,7 +341,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
     /// Returns the inclusive depth of the lowest function on the stack we were able able to cycle
     /// back into or `u32::MAX` if the target never called a function which was already being analyzed.
     #[must_use]
-    fn analyze_instance(&mut self, my_depth: u32, my_body_id: Instance<'tcx>) -> u32 {
+    fn analyze_single(&mut self, my_depth: u32, my_body_id: AnalysisSubject<'tcx>) -> u32 {
         // Create a blank fact entry for us. If a facts entry already exists, handle it as either a
         // cycle or a memoized result.
         match self.fn_facts.entry(my_body_id) {
@@ -351,10 +364,34 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
             }
         }
 
+        // If this is a function pointer, analyze its multiple dispatch.
+        let my_body_id = match my_body_id {
+            AnalysisSubject::Instance(instance) => instance,
+            AnalysisSubject::FnPtr(fn_ty) => {
+                let (min_recursion_into, my_facts) = self.analyze_multi(
+                    my_depth,
+                    self.fn_impls
+                        .get(&fn_ty)
+                        .unwrap_or(&FxHashSet::default())
+                        .iter()
+                        .copied(),
+                );
+
+                self.fn_facts.insert(
+                    AnalysisSubject::FnPtr(fn_ty),
+                    MaybeFunctionFacts::Done(my_facts),
+                );
+
+                return min_recursion_into;
+            }
+        };
+
         // If this function has a hardcoded fact set, use it.
         if let Some(facts) = self.get_hardcoded_facts(my_body_id) {
-            self.fn_facts
-                .insert(my_body_id, MaybeFunctionFacts::Done(facts));
+            self.fn_facts.insert(
+                AnalysisSubject::Instance(my_body_id),
+                MaybeFunctionFacts::Done(facts),
+            );
 
             return u32::MAX;
         }
@@ -372,8 +409,10 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                         .copied(),
                 );
 
-                self.fn_facts
-                    .insert(my_body_id, MaybeFunctionFacts::Done(my_facts));
+                self.fn_facts.insert(
+                    AnalysisSubject::Instance(my_body_id),
+                    MaybeFunctionFacts::Done(my_facts),
+                );
 
                 return min_recursion_into;
             }
@@ -461,10 +500,15 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                                 generics,
                             );
 
-                            (Some(callee_id), (*target).into_iter().collect())
+                            (
+                                Some(AnalysisSubject::Instance(callee_id)),
+                                (*target).into_iter().collect(),
+                            )
                         }
-                        // TODO: actually handle this
-                        TyKind::FnPtr(_) => (None, (*target).into_iter().collect()),
+                        TyKind::FnPtr(_) => (
+                            Some(AnalysisSubject::FnPtr(func)),
+                            (*target).into_iter().collect(),
+                        ),
                         _ => unreachable!(),
                     }
                 }
@@ -476,9 +520,9 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                         EarlyBinder::bind(place),
                     );
 
-                    let dtor = place
-                        .needs_drop(self.tcx, ParamEnv::reveal_all())
-                        .then(|| Instance::resolve_drop_in_place(self.tcx, place));
+                    let dtor = place.needs_drop(self.tcx, ParamEnv::reveal_all()).then(|| {
+                        AnalysisSubject::Instance(Instance::resolve_drop_in_place(self.tcx, place))
+                    });
 
                     (dtor, smallvec![*target])
                 }
@@ -501,7 +545,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
             let empty_fact_map = FunctionFactsMap::default();
             let call_facts = if let Some(callee_id) = calls {
                 // Analyze the callees and determine the `min_recurse_into` depth.
-                let this_min_recurse_level = self.analyze_instance(my_depth + 1, callee_id);
+                let this_min_recurse_level = self.analyze_single(my_depth + 1, callee_id);
 
                 min_recurse_into = min_recurse_into.min(this_min_recurse_level);
 
@@ -520,12 +564,12 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                             self.tcx.sess.span_warn(
                                 span,
                                 format!(
-										"this function calls itself recursively while holding at least \
-										 {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
-										 it does reach this same call again, it may mutably borrow the \
-										 same component more than once",
-										s_pluralize(leaked_muts),
-									),
+                                        "this function calls itself recursively while holding at least \
+                                         {leaked_muts} mutable borrow{} of {comp_ty:?} meaning that, if \
+                                         it does reach this same call again, it may mutably borrow the \
+                                         same component more than once",
+                                        s_pluralize(leaked_muts),
+                                    ),
                             );
                         }
 
@@ -561,7 +605,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                 // Adjust the max enter borrow counters appropriately.
                 //
                 // my_facts.max_enter_(im)mutable_borrows + curr_facts.leaked_(im)mutables
-                // 	  <= call_facts.max_enter_(im)mutable_borrows
+                //    <= call_facts.max_enter_(im)mutable_borrows
                 //
                 // So:
                 //
@@ -582,10 +626,10 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     self.tcx.sess.span_warn(
                         span,
                         format!(
-								"called a function expecting at most {max_enter_mut} mutable borrow{} of \
-								type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
-								s_pluralize(max_enter_mut),
-							),
+                            "called a function expecting at most {max_enter_mut} mutable borrow{} of \
+                            type {comp_ty:?} but was called in a scope with at least {leaked_muts}",
+                            s_pluralize(max_enter_mut),
+                        ),
                     );
                 }
 
@@ -602,10 +646,10 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     self.tcx.sess.span_warn(
                         span,
                         format!(
-								"called a function expecting at most {max_enter_ref} immutable borrow{} of \
-								type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
-								s_pluralize(max_enter_ref),
-							),
+                                "called a function expecting at most {max_enter_ref} immutable borrow{} of \
+                                type {comp_ty:?} but was called in a scope with at least {leaked_refs}",
+                                s_pluralize(max_enter_ref),
+                            ),
                     );
                 }
 
@@ -660,10 +704,10 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                             // made since, even though the analysis may be incomplete, we'll still
                             // produce useful diagnostics.
                             self.tcx.sess.span_warn(
-									span,
-									"not all control-flow paths to this statement are guaranteed to borrow \
-									 the same number of components",
-								);
+                                    span,
+                                    "not all control-flow paths to this statement are guaranteed to borrow \
+                                     the same number of components",
+                                );
                         }
                     }
                     None => {
@@ -695,9 +739,9 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                 self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
-							"this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
-							 meaning that it could theoretically leak an arbitrary number of borrows",
-						),
+                            "this function self-recurses yet has the ability to leak borrows of {comp_ty:?}, \
+                             meaning that it could theoretically leak an arbitrary number of borrows",
+                        ),
                 );
             }
         }
@@ -712,16 +756,19 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                 self.tcx.sess.span_warn(
                     my_body.span,
                     format!(
-							"this function self-recurses while holding an immutable borrow to {forbidden:?} \
-							 but holds the potential of borrowing that same component mutably somewhere \
-							 in the function body",
-						),
+                            "this function self-recurses while holding an immutable borrow to {forbidden:?} \
+                             but holds the potential of borrowing that same component mutably somewhere \
+                             in the function body",
+                        ),
                 );
             }
         }
 
         // Finally, save our resolved facts.
-        *self.fn_facts.get_mut(&my_body_id).unwrap() = MaybeFunctionFacts::Done(my_facts);
+        *self
+            .fn_facts
+            .get_mut(&AnalysisSubject::Instance(my_body_id))
+            .unwrap() = MaybeFunctionFacts::Done(my_facts);
 
         min_recurse_into
     }
@@ -735,11 +782,12 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
         let mut my_facts = FunctionFactsMap::default();
 
         for callee in callees {
-            min_recurse_into = min_recurse_into.min(self.analyze_instance(my_depth, callee));
+            min_recurse_into = min_recurse_into
+                .min(self.analyze_single(my_depth, AnalysisSubject::Instance(callee)));
 
             // This analysis is largely copied from what happens on below.
             let empty_fact_map = FunctionFactsMap::default();
-            let call_facts = match &self.fn_facts[&callee] {
+            let call_facts = match &self.fn_facts[&AnalysisSubject::Instance(callee)] {
                 MaybeFunctionFacts::Pending { .. } => &empty_fact_map,
                 MaybeFunctionFacts::Done(facts) => facts,
             };
@@ -748,7 +796,11 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                 let my_facts = my_facts.entry(*comp_ty).or_default();
 
                 // TODO: Handle disparities in leak counts.
-                my_facts.leaks = call_facts.leaks;
+                my_facts.leaks.leaked_muts =
+                    my_facts.leaks.leaked_muts.max(call_facts.leaks.leaked_muts);
+                my_facts.leaks.leaked_refs =
+                    my_facts.leaks.leaked_refs.max(call_facts.leaks.leaked_refs);
+
                 my_facts.max_enter_mut = my_facts.max_enter_mut.min(call_facts.max_enter_mut);
                 my_facts.max_enter_ref = my_facts.max_enter_ref.min(call_facts.max_enter_ref);
                 my_facts.mutably_borrows |= call_facts.mutably_borrows;
