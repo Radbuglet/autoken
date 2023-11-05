@@ -10,7 +10,7 @@ use rustc_middle::{
     traits::util::supertraits,
     ty::{
         adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, InstanceDef, List,
-        ParamEnv, Ty, TyCtxt, TyKind, VtblEntry,
+        ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut, VtblEntry,
     },
 };
 use rustc_span::Symbol;
@@ -150,14 +150,8 @@ impl<'tcx> CollectAnalyzer<'tcx> {
                         self.collect_dyn(instance);
                     }
                     PointerCoercion::Unsize => {
-                        // This code is largely copied from:
-                        // - https://github.com/rust-lang/rust/blob/master/compiler/rustc_codegen_cranelift/src/unsize.rs
-                        // - https://github.com/rust-lang/rust/blob/master/compiler/rustc_codegen_cranelift/src/vtable.rs#L90
-                        // - https://github.com/rust-lang/rust/blob/a2f5f9691b6ce64c1703feaf9363710dfd7a56cf/compiler/rustc_middle/src/ty/vtable.rs#L50
-
                         // Finds the type the coercion actually changed.
-                        // TODO: Handle other CoerceUnsized structures
-                        let (from_ty, to_ty) = (from_ty.peel_refs(), to_ty.peel_refs());
+                        let (from_ty, to_ty) = get_unsized_ty(self.tcx, from_ty, to_ty);
 
                         // Ensures that we're analyzing a dynamic type unsizing coercion.
                         let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
@@ -917,5 +911,45 @@ fn safeishly_grab_instance_mir<'tcx>(
         | InstanceDef::ReifyShim(_)
         | InstanceDef::FnPtrShim(_, _)
         | InstanceDef::Virtual(_, _) => MirGrabResult::Dynamic,
+    }
+}
+
+// Referenced from https://github.com/rust-lang/rust/blob/4b85902b438f791c5bfcb6b1c5b476d5b88e2bef/compiler/rustc_codegen_cranelift/src/unsize.rs#L62
+fn get_unsized_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    from_ty: Ty<'tcx>,
+    to_ty: Ty<'tcx>,
+) -> (Ty<'tcx>, Ty<'tcx>) {
+    match (from_ty.kind(), to_ty.kind()) {
+        // Reference unsizing
+        (TyKind::Ref(_, a, _), TyKind::Ref(_, b, _))
+        | (TyKind::Ref(_, a, _), TyKind::RawPtr(TypeAndMut { ty: b, mutbl: _ }))
+        | (
+            TyKind::RawPtr(TypeAndMut { ty: a, mutbl: _ }),
+            TyKind::RawPtr(TypeAndMut { ty: b, mutbl: _ }),
+        ) => get_unsized_ty(tcx, *a, *b),
+
+        // Box unsizing
+        (TyKind::Adt(def_a, _), TyKind::Adt(def_b, _)) if def_a.is_box() && def_b.is_box() => {
+            get_unsized_ty(tcx, from_ty.boxed_ty(), to_ty.boxed_ty())
+        }
+
+        // Structural unsizing
+        (TyKind::Adt(def_a, args_a), TyKind::Adt(def_b, args_b)) => {
+            assert_eq!(def_a, def_b);
+
+            for field in def_a.all_fields() {
+                let from_ty = field.ty(tcx, args_a);
+                let to_ty = field.ty(tcx, args_b);
+                if from_ty != to_ty {
+                    return get_unsized_ty(tcx, from_ty, to_ty);
+                }
+            }
+
+            (from_ty, to_ty)
+        }
+
+        // Identity unsizing
+        _ => (from_ty, to_ty),
     }
 }
