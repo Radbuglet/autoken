@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
-autoken-rustc = { version = "0.1.0", path = "../rustc" }
 directories = "5.0.1"
 rustc-build-sysroot = "0.4.2"
-rustc_tools_util = "0.3.0"
+
+[build-dependencies]
+anyhow = "1.0.75"
+sha256 = { version = "1.4.0", default-features = false }
