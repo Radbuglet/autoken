@@ -11,4 +11,4 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 pub mod analyzer;
-pub mod mir_reader;
+pub mod entry;

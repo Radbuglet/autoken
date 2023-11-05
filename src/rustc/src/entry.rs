@@ -6,35 +6,34 @@ use rustc_driver::{
 };
 
 use rustc_interface::{interface::Compiler, Queries};
-use rustc_middle::ty::TyCtxt;
 use rustc_session::{config::ErrorOutputType, EarlyErrorHandler};
 
-type AnalyzerFn = Box<dyn FnMut(&Compiler, TyCtxt<'_>) + Send>;
+use crate::analyzer::AnalyzerConfig;
 
-/// Runs a regular session of `rustc` but ensures that external MIR is stored away in each crate's
-/// `.rlib` file and gives an `AnalyzerFn` the opportunity to analyze the code after the MIR has been
-/// successfully constructed. Other than these two changes, this functions exactly like a regular
-/// `rustc` session.
-pub fn compile_analyze_mir(
-    rustc_args: &[String],
-    ice_url: &'static str,
-    analyzer: AnalyzerFn,
-) -> ! {
+const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
+
+pub fn main_inner(args: Vec<String>) -> ! {
     // Install rustc's default logger
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
 
     // Install a custom ICE hook for ourselves
-    install_ice_hook(ice_url, |_| ());
+    install_ice_hook(ICE_URL, |_| ());
 
     // Run the compiler with the user's specified arguments
     process::exit(catch_with_exit_code(|| {
-        RunCompiler::new(rustc_args, &mut AnalyzeMirCallbacks { analyzer }).run()
+        RunCompiler::new(
+            &args,
+            &mut AnalyzeMirCallbacks {
+                config: AnalyzerConfig {},
+            },
+        )
+        .run()
     }));
 }
 
 struct AnalyzeMirCallbacks {
-    analyzer: AnalyzerFn,
+    config: AnalyzerConfig,
 }
 
 impl Callbacks for AnalyzeMirCallbacks {
@@ -47,8 +46,7 @@ impl Callbacks for AnalyzeMirCallbacks {
         config.opts.unstable_opts.always_encode_mir = true;
 
         // We also have to hack in a little environment variable to override the sysroot.
-        // TODO: We should try to remove this.
-        if let Ok(ovr) = std::env::var("RUSTC_AUTOKEN_OVERRIDE_SYSROOT") {
+        if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {
             config.opts.maybe_sysroot = Some(PathBuf::from(ovr));
         }
     }
@@ -61,9 +59,10 @@ impl Callbacks for AnalyzeMirCallbacks {
     ) -> Compilation {
         queries.global_ctxt().unwrap().enter(|tcx| {
             // Ensure that this is valid MIR
-            if tcx.sess.compile_status().is_ok() {
-                // Run the user-provided analyzer
-                (self.analyzer)(compiler, tcx);
+            if tcx.sess.compile_status().is_ok() && std::env::var("AUTOKEN_SKIP_ANALYSIS").is_err()
+            {
+                // Run our custom analysis engine
+                self.config.analyze(compiler, tcx);
             }
         });
 
