@@ -53,6 +53,10 @@ pub fn analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
     __autoken_analysis_black_box::<T>(f)
 }
 
+pub struct Nothing {
+    __autoken_nothing_type_field_indicator: (),
+}
+
 // === RAII === //
 
 // MutableBorrow
@@ -64,6 +68,11 @@ impl<T: ?Sized> MutableBorrow<T> {
     pub const fn new() -> Self {
         borrow_mutably::<T>();
         Self { _ty: PhantomData }
+    }
+
+    pub fn defuse_analysis(self) -> MutableBorrow<Nothing> {
+        drop(self);
+        MutableBorrow::new()
     }
 }
 
@@ -114,6 +123,11 @@ impl<T: ?Sized> ImmutableBorrow<T> {
     pub const fn new() -> Self {
         borrow_immutably::<T>();
         Self { _ty: PhantomData }
+    }
+
+    pub fn defuse_analysis(self) -> ImmutableBorrow<Nothing> {
+        drop(self);
+        ImmutableBorrow::new()
     }
 }
 

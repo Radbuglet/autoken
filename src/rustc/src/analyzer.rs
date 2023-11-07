@@ -836,6 +836,13 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
     fn get_hardcoded_facts(&self, my_body_id: Instance<'tcx>) -> Option<FunctionFactsMap<'tcx>> {
         let item_name = self.tcx.opt_item_name(my_body_id.def_id())?;
 
+        // If this is a black box, pretend as if it is entirely uninteresting without visiting the
+        // closure it calls.
+        if item_name == sym::__autoken_analysis_black_box.get() {
+            return Some(FunctionFactsMap::default());
+        }
+
+        // Try to hardcode the remaining primitive borrow methods.
         let facts = if item_name == sym::__autoken_borrow_mutably.get() {
             FunctionFacts {
                 max_enter_mut: 0,
@@ -876,21 +883,30 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: -1,
                 },
             }
-        } else if item_name == sym::__autoken_analysis_black_box.get() {
-            FunctionFacts {
-                max_enter_mut: i32::MAX,
-                max_enter_ref: i32::MAX,
-                mutably_borrows: false,
-                leaks: LeakFacts::default(),
-            }
         } else {
             return None;
         };
 
-        Some(FunctionFactsMap::from_iter([(
-            self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty()),
-            facts,
-        )]))
+        // If they borrow nothing, fall back to an empty map.
+        let ty = self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty());
+
+        if Self::is_nothing_type(ty) {
+            Some(FunctionFactsMap::default())
+        } else {
+            Some(FunctionFactsMap::from_iter([(ty, facts)]))
+        }
+    }
+
+    fn is_nothing_type(ty: Ty<'tcx>) -> bool {
+        let Some(adt) = ty.ty_adt_def() else {
+            return false;
+        };
+
+        let Some(field) = adt.all_fields().next() else {
+            return false;
+        };
+
+        field.name == sym::__autoken_nothing_type_field_indicator.get()
     }
 }
 
@@ -1008,6 +1024,8 @@ impl ReusedSymbol {
     }
 }
 
+// === Symbols === //
+
 #[allow(non_upper_case_globals)]
 mod sym {
     use super::ReusedSymbol;
@@ -1032,4 +1050,7 @@ mod sym {
 
     pub static __autoken_analysis_black_box: ReusedSymbol =
         ReusedSymbol::new("__autoken_analysis_black_box");
+
+    pub static __autoken_nothing_type_field_indicator: ReusedSymbol =
+        ReusedSymbol::new("__autoken_nothing_type_field_indicator");
 }
