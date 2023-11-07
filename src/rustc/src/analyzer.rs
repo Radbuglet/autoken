@@ -67,6 +67,15 @@ impl<'tcx> CollectAnalyzer<'tcx> {
             return;
         }
 
+        // Ignore dispatches into `__autoken_analysis_black_box`.
+        if self
+            .tcx
+            .opt_item_name(my_body_id.def_id())
+            .is_some_and(|name| name == sym::__autoken_analysis_black_box.get())
+        {
+            return;
+        }
+
         // Grab the MIR for this instance. If it's an unavailable dynamic dispatch shim, just ignore
         // it because we handle dynamic dispatch ourselves.
         let MirGrabResult::Found(my_body) = safeishly_grab_instance_mir(self.tcx, my_body_id.def)
@@ -867,6 +876,13 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: -1,
                 },
             }
+        } else if item_name == sym::__autoken_analysis_black_box.get() {
+            FunctionFacts {
+                max_enter_mut: i32::MAX,
+                max_enter_ref: i32::MAX,
+                mutably_borrows: false,
+                leaks: LeakFacts::default(),
+            }
         } else {
             return None;
         };
@@ -1013,4 +1029,7 @@ mod sym {
 
     pub static __autoken_assume_no_alias: ReusedSymbol =
         ReusedSymbol::new("__autoken_assume_no_alias");
+
+    pub static __autoken_analysis_black_box: ReusedSymbol =
+        ReusedSymbol::new("__autoken_analysis_black_box");
 }

@@ -45,6 +45,14 @@ pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
     __autoken_assume_no_alias::<Res>(f)
 }
 
+pub fn analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
+    fn __autoken_analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
+
+    __autoken_analysis_black_box::<T>(f)
+}
+
 // === RAII === //
 
 // MutableBorrow
