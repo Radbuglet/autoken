@@ -45,12 +45,12 @@ pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
     __autoken_assume_no_alias::<Res>(f)
 }
 
-pub fn analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
-    fn __autoken_analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
+pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
+    fn __autoken_assume_black_box<T>(f: impl FnOnce() -> T) -> T {
         f()
     }
 
-    __autoken_analysis_black_box::<T>(f)
+    __autoken_assume_black_box::<T>(f)
 }
 
 pub struct Nothing<'a> {
@@ -72,6 +72,14 @@ impl<T: ?Sized> MutableBorrow<T> {
 
     pub fn loan(&mut self) -> MutableBorrow<Nothing<'_>> {
         MutableBorrow::new()
+    }
+
+    pub fn assume_no_alias_loan(&self) -> MutableBorrow<Nothing<'_>> {
+        MutableBorrow::new()
+    }
+
+    pub fn assume_no_alias_clone(&self) -> Self {
+        assume_no_alias(|| Self::new())
     }
 
     pub fn strip_lifetime_analysis(self) -> MutableBorrow<Nothing<'static>> {

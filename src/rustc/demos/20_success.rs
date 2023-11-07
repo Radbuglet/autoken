@@ -1,5 +1,5 @@
 fn main() {
-    let foo = analysis_black_box(|| {
+    let foo = assume_black_box(|| {
         let f = || loop {
             borrow_mutably::<u32>();
         };
@@ -8,17 +8,17 @@ fn main() {
 
     foo();
 
-    analysis_black_box(|| loop {
+    assume_black_box(|| loop {
         borrow_mutably::<u32>();
     });
 }
 
-pub fn analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
-    fn __autoken_analysis_black_box<T>(f: impl FnOnce() -> T) -> T {
+pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
+    fn __autoken_assume_black_box<T>(f: impl FnOnce() -> T) -> T {
         f()
     }
 
-    __autoken_analysis_black_box::<T>(f)
+    __autoken_assume_black_box::<T>(f)
 }
 
 fn borrow_mutably<T: ?Sized>() {

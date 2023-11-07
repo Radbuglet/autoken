@@ -67,11 +67,11 @@ impl<'tcx> CollectAnalyzer<'tcx> {
             return;
         }
 
-        // Ignore dispatches into `__autoken_analysis_black_box`.
+        // Ignore dispatches into `__autoken_assume_black_box`.
         if self
             .tcx
             .opt_item_name(my_body_id.def_id())
-            .is_some_and(|name| name == sym::__autoken_analysis_black_box.get())
+            .is_some_and(|name| name == sym::__autoken_assume_black_box.get())
         {
             return;
         }
@@ -838,7 +838,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
 
         // If this is a black box, pretend as if it is entirely uninteresting without visiting the
         // closure it calls.
-        if item_name == sym::__autoken_analysis_black_box.get() {
+        if item_name == sym::__autoken_assume_black_box.get() {
             return Some(FunctionFactsMap::default());
         }
 
@@ -1048,8 +1048,8 @@ mod sym {
     pub static __autoken_assume_no_alias: ReusedSymbol =
         ReusedSymbol::new("__autoken_assume_no_alias");
 
-    pub static __autoken_analysis_black_box: ReusedSymbol =
-        ReusedSymbol::new("__autoken_analysis_black_box");
+    pub static __autoken_assume_black_box: ReusedSymbol =
+        ReusedSymbol::new("__autoken_assume_black_box");
 
     pub static __autoken_nothing_type_field_indicator: ReusedSymbol =
         ReusedSymbol::new("__autoken_nothing_type_field_indicator");
