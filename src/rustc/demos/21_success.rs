@@ -6,8 +6,8 @@ fn main() {
     }
 }
 
-pub struct Nothing {
-    __autoken_nothing_type_field_indicator: (),
+pub struct Nothing<'a> {
+    __autoken_nothing_type_field_indicator: core::marker::PhantomData<&'a ()>,
 }
 
 pub const fn borrow_mutably<T: ?Sized>() {
