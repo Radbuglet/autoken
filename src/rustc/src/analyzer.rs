@@ -1,4 +1,4 @@
-use std::collections::hash_map;
+use std::{collections::hash_map, sync::OnceLock};
 
 use smallvec::{smallvec, SmallVec};
 
@@ -740,6 +740,22 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
             }
         }
 
+        // We're almost done but we have to apply the special `__autoken_assume_no_alias` rules, which
+        // preserve leaks but allow the incoming maximum borrow counts to be unbounded.
+        if self
+            .tcx
+            .opt_item_name(my_body_id.def_id())
+            .is_some_and(|name| name == sym::__autoken_assume_no_alias.get())
+        {
+            let ignored_ty = self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty());
+
+            if let Some(my_facts) = my_facts.get_mut(&ignored_ty) {
+                my_facts.max_enter_mut = i32::MAX;
+                my_facts.max_enter_ref = i32::MAX;
+                my_facts.mutably_borrows = false;
+            }
+        }
+
         // Finally, save our resolved facts.
         *self
             .fn_facts
@@ -789,7 +805,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
     fn get_hardcoded_facts(&self, my_body_id: Instance<'tcx>) -> Option<FunctionFactsMap<'tcx>> {
         let item_name = self.tcx.opt_item_name(my_body_id.def_id())?;
 
-        let facts = if item_name == Symbol::intern("__autoken_borrow_mutably") {
+        let facts = if item_name == sym::__autoken_borrow_mutably.get() {
             FunctionFacts {
                 max_enter_mut: 0,
                 max_enter_ref: 0,
@@ -799,7 +815,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: 0,
                 },
             }
-        } else if item_name == Symbol::intern("__autoken_unborrow_mutably") {
+        } else if item_name == sym::__autoken_unborrow_mutably.get() {
             FunctionFacts {
                 max_enter_mut: i32::MAX,
                 max_enter_ref: i32::MAX,
@@ -809,7 +825,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: 0,
                 },
             }
-        } else if item_name == Symbol::intern("__autoken_borrow_immutably") {
+        } else if item_name == sym::__autoken_borrow_mutably.get() {
             FunctionFacts {
                 max_enter_mut: 0,
                 max_enter_ref: i32::MAX,
@@ -819,7 +835,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: 1,
                 },
             }
-        } else if item_name == Symbol::intern("__autoken_unborrow_immutably") {
+        } else if item_name == sym::__autoken_unborrow_immutably.get() {
             FunctionFacts {
                 max_enter_mut: i32::MAX,
                 max_enter_ref: i32::MAX,
@@ -934,4 +950,42 @@ fn get_unsized_ty<'tcx>(
         // Identity unsizing
         _ => (from_ty, to_ty),
     }
+}
+
+struct ReusedSymbol {
+    raw: &'static str,
+    sym: OnceLock<Symbol>,
+}
+
+impl ReusedSymbol {
+    const fn new(raw: &'static str) -> Self {
+        Self {
+            raw,
+            sym: OnceLock::new(),
+        }
+    }
+
+    fn get(&self) -> Symbol {
+        *self.sym.get_or_init(|| Symbol::intern(self.raw))
+    }
+}
+
+#[allow(non_upper_case_globals)]
+mod sym {
+    use super::ReusedSymbol;
+
+    pub static __autoken_borrow_mutably: ReusedSymbol =
+        ReusedSymbol::new("__autoken_borrow_mutably");
+
+    pub static __autoken_unborrow_mutably: ReusedSymbol =
+        ReusedSymbol::new("__autoken_unborrow_mutably");
+
+    pub static __autoken_borrow_immutably: ReusedSymbol =
+        ReusedSymbol::new("__autoken_borrow_immutably");
+
+    pub static __autoken_unborrow_immutably: ReusedSymbol =
+        ReusedSymbol::new("__autoken_unborrow_immutably");
+
+    pub static __autoken_assume_no_alias: ReusedSymbol =
+        ReusedSymbol::new("__autoken_assume_no_alias");
 }
