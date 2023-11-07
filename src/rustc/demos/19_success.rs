@@ -1,6 +1,6 @@
 fn main() {
     let lock1 = Lock::new();
-    let lock2 = assume_no_alias_in::<Lock, _>(|| Lock::new());
+    let lock2 = assume_no_alias(|| Lock::new());
     drop(lock1);
 }
 

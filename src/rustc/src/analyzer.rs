@@ -745,11 +745,33 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
         if self
             .tcx
             .opt_item_name(my_body_id.def_id())
-            .is_some_and(|name| name == sym::__autoken_assume_no_alias.get())
+            .is_some_and(|name| name == sym::__autoken_assume_no_alias_in.get())
         {
             let ignored_ty = self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty());
+            let singleton_arr: [Ty<'tcx>; 1];
 
-            if let Some(my_facts) = my_facts.get_mut(&ignored_ty) {
+            let ignored_tys = if let TyKind::Tuple(list) = ignored_ty.kind() {
+                list.as_slice().iter()
+            } else {
+                singleton_arr = [ignored_ty];
+                singleton_arr.iter()
+            };
+
+            for ignored_ty in ignored_tys {
+                if let Some(my_facts) = my_facts.get_mut(ignored_ty) {
+                    my_facts.max_enter_mut = i32::MAX;
+                    my_facts.max_enter_ref = i32::MAX;
+                    my_facts.mutably_borrows = false;
+                }
+            }
+        }
+
+        if self
+            .tcx
+            .opt_item_name(my_body_id.def_id())
+            .is_some_and(|name| name == sym::__autoken_assume_no_alias.get())
+        {
+            for my_facts in my_facts.values_mut() {
                 my_facts.max_enter_mut = i32::MAX;
                 my_facts.max_enter_ref = i32::MAX;
                 my_facts.mutably_borrows = false;
@@ -985,6 +1007,9 @@ mod sym {
 
     pub static __autoken_unborrow_immutably: ReusedSymbol =
         ReusedSymbol::new("__autoken_unborrow_immutably");
+
+    pub static __autoken_assume_no_alias_in: ReusedSymbol =
+        ReusedSymbol::new("__autoken_assume_no_alias_in");
 
     pub static __autoken_assume_no_alias: ReusedSymbol =
         ReusedSymbol::new("__autoken_assume_no_alias");

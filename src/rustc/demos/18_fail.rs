@@ -1,5 +1,5 @@
 fn main() {
-    let lock2 = assume_no_alias::<Lock, _>(|| Lock::new());
+    let lock2 = assume_no_alias_in::<Lock, _>(|| Lock::new());
     let lock1 = Lock::new();
     drop(lock1);
 }
@@ -44,11 +44,19 @@ fn unborrow_immutably<T: ?Sized>() {
     __autoken_unborrow_immutably::<T>();
 }
 
-pub fn assume_no_alias<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
+pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
     #[allow(clippy::extra_unused_type_parameters)] // Used by autoken
-    fn __autoken_assume_no_alias<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
+    fn __autoken_assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
         f()
     }
 
-    __autoken_assume_no_alias::<T, Res>(f)
+    __autoken_assume_no_alias_in::<T, Res>(f)
+}
+
+pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
+    fn __autoken_assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
+        f()
+    }
+
+    __autoken_assume_no_alias::<Res>(f)
 }
