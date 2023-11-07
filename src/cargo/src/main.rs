@@ -81,10 +81,12 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Let's also ensure that we have a valid sysroot for this version of `rustc`.
+    let target =
+        get_host_target(rustc_cmd(true, None)).context("failed to determine host target")?;
+
     build_sysroot(
         app_dir,
-        // TODO: Determine target dynamically
-        "aarch64-apple-darwin",
+        &target,
         rustc_cmd(true, None),
         cargo_cmd(rustc_cmd(true, None)),
     )
@@ -173,4 +175,12 @@ fn build_sysroot(
         .build_from_source(&sysroot_src_code)?;
 
     Ok(())
+}
+
+fn get_host_target(mut rust_cmd: Command) -> anyhow::Result<String> {
+    Ok(String::from_utf8(rust_cmd.arg("-vV").output()?.stdout)?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("failed to find `host: ` line")?
+        .to_string())
 }
