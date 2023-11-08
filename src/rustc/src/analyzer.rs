@@ -440,7 +440,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     (None, smallvec![*target])
                 }
                 TerminatorKind::SwitchInt { targets, .. } => {
-                    (None, targets.iter().map(|(_, bb)| bb).collect())
+                    (None, targets.all_targets().iter().copied().collect())
                 }
 
                 // Inline assembly is already quite inherently dangerous so it's probably fine to
@@ -453,7 +453,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                 //> The following terminators have no effects or blocks to call to.
                 TerminatorKind::UnwindResume
                 | TerminatorKind::UnwindTerminate(_)
-                | TerminatorKind::Unreachable => continue,
+                | TerminatorKind::Unreachable => (None, smallvec![]),
 
                 //> The following terminator is special in that it is the only way to safely
                 //> return. We treat this as branching to the last bb, which we reserve as
