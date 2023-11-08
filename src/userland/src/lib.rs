@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::{cmp::Ordering, fmt, marker::PhantomData};
+use core::{cmp::Ordering, fmt, marker::PhantomData, mem};
 
 // === Primitives === //
 
@@ -26,6 +26,16 @@ pub const fn unborrow_immutably<T: ?Sized>() {
     const fn __autoken_unborrow_immutably<T: ?Sized>() {}
 
     __autoken_unborrow_immutably::<T>();
+}
+
+pub const fn assert_mutably_borrowable<T: ?Sized>() {
+    borrow_mutably::<T>();
+    unborrow_mutably::<T>();
+}
+
+pub const fn assert_immutably_borrowable<T: ?Sized>() {
+    borrow_immutably::<T>();
+    unborrow_immutably::<T>();
 }
 
 pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
@@ -57,7 +67,7 @@ pub struct Nothing<'a> {
     __autoken_nothing_type_field_indicator: PhantomData<&'a ()>,
 }
 
-// === RAII === //
+// === Guaranteed RAII === //
 
 // MutableBorrow
 pub struct MutableBorrow<T: ?Sized> {
@@ -68,6 +78,18 @@ impl<T: ?Sized> MutableBorrow<T> {
     pub const fn new() -> Self {
         borrow_mutably::<T>();
         Self { _ty: PhantomData }
+    }
+
+    pub fn downgrade(self) -> PotentialMutableBorrow<T> {
+        PotentialMutableBorrow(self)
+    }
+
+    pub fn downgrade_ref(&self) -> &PotentialMutableBorrow<T> {
+        unsafe { mem::transmute(self) }
+    }
+
+    pub fn downgrade_mut(&mut self) -> &mut PotentialMutableBorrow<T> {
+        unsafe { mem::transmute(self) }
     }
 
     pub fn loan(&mut self) -> MutableBorrow<Nothing<'_>> {
@@ -137,6 +159,18 @@ impl<T: ?Sized> ImmutableBorrow<T> {
         Self { _ty: PhantomData }
     }
 
+    pub fn downgrade(self) -> PotentialImmutableBorrow<T> {
+        PotentialImmutableBorrow(self)
+    }
+
+    pub fn downgrade_ref(&self) -> &PotentialImmutableBorrow<T> {
+        unsafe { mem::transmute(self) }
+    }
+
+    pub fn downgrade_mut(&mut self) -> &mut PotentialImmutableBorrow<T> {
+        unsafe { mem::transmute(self) }
+    }
+
     pub const fn loan(&self) -> ImmutableBorrow<Nothing<'_>> {
         ImmutableBorrow::new()
     }
@@ -188,5 +222,127 @@ impl<T: ?Sized> Clone for ImmutableBorrow<T> {
 impl<T: ?Sized> Drop for ImmutableBorrow<T> {
     fn drop(&mut self) {
         unborrow_immutably::<T>();
+    }
+}
+
+// === Potential RAII === //
+
+// PotentialMutableBorrow
+#[repr(transparent)]
+pub struct PotentialMutableBorrow<T: ?Sized>(MutableBorrow<T>);
+
+impl<T: ?Sized> PotentialMutableBorrow<T> {
+    pub fn new() -> Self {
+        assume_no_alias(|| Self(MutableBorrow::new()))
+    }
+
+    pub fn loan(&mut self) -> MutableBorrow<Nothing<'_>> {
+        MutableBorrow::new()
+    }
+
+    pub fn assume_no_alias_loan(&self) -> MutableBorrow<Nothing<'_>> {
+        MutableBorrow::new()
+    }
+
+    pub fn strip_lifetime_analysis(self) -> PotentialMutableBorrow<Nothing<'static>> {
+        drop(self);
+        PotentialMutableBorrow::new()
+    }
+}
+
+impl<T: ?Sized> Default for PotentialMutableBorrow<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for PotentialMutableBorrow<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PotentialMutableBorrow")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: ?Sized> Eq for PotentialMutableBorrow<T> {}
+
+impl<T: ?Sized> PartialEq for PotentialMutableBorrow<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<T: ?Sized> Ord for PotentialMutableBorrow<T> {
+    fn cmp(&self, _other: &Self) -> Ordering {
+        Ordering::Equal
+    }
+}
+
+impl<T: ?Sized> PartialOrd for PotentialMutableBorrow<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: ?Sized> Clone for PotentialMutableBorrow<T> {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+// PotentialImmutableBorrow
+#[repr(transparent)]
+pub struct PotentialImmutableBorrow<T: ?Sized>(ImmutableBorrow<T>);
+
+impl<T: ?Sized> PotentialImmutableBorrow<T> {
+    pub fn new() -> Self {
+        assume_no_alias(|| Self(ImmutableBorrow::new()))
+    }
+
+    pub const fn loan(&self) -> ImmutableBorrow<Nothing<'_>> {
+        ImmutableBorrow::new()
+    }
+
+    pub fn strip_lifetime_analysis(self) -> PotentialImmutableBorrow<Nothing<'static>> {
+        drop(self);
+        PotentialImmutableBorrow::new()
+    }
+}
+
+impl<T: ?Sized> Default for PotentialImmutableBorrow<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for PotentialImmutableBorrow<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PotentialImmutableBorrow")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: ?Sized> Eq for PotentialImmutableBorrow<T> {}
+
+impl<T: ?Sized> PartialEq for PotentialImmutableBorrow<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<T: ?Sized> Ord for PotentialImmutableBorrow<T> {
+    fn cmp(&self, _other: &Self) -> Ordering {
+        Ordering::Equal
+    }
+}
+
+impl<T: ?Sized> PartialOrd for PotentialImmutableBorrow<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: ?Sized> Clone for PotentialImmutableBorrow<T> {
+    fn clone(&self) -> Self {
+        Self::new()
     }
 }
