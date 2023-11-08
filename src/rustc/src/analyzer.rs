@@ -267,6 +267,7 @@ enum AnalysisSubject<'tcx> {
     FnPtr(Ty<'tcx>),
 }
 
+#[derive(Debug)]
 enum MaybeFunctionFacts<'tcx> {
     Pending { my_depth: u32 },
     Done(FactMap<'tcx, FunctionFacts>),
@@ -278,7 +279,7 @@ type FunctionFactsMap<'tcx> = FactMap<'tcx, FunctionFacts>;
 
 type LeakFactsMap<'tcx> = FactMap<'tcx, LeakFacts>;
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct FunctionFacts {
     max_enter_ref: i32,
     max_enter_mut: i32,
@@ -401,7 +402,14 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
 
                 return min_recursion_into;
             }
-            MirGrabResult::BottomsOut => return u32::MAX,
+            MirGrabResult::BottomsOut => {
+                self.fn_facts.insert(
+                    AnalysisSubject::Instance(my_body_id),
+                    MaybeFunctionFacts::Done(FunctionFactsMap::default()),
+                );
+
+                return u32::MAX;
+            }
         };
 
         // Keep track of the minimum recursion depth.
@@ -863,7 +871,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     leaked_refs: 0,
                 },
             }
-        } else if item_name == sym::__autoken_borrow_mutably.get() {
+        } else if item_name == sym::__autoken_borrow_immutably.get() {
             FunctionFacts {
                 max_enter_mut: 0,
                 max_enter_ref: i32::MAX,
