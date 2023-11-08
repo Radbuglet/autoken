@@ -949,6 +949,10 @@ fn safeishly_grab_instance_mir<'tcx>(
             }
         }
 
+        // This is a shim around `FnDef` (or maybe an `FnPtr`?) for `FnTrait::call_x`. We generate the
+        // shim MIR for it and let the regular instance body processing handle it.
+        InstanceDef::FnPtrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
+
         // All the remaining things here require shims. We referenced...
         //
         // https://github.com/rust-lang/rust/blob/9c20ddd956426d577d77cb3f57a7db2227a3c6e9/compiler/rustc_mir_transform/src/shim.rs#L29
@@ -967,10 +971,9 @@ fn safeishly_grab_instance_mir<'tcx>(
 
         // These are dynamic dispatches and should not be analyzed since we analyze them in a
         // different way.
-        InstanceDef::VTableShim(_)
-        | InstanceDef::ReifyShim(_)
-        | InstanceDef::FnPtrShim(_, _)
-        | InstanceDef::Virtual(_, _) => MirGrabResult::Dynamic,
+        InstanceDef::VTableShim(_) | InstanceDef::ReifyShim(_) | InstanceDef::Virtual(_, _) => {
+            MirGrabResult::Dynamic
+        }
     }
 }
 
@@ -1014,12 +1017,12 @@ fn get_unsized_ty<'tcx>(
     }
 }
 
-struct ReusedSymbol {
+struct CachedSymbol {
     raw: &'static str,
     sym: OnceLock<Symbol>,
 }
 
-impl ReusedSymbol {
+impl CachedSymbol {
     const fn new(raw: &'static str) -> Self {
         Self {
             raw,
@@ -1036,29 +1039,29 @@ impl ReusedSymbol {
 
 #[allow(non_upper_case_globals)]
 mod sym {
-    use super::ReusedSymbol;
+    use super::CachedSymbol;
 
-    pub static __autoken_borrow_mutably: ReusedSymbol =
-        ReusedSymbol::new("__autoken_borrow_mutably");
+    pub static __autoken_borrow_mutably: CachedSymbol =
+        CachedSymbol::new("__autoken_borrow_mutably");
 
-    pub static __autoken_unborrow_mutably: ReusedSymbol =
-        ReusedSymbol::new("__autoken_unborrow_mutably");
+    pub static __autoken_unborrow_mutably: CachedSymbol =
+        CachedSymbol::new("__autoken_unborrow_mutably");
 
-    pub static __autoken_borrow_immutably: ReusedSymbol =
-        ReusedSymbol::new("__autoken_borrow_immutably");
+    pub static __autoken_borrow_immutably: CachedSymbol =
+        CachedSymbol::new("__autoken_borrow_immutably");
 
-    pub static __autoken_unborrow_immutably: ReusedSymbol =
-        ReusedSymbol::new("__autoken_unborrow_immutably");
+    pub static __autoken_unborrow_immutably: CachedSymbol =
+        CachedSymbol::new("__autoken_unborrow_immutably");
 
-    pub static __autoken_assume_no_alias_in: ReusedSymbol =
-        ReusedSymbol::new("__autoken_assume_no_alias_in");
+    pub static __autoken_assume_no_alias_in: CachedSymbol =
+        CachedSymbol::new("__autoken_assume_no_alias_in");
 
-    pub static __autoken_assume_no_alias: ReusedSymbol =
-        ReusedSymbol::new("__autoken_assume_no_alias");
+    pub static __autoken_assume_no_alias: CachedSymbol =
+        CachedSymbol::new("__autoken_assume_no_alias");
 
-    pub static __autoken_assume_black_box: ReusedSymbol =
-        ReusedSymbol::new("__autoken_assume_black_box");
+    pub static __autoken_assume_black_box: CachedSymbol =
+        CachedSymbol::new("__autoken_assume_black_box");
 
-    pub static __autoken_nothing_type_field_indicator: ReusedSymbol =
-        ReusedSymbol::new("__autoken_nothing_type_field_indicator");
+    pub static __autoken_nothing_type_field_indicator: CachedSymbol =
+        CachedSymbol::new("__autoken_nothing_type_field_indicator");
 }
