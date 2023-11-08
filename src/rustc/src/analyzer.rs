@@ -6,7 +6,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::{
-    mir::{BasicBlock, Body, CastKind, Rvalue, StatementKind, TerminatorKind, START_BLOCK},
+    mir::{
+        BasicBlock, Body, CastKind, Rvalue, StatementKind, Terminator, TerminatorKind, START_BLOCK,
+    },
     traits::util::supertraits,
     ty::{
         adjustment::PointerCoercion, EarlyBinder, GenericArg, Instance, InstanceDef, List,
@@ -442,7 +444,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
             // N.B. we intentionally ignore panics because they complicate analysis a lot and the
             // program is already broken by that point so we probably shouldn't bother ensuring that
             // those are safe.
-            let (calls, targets): (_, SmallVec<[_; 2]>) = match &curr_terminator.kind {
+            let (calls, mut targets): (_, SmallVec<[_; 2]>) = match &curr_terminator.kind {
                 //> The following terminators have no effects and are just connectors to other blocks.
                 TerminatorKind::Goto { target } | TerminatorKind::Assert { target, .. } => {
                     (None, smallvec![*target])
@@ -533,6 +535,25 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
                     unreachable!("drops should have been elaborated by this point")
                 }
             };
+
+            // Some of our transition targets may be U.B. to reach. We have to filter these out for
+            // analysis because, if we don't, the Rust compiler may occasionally reuse the same
+            // unreachable basic block for several unreachable scenarios, causing false positives
+            // for the leak consistency check.
+            targets.retain(|bb| {
+                // The virtual return bb is always valid
+                bb.as_u32() as usize >= my_body.basic_blocks.len()
+					// Otherwise, simply ensure that the target BB doesn't immediately cause U.B.
+					// Technically, we could trace out the path to ensure that we're not pointing to
+					// a U.B. "slide" but that hasn't seemed to be an issue.
+                    || !matches!(
+                        my_body.basic_blocks[*bb].terminator,
+                        Some(Terminator {
+                            kind: TerminatorKind::Unreachable,
+                            ..
+                        })
+                    )
+            });
 
             // If we call a function, analyze and propagate their leaked borrows.
             let empty_fact_map = FunctionFactsMap::default();
