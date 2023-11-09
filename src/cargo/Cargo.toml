@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+autoken = { version = "0.1.0", path = "../userland" }
 clap = { version = "4.4.7", features = ["derive"] }
 clap-cargo = { version = "0.13.0", features = ["cargo_metadata"] }
 directories = "5.0.1"

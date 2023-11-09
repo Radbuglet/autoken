@@ -10,7 +10,7 @@ use rustc_session::{config::ErrorOutputType, EarlyErrorHandler};
 
 use crate::analyzer::AnalyzerConfig;
 
-const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issueseaux";
+const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
 
 pub fn main_inner(args: Vec<String>) -> ! {
     // Install rustc's default logger
@@ -44,6 +44,21 @@ impl Callbacks for AnalyzeMirCallbacks {
         // break with clever `#[no_mangle]` hacks. Luckily, this analysis also only looks at functions
         // which are reachable from the main function so this is an okay limitation.
         config.opts.unstable_opts.always_encode_mir = true;
+
+        // Define version-checking CFGs
+        config
+            .crate_cfg
+            .insert(("__autoken_checking_version".to_string(), None));
+
+        config.crate_cfg.insert((
+            format!(
+                "__autoken_current_version_is_{}_{}_{}",
+                env!("CARGO_PKG_VERSION_MAJOR"),
+                env!("CARGO_PKG_VERSION_MINOR"),
+                env!("CARGO_PKG_VERSION_PATCH"),
+            ),
+            None,
+        ));
 
         // We also have to hack in a little environment variable to override the sysroot.
         if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {
