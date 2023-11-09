@@ -10,7 +10,7 @@ use rustc_session::{config::ErrorOutputType, EarlyErrorHandler};
 
 use crate::analyzer::AnalyzerConfig;
 
-const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
+const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issueseaux";
 
 pub fn main_inner(args: Vec<String>) -> ! {
     // Install rustc's default logger
