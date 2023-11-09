@@ -44,15 +44,6 @@ fn unborrow_immutably<T: ?Sized>() {
     __autoken_unborrow_immutably::<T>();
 }
 
-pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
-    #[allow(clippy::extra_unused_type_parameters)] // Used by autoken
-    fn __autoken_assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
-        f()
-    }
-
-    __autoken_assume_no_alias_in::<T, Res>(f)
-}
-
 pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
     fn __autoken_assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
         f()

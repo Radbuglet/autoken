@@ -783,7 +783,7 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
         if self
             .tcx
             .opt_item_name(my_body_id.def_id())
-            .is_some_and(|name| name == sym::__autoken_assume_no_alias_in.get())
+            .is_some_and(|name| name == sym::__autoken_assume_no_alias_in_many.get())
         {
             let ignored_ty = self.tcx.erase_regions_ty(my_body_id.args[0].expect_ty());
             let singleton_arr: [Ty<'tcx>; 1];
@@ -1074,8 +1074,8 @@ mod sym {
     pub static __autoken_unborrow_immutably: CachedSymbol =
         CachedSymbol::new("__autoken_unborrow_immutably");
 
-    pub static __autoken_assume_no_alias_in: CachedSymbol =
-        CachedSymbol::new("__autoken_assume_no_alias_in");
+    pub static __autoken_assume_no_alias_in_many: CachedSymbol =
+        CachedSymbol::new("__autoken_assume_no_alias_in_many");
 
     pub static __autoken_assume_no_alias: CachedSymbol =
         CachedSymbol::new("__autoken_assume_no_alias");

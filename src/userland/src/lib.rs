@@ -42,13 +42,20 @@ pub const fn assert_immutably_borrowable<T: ?Sized>() {
     unborrow_immutably::<T>();
 }
 
-pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
+pub fn assume_no_alias_in_many<T, Res>(f: impl FnOnce() -> Res) -> Res
+where
+    T: ?Sized + tuple_sealed::Tuple,
+{
     #[allow(clippy::extra_unused_type_parameters)] // Used by autoken
     fn __autoken_assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
         f()
     }
 
     __autoken_assume_no_alias_in::<T, Res>(f)
+}
+
+pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
+    assume_no_alias_in_many::<(T,), Res>(f)
 }
 
 pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
@@ -69,6 +76,34 @@ pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
 
 pub struct Nothing<'a> {
     __autoken_nothing_type_field_indicator: PhantomData<&'a ()>,
+}
+
+mod tuple_sealed {
+    pub trait Tuple {}
+
+    impl<A: ?Sized> Tuple for (A,) {}
+
+    impl<A, B: ?Sized> Tuple for (A, B) {}
+
+    impl<A, B, C: ?Sized> Tuple for (A, B, C) {}
+
+    impl<A, B, C, D: ?Sized> Tuple for (A, B, C, D) {}
+
+    impl<A, B, C, D, E: ?Sized> Tuple for (A, B, C, D, E) {}
+
+    impl<A, B, C, D, E, F: ?Sized> Tuple for (A, B, C, D, E, F) {}
+
+    impl<A, B, C, D, E, F, G: ?Sized> Tuple for (A, B, C, D, E, F, G) {}
+
+    impl<A, B, C, D, E, F, G, H: ?Sized> Tuple for (A, B, C, D, E, F, G, H) {}
+
+    impl<A, B, C, D, E, F, G, H, I: ?Sized> Tuple for (A, B, C, D, E, F, G, H, I) {}
+
+    impl<A, B, C, D, E, F, G, H, I, J: ?Sized> Tuple for (A, B, C, D, E, F, G, H, I, J) {}
+
+    impl<A, B, C, D, E, F, G, H, I, J, K: ?Sized> Tuple for (A, B, C, D, E, F, G, H, I, J, K) {}
+
+    impl<A, B, C, D, E, F, G, H, I, J, K, L: ?Sized> Tuple for (A, B, C, D, E, F, G, H, I, J, K, L) {}
 }
 
 // === Guaranteed RAII === //
