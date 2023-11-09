@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     let cargo_exe = PathBuf::from(std::env::var("CARGO")?);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
 
-    // Make `EXPECTED_RUSTC_VERSION` available to the binary.
+    // Make `AUTOKEN_EXPECTED_RUSTC_VERSION` available to the binary.
     let rustc_version =
         String::from_utf8(Command::new(rustc_exe).arg("--version").output()?.stdout)?;
 
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     // Ensure that our rustc wrapper is also available for embedding.
     let rustc_wrapper_src = {
         // `./../rustc`
-        let mut cwd = std::env::current_dir().unwrap();
+        let mut cwd = std::env::current_dir().unwrap().canonicalize()?;
         cwd.pop();
         cwd.push("rustc");
         cwd

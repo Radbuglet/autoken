@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+clap = { version = "4.4.7", features = ["derive"] }
+clap-cargo = "0.13.0"
 directories = "5.0.1"
 rustc-build-sysroot = "0.4.2"
 
