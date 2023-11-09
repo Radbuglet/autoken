@@ -35,7 +35,7 @@ enum CliCmd {
     Check(CliCmdCheck),
     #[command(about = "Print metadata about this cargo-autoken installation.")]
     Metadata,
-    #[command(about = "Clean cargo-autoken's global working directory.")]
+    #[command(about = "Clean cargo-autoken's global cache directory.")]
     ClearCache,
     #[command(about = "Emit the embedded rustc wrapper binary into the target path.")]
     EmitRustc {
@@ -83,7 +83,15 @@ struct CliCmdCheck {
         help = "Specify a custom target triple against which the project will be compiled and analyzed.",
         default_value = None,
     )]
-    target: Option<String>,
+    target_triple: Option<String>,
+
+    #[arg(
+        short = 'O',
+        long = "target-dir",
+        help = "Specify a custom cargo target directory into which the project will be compiled and analyzed.",
+        default_value = None,
+    )]
+    target_dir: Option<PathBuf>,
 
     // Cargo options
     #[command(flatten)]
@@ -153,7 +161,7 @@ fn main() -> anyhow::Result<()> {
             let bin = BinaryCollection::new(&mut app_dir, &args.binary_overrides)?;
 
             // Get the target.
-            let target = match args.target {
+            let target_triple = match args.target_triple {
                 Some(target) => target,
                 None => get_host_target(bin.rustc_cmd(true, None))
                     .context("failed to determine host target")?,
@@ -167,7 +175,7 @@ fn main() -> anyhow::Result<()> {
 
                     build_sysroot(
                         sysroot_dir,
-                        &target,
+                        &target_triple,
                         bin.rustc_cmd(true, None),
                         bin.cargo_cmd(bin.rustc_cmd(true, None)),
                     )?;
@@ -176,15 +184,33 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // Determine the target artifact directory for our compilation.
+            let target_dir = match args.target_dir {
+                Some(path) => path,
+                None => {
+                    let meta = args.manifest.metadata().exec().context(
+                        "Failed to get cargo metadata. This was performed in order to customize \
+                             the cargo target directory and can be skipped by setting it manually \
+                             by setting the `target-dir` parameter.",
+                    )?;
+                    let mut target_dir = PathBuf::from(meta.target_directory);
+                    target_dir.push(format!("autoken_{}", rustc_wrapper_hash()));
+                    target_dir
+                }
+            };
+
             // Call out to cargo to do the actual work!
             let mut cmd = bin.cargo_cmd(bin.rustc_cmd(false, Some(rustc_sysroot_path)));
-            cmd.arg("check").arg("--target").arg(target);
+            cmd.arg("check")
+                .arg("--target")
+                .arg(target_triple)
+                .arg("--target-dir")
+                .arg(target_dir);
 
             if let Some(path) = args.manifest.manifest_path {
                 cmd.arg("--path").arg(path);
             }
 
-            // TODO: Customize target directory
             // TODO: Allow users to pass their own custom arguments
 
             std::process::exit(
@@ -274,7 +300,7 @@ impl BinaryCollection {
             Some(path) => path.clone(),
             None => get_calling_cargo().context(
                 "Failed to get the cargo binary through which this cargo tool was invoked. If \
-                 this tool was not invoked through cargo, consider setting the `custom-cargo` flag",
+                 this tool was not invoked through cargo, consider setting the `custom-cargo` parameter.",
             )?,
         };
 
@@ -338,7 +364,7 @@ impl BinaryCollection {
                     format!(
                         "Failed to extract our autoken rustc wrapper into {}. You can specify a \
                          path to a custom autoken rustc wrapper by setting the `custom-rustc-wrapper`
-                         flag.",
+                         parameter.",
                         path.to_string_lossy(),
                     )
                 })?;
