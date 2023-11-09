@@ -42,42 +42,31 @@ enum CliCmd {
         #[arg(help = "The path of the binary to be written.")]
         path: PathBuf,
     },
-    // TODO: Add the ability to build custom sysroots.
-    // #[command(
-    //     about = "Build a suitable sysroot for the rustc wrapper binary into the target path."
-    // )]
-    // BuildSysroot {
-    //     #[arg(help = "The path of the sysroot to be built.")]
-    //     path: PathBuf,
-    // },
+    #[command(
+        about = "Build a suitable sysroot for the rustc wrapper binary into the target path."
+    )]
+    BuildSysroot {
+        #[command(flatten)]
+        binary_overrides: CliBinaryOverrides,
+
+        #[arg(
+            short = 't',
+            long = "target",
+            help = "Specify the target triple for which the sysroot will be generated.",
+            default_value = None,
+        )]
+        target: Option<String>,
+
+        #[arg(help = "The path of the sysroot to be built.")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
 struct CliCmdCheck {
     // Binary overrides
-    #[arg(
-        short = 'I',
-        long = "disable-toolchain-checks",
-        help = "Disable calling cargo version integrity checks.",
-        default_value_t = false
-    )]
-    disable_toolchain_checks: bool,
-
-    #[arg(
-        short = 'C',
-        long = "custom-cargo",
-        help = "Use a custom Cargo executable to check this project.",
-        default_value = None,
-    )]
-    custom_cargo: Option<PathBuf>,
-
-    #[arg(
-        short = 'R',
-        long = "custom-rustc-wrapper",
-        help = "Use a custom rustc wrapper executable to check this project.",
-        default_value = None,
-    )]
-    custom_rustc_wrapper: Option<PathBuf>,
+    #[command(flatten)]
+    binary_overrides: CliBinaryOverrides,
 
     #[arg(
         short = 'S',
@@ -106,9 +95,37 @@ struct CliCmdCheck {
     // features: clap_cargo::Features,
 }
 
+#[derive(Debug, Args)]
+struct CliBinaryOverrides {
+    #[arg(
+        short = 'I',
+        long = "disable-toolchain-checks",
+        help = "Disable calling cargo version integrity checks.",
+        default_value_t = false
+    )]
+    disable_toolchain_checks: bool,
+
+    #[arg(
+        short = 'C',
+        long = "custom-cargo",
+        help = "Use a custom Cargo executable to check this project.",
+        default_value = None,
+    )]
+    custom_cargo: Option<PathBuf>,
+
+    #[arg(
+        short = 'R',
+        long = "custom-rustc-wrapper",
+        help = "Use a custom rustc wrapper executable to check this project.",
+        default_value = None,
+    )]
+    custom_rustc_wrapper: Option<PathBuf>,
+}
+
 // === Driver === //
 
 fn main() -> anyhow::Result<()> {
+    // Parse CLI
     let cli = Cli::parse_from({
         let mut args = std::env::args().peekable();
 
@@ -123,104 +140,22 @@ fn main() -> anyhow::Result<()> {
         args
     });
 
+    // Get a cache directory for our work.
+    let mut app_dir = LazilyComputed::new(|| {
+        ProjectDirs::from("me", "radbuglet", "autoken")
+            .context("failed to get a cache directory for autoken")
+    });
+
+    // Handle CLI
     match cli.cmd {
         CliCmd::Check(args) => {
-            // Get a path to cargo.
-            let cargo_exe = match args.custom_cargo {
-                Some(path) => path,
-                None => get_calling_cargo().context(
-                    "Failed to get the cargo binary through which this cargo tool was invoked. If \
-                     this tool was not invoked through cargo, consider setting the `custom-cargo` flag",
-                )?,
-            };
-
-            let cargo_cmd = |rust_cmd: Command| {
-                let mut cmd = Command::new(&cargo_exe);
-                cmd.env("RUSTC", rust_cmd.get_program());
-                cmd.envs(rust_cmd.get_envs().filter_map(|(a, b)| Some((a, b?))));
-                cmd
-            };
-
-            // Ensure that cargo's `rustc` version string against which `cargo`'s linker path is
-            // provided is appropriate for our rustc binary.
-            if !args.disable_toolchain_checks {
-                let mut cargo_rustc_exe = cargo_exe.clone();
-                if cfg!(windows) {
-                    cargo_rustc_exe.set_file_name("rustc.exe");
-                } else {
-                    cargo_rustc_exe.set_file_name("rustc");
-                }
-
-                let cargo_rustc_version = get_rustc_version_str(&cargo_rustc_exe).with_context(||
-                    format!(
-                        "Failed to determine version of the rustc binary with which the invoking \
-                         cargo command was distributed (expected path: {}). This is for an integrity \
-                         check so, if this cannot be satisfied, you can bypass this check entirely \
-                         by setting the `disable-toolchain-checks` flag.",
-                        cargo_rustc_exe.to_string_lossy(),
-                    )
-                )?;
-
-                if cargo_rustc_version.lines().next() != Some(rustc_wrapper_version()) {
-                    anyhow::bail!(
-                        "The version of rustc (path: {}) with which cargo was bundled was {:?} but \
-                         autoken's rustc version was {:?}. Make sure to call cargo with the appropriate \
-                         toolchain parameter to avoid dynamic linker errors. If this is a false positive, \
-                         you can bypass this check by setting the `disable-toolchain-checks` flag.",
-                        cargo_rustc_exe.to_string_lossy(),
-                        cargo_rustc_version,
-                        env!("AUTOKEN_EXPECTED_RUSTC_VERSION"),
-                    );
-                }
-            }
-
-            // Get a cache directory for our work.
-            let mut app_dir = LazilyComputed::new(|| {
-                ProjectDirs::from("me", "radbuglet", "autoken")
-                    .context("failed to get a cache directory for autoken")
-            });
-
-            // Get our rustc wrapper.
-            let rustc_wrapper_path = match args.custom_rustc_wrapper {
-                Some(path) => path,
-                None => {
-                    // Determine its path
-                    let mut path = app_dir
-                        .get()
-                        .context(
-                            "Failed to get a work directory into which we can extract our custom \
-                             rustc wrapper. You can specify a path to a custom autoken rustc wrapper \
-                             by setting the `custom-rustc-wrapper` flag."
-                        )?
-                        .cache_dir()
-                        .to_path_buf();
-
-                    if cfg!(windows) {
-                        path.push("autoken_rustc_wrapper.exe");
-                    } else {
-                        path.push("autoken_rustc_wrapper");
-                    }
-
-                    // Extract it
-                    write_rustc_wrapper_exe(&path).with_context(|| {
-                        format!(
-                            "Failed to extract our autoken rustc wrapper into {}. You can specify a \
-                             path to a custom autoken rustc wrapper by setting the `custom-rustc-wrapper`
-                             flag.",
-                            path.to_string_lossy(),
-                        )
-                    })?;
-
-                    path
-                }
-            };
-
-            let rustc_cmd = get_rustc_wrapper_cmd_gen(&rustc_wrapper_path);
+            // Get the binary collection.
+            let bin = BinaryCollection::new(&mut app_dir, &args.binary_overrides)?;
 
             // Get the target.
             let target = match args.target {
                 Some(target) => target,
-                None => get_host_target(rustc_cmd(true, None))
+                None => get_host_target(bin.rustc_cmd(true, None))
                     .context("failed to determine host target")?,
             };
 
@@ -233,8 +168,8 @@ fn main() -> anyhow::Result<()> {
                     build_sysroot(
                         sysroot_dir,
                         &target,
-                        rustc_cmd(true, None),
-                        cargo_cmd(rustc_cmd(true, None)),
+                        bin.rustc_cmd(true, None),
+                        bin.cargo_cmd(bin.rustc_cmd(true, None)),
                     )?;
 
                     sysroot_dir
@@ -242,7 +177,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             // Call out to cargo to do the actual work!
-            let mut cmd = cargo_cmd(rustc_cmd(false, Some(rustc_sysroot_path)));
+            let mut cmd = bin.cargo_cmd(bin.rustc_cmd(false, Some(rustc_sysroot_path)));
             cmd.arg("check").arg("--target").arg(target);
 
             if let Some(path) = args.manifest.manifest_path {
@@ -290,6 +225,140 @@ fn main() -> anyhow::Result<()> {
             write_rustc_wrapper_exe(&path).context("failed to write rustc wrapper")?;
             Ok(())
         }
+        CliCmd::BuildSysroot {
+            binary_overrides,
+            target,
+            path,
+        } => {
+            // Get the binary collection.
+            let bin = BinaryCollection::new(&mut app_dir, &binary_overrides)?;
+
+            // Get the target.
+            let target = match target {
+                Some(target) => target,
+                None => get_host_target(bin.rustc_cmd(true, None))
+                    .context("failed to determine host target")?,
+            };
+
+            // Build the requested sysroot.
+            eprintln!(
+                "Building sysroot for target {target} in path {}...",
+                path.to_string_lossy()
+            );
+
+            build_sysroot(
+                &path,
+                &target,
+                bin.rustc_cmd(true, None),
+                bin.cargo_cmd(bin.rustc_cmd(true, None)),
+            )?;
+
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BinaryCollection {
+    cargo_exe: PathBuf,
+    rustc_wrapper_path: PathBuf,
+}
+
+impl BinaryCollection {
+    pub fn new(
+        app_dir: &mut LazilyComputed<'_, ProjectDirs>,
+        args: &CliBinaryOverrides,
+    ) -> anyhow::Result<Self> {
+        // Get a path to cargo.
+        let cargo_exe = match &args.custom_cargo {
+            Some(path) => path.clone(),
+            None => get_calling_cargo().context(
+                "Failed to get the cargo binary through which this cargo tool was invoked. If \
+                 this tool was not invoked through cargo, consider setting the `custom-cargo` flag",
+            )?,
+        };
+
+        // Ensure that cargo's `rustc` version string against which `cargo`'s linker path is
+        // provided is appropriate for our rustc binary.
+        if !args.disable_toolchain_checks {
+            let mut cargo_rustc_exe = cargo_exe.clone();
+            if cfg!(windows) {
+                cargo_rustc_exe.set_file_name("rustc.exe");
+            } else {
+                cargo_rustc_exe.set_file_name("rustc");
+            }
+
+            let cargo_rustc_version =
+                get_rustc_version_str(&cargo_rustc_exe).with_context(|| {
+                    format!(
+                        "Failed to determine version of the rustc binary with which the invoking \
+                     cargo command was distributed (expected path: {}). This is for an integrity \
+                     check so, if this cannot be satisfied, you can bypass this check entirely \
+                     by setting the `disable-toolchain-checks` flag.",
+                        cargo_rustc_exe.to_string_lossy(),
+                    )
+                })?;
+
+            if cargo_rustc_version.lines().next() != Some(rustc_wrapper_version()) {
+                anyhow::bail!(
+                    "The version of rustc (path: {}) with which cargo was bundled was {:?} but \
+                     autoken's rustc version was {:?}. Make sure to call cargo with the appropriate \
+                     toolchain parameter to avoid dynamic linker errors. If this is a false positive, \
+                     you can bypass this check by setting the `disable-toolchain-checks` flag.",
+                    cargo_rustc_exe.to_string_lossy(),
+                    cargo_rustc_version,
+                    env!("AUTOKEN_EXPECTED_RUSTC_VERSION"),
+                );
+            }
+        }
+
+        // Get our rustc wrapper.
+        let rustc_wrapper_path = match &args.custom_rustc_wrapper {
+            Some(path) => path.clone(),
+            None => {
+                // Determine its path
+                let mut path = app_dir
+                    .get()
+                    .context(
+                        "Failed to get a work directory into which we can extract our custom \
+                         rustc wrapper. You can specify a path to a custom autoken rustc wrapper \
+                         by setting the `custom-rustc-wrapper` flag.",
+                    )?
+                    .cache_dir()
+                    .to_path_buf();
+
+                if cfg!(windows) {
+                    path.push("autoken_rustc_wrapper.exe");
+                } else {
+                    path.push("autoken_rustc_wrapper");
+                }
+
+                // Extract it
+                write_rustc_wrapper_exe(&path).with_context(|| {
+                    format!(
+                        "Failed to extract our autoken rustc wrapper into {}. You can specify a \
+                         path to a custom autoken rustc wrapper by setting the `custom-rustc-wrapper`
+                         flag.",
+                        path.to_string_lossy(),
+                    )
+                })?;
+
+                path
+            }
+        };
+
+        Ok(Self {
+            cargo_exe,
+            rustc_wrapper_path,
+        })
+    }
+
+    pub fn cargo_cmd(&self, rustc: Command) -> Command {
+        get_cargo_wrapper_cmd_gen(&self.cargo_exe)(rustc)
+    }
+
+    pub fn rustc_cmd(&self, skip_analysis: bool, sysroot: Option<&Path>) -> Command {
+        get_rustc_wrapper_cmd_gen(&self.rustc_wrapper_path)(skip_analysis, sysroot)
     }
 }
 
@@ -335,6 +404,15 @@ fn write_rustc_wrapper_exe(path: &Path) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+fn get_cargo_wrapper_cmd_gen(cargo_exe: &Path) -> impl Fn(Command) -> Command + '_ {
+    move |rust_cmd: Command| {
+        let mut cmd = Command::new(cargo_exe);
+        cmd.env("RUSTC", rust_cmd.get_program());
+        cmd.envs(rust_cmd.get_envs().filter_map(|(a, b)| Some((a, b?))));
+        cmd
+    }
 }
 
 fn get_rustc_wrapper_cmd_gen(
@@ -389,17 +467,17 @@ fn build_sysroot(
     Ok(())
 }
 
-enum LazilyComputed<V, F> {
+enum LazilyComputed<'f, V> {
     Ok(V),
-    Pending(Option<F>),
+    Pending(Option<Box<dyn FnOnce() -> anyhow::Result<V> + 'f>>),
 }
 
-impl<V, F> LazilyComputed<V, F>
-where
-    F: FnOnce() -> anyhow::Result<V>,
-{
-    pub fn new(f: F) -> Self {
-        Self::Pending(Some(f))
+impl<'f, V> LazilyComputed<'f, V> {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: 'f + FnOnce() -> anyhow::Result<V>,
+    {
+        Self::Pending(Some(Box::new(f)))
     }
 
     pub fn get(&mut self) -> anyhow::Result<&mut V> {
