@@ -8,4 +8,3 @@ rustc_private = true
 
 [dependencies]
 smallvec = "1.11.1"
-autoken-versions = { path = "../versions" }

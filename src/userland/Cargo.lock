@@ -5,10 +5,3 @@ version = 3
 [[package]]
 name = "autoken"
 version = "0.1.0"
-dependencies = [
- "autoken-versions",
-]
-
-[[package]]
-name = "autoken-versions"
-version = "0.1.0"

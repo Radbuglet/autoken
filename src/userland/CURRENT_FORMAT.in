@@ -1,0 +1,5 @@
+// This configuration file appears in two places: `rustc/CURRENT_FORMAT.in` and `userland/CURRENT_FORMAT.in`.
+// These must be kept in sync.
+const CURRENT_FORMAT_MAJOR: u32 = 1;
+const CURRENT_FORMAT_MINOR: u32 = 1;
+const DEPRECATED_FORMAT_MINOR: u32 = 0;
