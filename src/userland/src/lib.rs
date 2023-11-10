@@ -227,9 +227,10 @@
 //! You may occasionally see fallible borrow methods which take in a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow)
 //! or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow) "loaner" guard. The reason for
 //! these guards is somewhat similar to why we need loaner guards for other conditionally created
-//! borrows with the added caveat that, because the borrow only happens if it is allowed to happen,
-//! the guard need not cause a static analysis warning if its in a scope that already has confounding
-//! borrows since, if they truly do alias, the borrow won't actually happen at runtime.
+//! borrows with the added caveat that, because these borrow guards are being used with a fallible borrow
+//! method, it is assumed that the aliasing with an existing borrow can be handled gracefully at
+//! runtime. Because of this assumption, `PotentialMutableBorrows` do not emit a warning if another
+//! confounding borrow guard is already in scope.
 //!
 //! ```rust
 //! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
@@ -267,6 +268,50 @@
 //! // borrowed, the function returns an `Err` rather than panicking.
 //! let mut my_loaner_2 = PotentialMutableBorrow::<u32>::new();
 //! let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap_err();
+//! ```
+//!
+//! If the borrow cannot be handled gracefully, one may create a [`MutableBorrow`](crate::MutableBorrow)
+//! or [`ImmutableBorrow`](crate::ImmutableBorrow) guard and [`downgrade`](crate::MutableBorrow::downgrade)
+//! it to a `PotentialMutableBorrow` or `PotentialImmutableBorrow` guard so that the static analyzer
+//! will start reporting these potentially aliasing borrows again.
+//!
+//! ```no_run
+//! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
+//! # #[derive(Debug)]
+//! # struct MyRefMut<'a, T, B = T> {
+//! #     token: MutableBorrow<B>,
+//! #     sptr: RefMut<'a, T>,
+//! # }
+//! # use autoken::{Nothing, PotentialMutableBorrow};
+//! # #[derive(Debug)]
+//! # struct MyCell<T> {
+//! #     inner: RefCell<T>,
+//! # }
+//! # impl<T> MyCell<T> {
+//! #     pub fn new(value: T) -> Self {
+//! #         Self { inner: RefCell::new(value) }
+//! #     }
+//! #
+//! #     pub fn try_borrow_mut<'l>(
+//! #         &self,
+//! #         loaner: &'l mut PotentialMutableBorrow<T>
+//! #     ) -> Result<MyRefMut<'_, T, Nothing<'l>>, BorrowMutError> {
+//! #         self.inner.try_borrow_mut().map(|sptr| MyRefMut {
+//! #             token: loaner.loan(),
+//! #             sptr,
+//! #         })
+//! #     }
+//! # }
+//! let my_cell = MyCell::new(1u32);
+//!
+//! let mut my_loaner_1 = PotentialMutableBorrow::<u32>::new();
+//! let borrow_1 = my_cell.try_borrow_mut(&mut my_loaner_1).unwrap();
+//!
+//! // Unlike the previous example, this code cannot handle aliasing borrows gracefully, so we should
+//! // create a `MutableBorrow` first to get the alias check and then downgrade it for use in the
+//! // fallible borrowing method.
+//! let mut my_loaner_2 = MutableBorrow::<u32>::new().downgrade();
+//! let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap();
 //! ```
 //!
 //! ## Dealing With Dynamic Dispatches
@@ -798,6 +843,18 @@ pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
     __autoken_assume_black_box::<T>(f)
 }
 
+/// A marker type representing a borrow of... "nothing."
+///
+/// When passed as a parameter to any borrow-adjacent function or method in this crate, this type
+/// essentially turns that operation into a no-op. The lifetime is merely a placeholder to help with
+/// the common idioms detailed in the [Dealing with Limitations](index.html#dealing-with-limitations)
+/// section of the integration guide.
+///
+/// This is useful for disabling borrows for a given RAII'd AuToken object, as needed by
+/// `strip_lifetime_analysis` or for tying an object's borrow to a different [`MutableBorrow`] or
+/// [`ImmutableBorrow`] guard.
+///
+/// An instance of this type cannot be obtained—it is a marker type.
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Nothing<'a> {
     __autoken_nothing_type_field_indicator: PhantomData<&'a ()>,
@@ -833,7 +890,18 @@ mod tuple_sealed {
 
 // === Guaranteed RAII === //
 
-// MutableBorrow
+/// A guard for a virtual mutable borrow of the global token of type `T`.
+///
+/// These can be thought of as [`Ref`](core::cell::Ref)s to those global tokens except that they have
+/// no impact on the runtime and only contribute to AuToken's static analysis of the binary.
+///
+/// Developers wishing to integrate their crate with AuToken will likely use this type to represent
+/// the static counterpart to a runtime borrow of some cell of type `T` as described in the
+/// [Integrating AuToken](index.html#integrating-autoken) section of the crate documentation.
+///
+/// End-users consuming crates with integrations with AuToken, meanwhile, will likely only use these
+/// guards for loaned borrows as described by the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+/// section of the crate documentation.
 pub struct MutableBorrow<T: ?Sized> {
     _ty: PhantomData<fn() -> T>,
 }
@@ -912,7 +980,18 @@ impl<T: ?Sized> Drop for MutableBorrow<T> {
     }
 }
 
-// ImmutableBorrow
+/// A guard for a virtual mutable borrow of the global token of type `T`.
+///
+/// These can be thought of as [`Ref`](core::cell::Ref)s to those global tokens except that they have
+/// no impact on the runtime and only contribute to AuToken's static analysis of the binary.
+///
+/// Developers wishing to integrate their crate with AuToken will likely use this type to represent
+/// the static counterpart to a runtime borrow of some cell of type `T` as described in the
+/// [Integrating AuToken](index.html#integrating-autoken) section of the crate documentation.
+///
+/// End-users consuming crates with integrations with AuToken, meanwhile, will likely only use these
+/// guards for loaned borrows as described by the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+/// section of the crate documentation.
 pub struct ImmutableBorrow<T: ?Sized> {
     _ty: PhantomData<fn() -> T>,
 }
@@ -991,7 +1070,19 @@ impl<T: ?Sized> Drop for ImmutableBorrow<T> {
 
 // === Potential RAII === //
 
-// PotentialMutableBorrow
+/// A variant of [`MutableBorrow`] which represents a mutable borrow which only really happens if
+/// doing so is safe.
+///
+/// Unlike a `MutableBorrow`, this token will not trigger a warning if a confounding borrow is
+/// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
+/// ends up aliasing with something else, the error is assumed to be handled gracefully.
+///
+/// If the error cannot be handled gracefully, one may construct a `MutableBorrow` and
+/// [`downgrade`](MutableBorrow::downgrade) it to a `PotentialMutableBorrow` so that the static
+/// analyzer will start reporting these potentially aliasing borrows again.
+///
+/// See the [Potential Borrows](index.html#potential-borrows) section of the crate documentation for
+/// more details.
 #[repr(transparent)]
 pub struct PotentialMutableBorrow<T: ?Sized>(MutableBorrow<T>);
 
@@ -1053,7 +1144,19 @@ impl<T: ?Sized> Clone for PotentialMutableBorrow<T> {
     }
 }
 
-// PotentialImmutableBorrow
+/// A variant of [`ImmutableBorrow`] which represents a mutable borrow which only really happens if
+/// doing so is safe.
+///
+/// Unlike an `ImmutableBorrow`, this token will not trigger a warning if a confounding borrow is
+/// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
+/// ends up aliasing with something else, the error is assumed to be handled gracefully.
+///
+/// If the error cannot be handled gracefully, one may construct an `ImmutableBorrow` and
+/// [`downgrade`](ImmutableBorrow::downgrade) it to a `PotentialImmutableBorrow` so that the static
+/// analyzer will start reporting these potentially aliasing borrows again.
+///
+/// See the [Potential Borrows](index.html#potential-borrows) section of the crate documentation for
+/// more details.
 #[repr(transparent)]
 pub struct PotentialImmutableBorrow<T: ?Sized>(ImmutableBorrow<T>);
 
