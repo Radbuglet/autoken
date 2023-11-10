@@ -21,10 +21,10 @@ fn main() {
     writeln!(
         file,
         "compile_error!(\"Expected autoken to be validated by cargo-autoken version {}.{}.{} but got \
-		 a different version. Run `cargo autoken --version` to get the current version.\");",
+         a different version. Run `cargo autoken --version` to get the current version.\");",
         std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
-		std::env::var("CARGO_PKG_VERSION_MINOR").unwrap(),
-		std::env::var("CARGO_PKG_VERSION_PATCH").unwrap(),
+        std::env::var("CARGO_PKG_VERSION_MINOR").unwrap(),
+        std::env::var("CARGO_PKG_VERSION_PATCH").unwrap(),
     )
     .unwrap();
 

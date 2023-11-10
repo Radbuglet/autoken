@@ -543,9 +543,9 @@ impl<'cl, 'tcx> FactAnalyzer<'cl, 'tcx> {
             targets.retain(|bb| {
                 // The virtual return bb is always valid
                 bb.as_u32() as usize >= my_body.basic_blocks.len()
-					// Otherwise, simply ensure that the target BB doesn't immediately cause U.B.
-					// Technically, we could trace out the path to ensure that we're not pointing to
-					// a U.B. "slide" but that hasn't seemed to be an issue.
+                    // Otherwise, simply ensure that the target BB doesn't immediately cause U.B.
+                    // Technically, we could trace out the path to ensure that we're not pointing to
+                    // a U.B. "slide" but that hasn't seemed to be an issue.
                     || !matches!(
                         my_body.basic_blocks[*bb].terminator,
                         Some(Terminator {
