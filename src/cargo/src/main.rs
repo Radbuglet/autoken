@@ -33,6 +33,17 @@ struct Cli {
 enum CliCmd {
     #[command(about = "Analyze the specified program.")]
     Check(CliCmdCheck),
+    #[command(about = "Run autoken's version of rustc.")]
+    Rustc {
+        #[command(flatten)]
+        binary_overrides: CliBinaryOverrides,
+
+        #[command(flatten)]
+        rustc_overrides: CliRustcOverrides,
+
+        #[command(subcommand)]
+        args: CliRustcArgs,
+    },
     #[command(about = "Print metadata about this cargo-autoken installation.")]
     Metadata,
     #[command(about = "Clean cargo-autoken's global cache directory.")]
@@ -68,22 +79,8 @@ struct CliCmdCheck {
     #[command(flatten)]
     binary_overrides: CliBinaryOverrides,
 
-    #[arg(
-        short = 'S',
-        long = "custom-rustc-sysroot",
-        help = "Use a custom sysroot with our rustc wrapper executable to check this project.",
-        default_value = None,
-    )]
-    custom_rustc_sysroot: Option<PathBuf>,
-
-    // Check options
-    #[arg(
-        short = 't',
-        long = "target",
-        help = "Specify a custom target triple against which the project will be compiled and analyzed.",
-        default_value = None,
-    )]
-    target_triple: Option<String>,
+    #[command(flatten)]
+    rustc_overrides: CliRustcOverrides,
 
     #[arg(
         short = 'O',
@@ -105,11 +102,6 @@ struct CliCmdCheck {
     // Cargo options
     #[command(flatten)]
     manifest: clap_cargo::Manifest,
-    // TODO: Forward more cargo arguments
-    // #[command(flatten)]
-    // workspace: clap_cargo::Workspace,
-    // #[command(flatten)]
-    // features: clap_cargo::Features,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -146,6 +138,41 @@ struct CliBinaryOverrides {
     custom_rustc_wrapper: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct CliRustcOverrides {
+    #[arg(
+        short = 'S',
+        long = "custom-rustc-sysroot",
+        help = "Use a custom sysroot with our rustc wrapper executable to check this project.",
+        default_value = None,
+    )]
+    custom_rustc_sysroot: Option<PathBuf>,
+
+    // Check options
+    #[arg(
+        short = 't',
+        long = "target",
+        help = "Specify a custom target triple against which the project will be compiled and analyzed.",
+        default_value = None,
+    )]
+    target_triple: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(disable_help_flag = true)]
+enum CliRustcArgs {
+    #[command(
+        name = "metadata",
+        about = "Print metadata about the rustc instance to be run"
+    )]
+    Metadata,
+    #[command(name = "with", about = "Run rustc with the specified arguments")]
+    With {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rustc_args: Vec<String>,
+    },
+}
+
 // === Driver === //
 
 fn main() -> anyhow::Result<()> {
@@ -176,29 +203,8 @@ fn main() -> anyhow::Result<()> {
             // Get the binary collection.
             let bin = BinaryCollection::new(&mut app_dir, &args.binary_overrides)?;
 
-            // Get the target.
-            let target_triple = match args.target_triple {
-                Some(target) => target,
-                None => get_host_target(bin.rustc_cmd(true, None))
-                    .context("failed to determine host target")?,
-            };
-
-            // Get a sysroot for our wrapper.
-            let rustc_sysroot_path = match &args.custom_rustc_sysroot {
-                Some(path) => path,
-                None => {
-                    let sysroot_dir = app_dir.get()?.cache_dir();
-
-                    build_sysroot(
-                        sysroot_dir,
-                        &target_triple,
-                        bin.rustc_cmd(true, None),
-                        bin.cargo_cmd(bin.rustc_cmd(true, None)),
-                    )?;
-
-                    sysroot_dir
-                }
-            };
+            let (target_triple, rustc_sysroot_path) =
+                prepare_rust_wrapper(&mut app_dir, &bin, &args.rustc_overrides)?;
 
             // Determine the target artifact directory for our compilation.
             let target_dir = match args.target_dir {
@@ -206,8 +212,8 @@ fn main() -> anyhow::Result<()> {
                 None => {
                     let meta = args.manifest.metadata().exec().context(
                         "Failed to get cargo metadata. This was performed in order to customize \
-                             the cargo target directory and can be skipped by setting it manually \
-                             by setting the `target-dir` parameter.",
+                         the cargo target directory and can be skipped by setting it manually \
+                         by setting the `target-dir` parameter.",
                     )?;
                     let mut target_dir = PathBuf::from(meta.target_directory);
                     target_dir.push("autoken");
@@ -262,6 +268,44 @@ fn main() -> anyhow::Result<()> {
                     .code()
                     .unwrap_or(1),
             );
+        }
+        CliCmd::Rustc {
+            binary_overrides,
+            rustc_overrides,
+            args,
+        } => {
+            // Get the binary collection.
+            let bin = BinaryCollection::new(&mut app_dir, &binary_overrides)?;
+
+            let (target_triple, rustc_sysroot_path) =
+                prepare_rust_wrapper(&mut app_dir, &bin, &rustc_overrides)?;
+
+            // Call out to autoken-rustc to do the actual work!
+            match args {
+                CliRustcArgs::Metadata => {
+                    println!("autoken-rustc-exe: {}", bin.rustc_wrapper_path.to_string_lossy());
+					println!("autoken-rustc-sysroot-target: {}", target_triple);
+					println!("autoken-rustc-sysroot-path: {}", rustc_sysroot_path.to_string_lossy());
+                    Ok(())
+                }
+                CliRustcArgs::With { rustc_args } => std::process::exit(
+                    bin.rustc_cmd(false, Some(rustc_sysroot_path))
+                        .arg("--target")
+                        .arg(target_triple)
+                        .args(rustc_args)
+                        .spawn()
+                        .with_context(|| {
+                            format!(
+                                "Failed to spawn autoken-rustc (path: {})",
+                                bin.rustc_wrapper_path.to_string_lossy()
+                            )
+                        })?
+                        .wait_with_output()?
+                        .status
+                        .code()
+                        .unwrap_or(1),
+                ),
+            }
         }
         CliCmd::Metadata => {
             println!("cargo-autoken-version: {}", env!("CARGO_PKG_VERSION"));
@@ -394,10 +438,12 @@ impl BinaryCollection {
                     .cache_dir()
                     .to_path_buf();
 
+                let file_name = format!("autoken_rustc_wrapper_{}", rustc_wrapper_hash());
+
                 if cfg!(windows) {
-                    path.push("autoken_rustc_wrapper.exe");
+                    path.push(&format!("{file_name}.exe"));
                 } else {
-                    path.push("autoken_rustc_wrapper");
+                    path.push(&file_name);
                 }
 
                 // Extract it
@@ -510,6 +556,43 @@ fn get_host_target(mut rust_cmd: Command) -> anyhow::Result<String> {
         .find_map(|line| line.strip_prefix("host: "))
         .context("failed to find `host: ` line")?
         .to_string())
+}
+
+fn prepare_rust_wrapper<'a>(
+    app_dir: &'a mut LazilyComputed<'_, ProjectDirs>,
+    bin: &BinaryCollection,
+    args: &'a CliRustcOverrides,
+) -> anyhow::Result<(String, &'a Path)> {
+    // Get the target.
+    let target_triple = match &args.target_triple {
+        Some(target) => target.clone(),
+        None => get_host_target(bin.rustc_cmd(true, None)).context(
+            "Failed to determine host target triple while preparing sysroot. This can be skipped by \
+			 specifying a target explicitly with the `target` parameter.",
+        )?,
+    };
+
+    // Get a sysroot for our wrapper.
+    let rustc_sysroot_path = match &args.custom_rustc_sysroot {
+        Some(path) => path,
+        None => {
+            let sysroot_dir = app_dir.get()?.cache_dir();
+
+            build_sysroot(
+                sysroot_dir,
+                &target_triple,
+                bin.rustc_cmd(true, None),
+                bin.cargo_cmd(bin.rustc_cmd(true, None)),
+            ).context(
+				"Failed to build sysroot. This can be skipped by specifying a sysroot explicitly with \
+				 the `custom-rustc-sysroot` parameter."
+			)?;
+
+            sysroot_dir
+        }
+    };
+
+    Ok((target_triple, rustc_sysroot_path))
 }
 
 fn build_sysroot(

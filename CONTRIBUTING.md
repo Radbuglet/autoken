@@ -1,5 +1,7 @@
 # Contribution Guide
 
+We have yet to devise a contribution process for this repository. Just file a PR for now and we'll work from there.
+
 ## Rust-Analyzer Setup
 
 In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/settings.json` at the root directory of this project with:
@@ -27,9 +29,15 @@ There are three major components to AuToken:
   - compiles a version of the Rust standard library using our custom version of `rustc` for use as a sysroot
   - ...and re-executes the appropriate `cargo` command with `rustc` overwritten to point to our custom wrapper and with the appropriate sysroot specified.
 
-## Manual Execution
+## Executing Cargo
 
-Build the custom rustc driver. If you want to call it directly without the help of `cargo`, you have to build it with an appropriate rpath:
+The `cargo-autoken` binary automatically builds its own version of `autoken-rustc` so you can execute the entire stack by calling `cargo run` in the `src/cargo` directory. This tool can be installed onto your local computer with `cargo install --path src/cargo`—no questions asked.
+
+## Executing Rustc
+
+The easiest way to execute `rustc-autoken` directly is through `cargo-autoken`'s `rustc` subcommand.
+
+Alternatively, you could build the custom rustc driver manually. If you want to call it directly without the help of `cargo`, you have to build it with an appropriate rpath:
 
 ```bash
 RUSTFLAGS="-C link-args=-Wl,-rpath,$(rustc --print sysroot)/lib" cargo build --release
