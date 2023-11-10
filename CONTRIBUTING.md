@@ -32,7 +32,7 @@ There are three major components to AuToken:
 
 ## Executing Cargo
 
-The `cargo-autoken` binary automatically builds its own version of `autoken-rustc` so you can execute the entire stack by calling `cargo run` in the `src/cargo` directory. This tool can be installed onto your local computer with `cargo install --path src/cargo`—no questions asked.
+The `cargo-autoken` binary automatically builds its own version of `autoken-rustc` so you can execute the entire stack by calling `cargo run` in the `src/cargo` directory. This tool can be installed onto your local computer with `cargo install --path src/cargo -Z bindeps`—no questions asked! The `rust-toolchain.toml` should handle all the nightly shenanigans for you.
 
 ## Executing Rustc
 

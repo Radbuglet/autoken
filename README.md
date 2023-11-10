@@ -32,7 +32,7 @@ If you wish to install from source, assuming your current working directory is t
 like so:
 
 ```bash
-cargo install --path src/cargo
+cargo install --path src/cargo -Z bindeps
 ```
 
 ...and executed in the crate you wish to validate like so:

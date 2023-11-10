@@ -29,7 +29,7 @@
 //! like so:
 //!
 //! ```bash
-//! cargo install --path src/cargo
+//! cargo install --path src/cargo -Z bindeps
 //! ```
 //!
 //! ...and executed in the crate you wish to validate like so:
