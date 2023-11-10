@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.75"
 autoken = { version = "0.1.0", path = "../userland" }
+autoken-versions = { path = "../versions" }
 clap = { version = "4.4.7", features = ["derive"] }
 clap-cargo = { version = "0.13.0", features = ["cargo_metadata"] }
 directories = "5.0.1"
@@ -13,4 +14,5 @@ rustc-build-sysroot = "0.4.2"
 
 [build-dependencies]
 anyhow = "1.0.75"
+autoken-versions = { path = "../versions" }
 sha256 = { version = "1.4.0", default-features = false }

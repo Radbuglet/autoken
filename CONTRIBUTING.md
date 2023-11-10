@@ -12,6 +12,7 @@ In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/se
         "src/cargo/Cargo.toml",
         "src/rustc/Cargo.toml",
         "src/userland/Cargo.toml",
+        "src/versions/Cargo.toml",
     ]
 }
 ```

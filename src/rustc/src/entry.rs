@@ -46,19 +46,9 @@ impl Callbacks for AnalyzeMirCallbacks {
         config.opts.unstable_opts.always_encode_mir = true;
 
         // Define version-checking CFGs
-        config
-            .crate_cfg
-            .insert(("__autoken_checking_version".to_string(), None));
-
-        config.crate_cfg.insert((
-            format!(
-                "__autoken_current_version_is_{}_{}_{}",
-                env!("CARGO_PKG_VERSION_MAJOR"),
-                env!("CARGO_PKG_VERSION_MINOR"),
-                env!("CARGO_PKG_VERSION_PATCH"),
-            ),
-            None,
-        ));
+        autoken_versions::set_analyzer_cfgs(|v| {
+            config.crate_cfg.insert((v.to_string(), None));
+        });
 
         // We also have to hack in a little environment variable to override the sysroot.
         if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {

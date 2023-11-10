@@ -6,8 +6,13 @@ version = 3
 name = "autoken-rustc"
 version = "0.1.0"
 dependencies = [
+ "autoken-versions",
  "smallvec",
 ]
+
+[[package]]
+name = "autoken-versions"
+version = "0.1.0"
 
 [[package]]
 name = "smallvec"

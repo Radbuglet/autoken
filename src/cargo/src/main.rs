@@ -17,7 +17,12 @@ use rustc_build_sysroot::{SysrootBuilder, SysrootConfig};
 #[command(
     styles = clap_cargo::style::CLAP_STYLING,
     author = env!("CARGO_PKG_AUTHORS"),
-    version = env!("CARGO_PKG_VERSION"),
+    version = &*String::leak(format!(
+        "{} (format: {}.{})",
+        env!("CARGO_PKG_VERSION"),
+        autoken_versions::CURRENT_FORMAT_MAJOR,
+        autoken_versions::CURRENT_FORMAT_MINOR,
+    )),
     about = env!("CARGO_PKG_DESCRIPTION"),
     long_about = None,
 

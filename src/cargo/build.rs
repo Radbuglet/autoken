@@ -4,6 +4,9 @@ fn main() -> anyhow::Result<()> {
     // Don't rebuild this crate when nothing changed.
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Validate our version
+    autoken_versions::validate_crate_version_in_build_script();
+
     // Extract some environment variables.
     let rustc_exe = PathBuf::from(std::env::var("RUSTC")?);
     let cargo_exe = PathBuf::from(std::env::var("CARGO")?);

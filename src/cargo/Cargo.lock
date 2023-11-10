@@ -70,6 +70,13 @@ dependencies = [
 [[package]]
 name = "autoken"
 version = "0.1.0"
+dependencies = [
+ "autoken-versions",
+]
+
+[[package]]
+name = "autoken-versions"
+version = "0.1.0"
 
 [[package]]
 name = "bitflags"
@@ -113,6 +120,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoken",
+ "autoken-versions",
  "clap",
  "clap-cargo",
  "directories",
