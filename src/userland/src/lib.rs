@@ -1,4 +1,4 @@
-#![warn(rustdoc::redundant_explicit_links)] // (cargo-rdme needs this)
+#![allow(rustdoc::redundant_explicit_links)] // (cargo-rdme needs this)
 //! A rust-lang static analysis tool to automatically check for runtime borrow violations.
 //!
 //! ```rust
@@ -222,6 +222,53 @@
 //! looking at anything in the called closure. You should read its documentation for details before
 //! even thinking about touching it!
 //!
+//! ### Potential Borrows
+//!
+//! You may occasionally see fallible borrow methods which take in a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow)
+//! or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow) "loaner" guard. The reason for
+//! these guards is somewhat similar to why we need loaner guards for other conditionally created
+//! borrows with the added caveat that, because the borrow only happens if it is allowed to happen,
+//! the guard need not cause a static analysis warning if its in a scope that already has confounding
+//! borrows since, if they truly do alias, the borrow won't actually happen at runtime.
+//!
+//! ```rust
+//! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
+//! # #[derive(Debug)]
+//! # struct MyRefMut<'a, T, B = T> {
+//! #     token: MutableBorrow<B>,
+//! #     sptr: RefMut<'a, T>,
+//! # }
+//! # use autoken::{Nothing, PotentialMutableBorrow};
+//! # #[derive(Debug)]
+//! # struct MyCell<T> {
+//! #     inner: RefCell<T>,
+//! # }
+//! # impl<T> MyCell<T> {
+//! #     pub fn new(value: T) -> Self {
+//! #         Self { inner: RefCell::new(value) }
+//! #     }
+//! #
+//! #     pub fn try_borrow_mut<'l>(
+//! #         &self,
+//! #         loaner: &'l mut PotentialMutableBorrow<T>
+//! #     ) -> Result<MyRefMut<'_, T, Nothing<'l>>, BorrowMutError> {
+//! #         self.inner.try_borrow_mut().map(|sptr| MyRefMut {
+//! #             token: loaner.loan(),
+//! #             sptr,
+//! #         })
+//! #     }
+//! # }
+//! let my_cell = MyCell::new(1u32);
+//!
+//! let mut my_loaner_1 = PotentialMutableBorrow::<u32>::new();
+//! let borrow_1 = my_cell.try_borrow_mut(&mut my_loaner_1).unwrap();
+//!
+//! // This should not trigger a static analysis warning because, if the specific cell is already
+//! // borrowed, the function returns an `Err` rather than panicking.
+//! let mut my_loaner_2 = PotentialMutableBorrow::<u32>::new();
+//! let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap_err();
+//! ```
+//!
 //! ## Dealing With Dynamic Dispatches
 //!
 //! AuToken resolves dynamic dispatches by collecting all possible dispatch targets ahead of time
@@ -254,7 +301,298 @@
 //!
 //! # Integrating AuToken
 //!
-//! **TODO:** Write documentation
+//! This section is for crate developers wishing to add static analysis to their dynamic borrowing
+//! schemes. If you're interested in using one of those crates, see the [checking projects](#checking-projects)
+//! section.
+//!
+//! There are four primitive borrowing functions offered by this library:
+//!
+//! - [`borrow_mutably`](crate::borrow_mutably)
+//! - [`borrow_immutably`](crate::borrow_immutably)
+//! - [`unborrow_mutably`](crate::unborrow_mutably)
+//! - [`unborrow_immutably`](crate::unborrow_immutably)
+//!
+//! These functions, in reality, do absolutely nothing and are compiled away. However, when checked
+//! by the custom AuToken rustc wrapper, they virtually "borrow" and "unborrow" a global token of
+//! the type specified by their single generic parameter and raise a warning if it is possible to
+//! violate the XOR mutability rules of that virtual global token.
+//!
+//! Usually, these functions aren't called directly and are instead called indirectly through their
+//! RAII'd counterparts [`MutableBorrow`](crate::MutableBorrow) and [`ImmutableBorrow`](crate::ImmutableBorrow).
+//!
+//! These primitives can be used to introduce additional compile-time safety to dynamically checked
+//! borrowing and locking schemes. Here's a couple of examples:
+//!
+//! You could make a safe wrapper around a `RefCell`...
+//!
+//! ```no_run
+//! use autoken::MutableBorrow;
+//! use std::cell::{RefCell, RefMut};
+//!
+//! struct MyRefCell<T> {
+//!     inner: RefCell<T>,
+//! }
+//!
+//! impl<T> MyRefCell<T> {
+//!     pub fn new(value: T) -> Self {
+//!         Self { inner: RefCell::new(value) }
+//!     }
+//!
+//!     pub fn borrow_mut(&self) -> MyRefMut<'_, T> {
+//!         MyRefMut {
+//!             token: MutableBorrow::new(),
+//!             sptr: self.inner.borrow_mut(),
+//!         }
+//!     }
+//! }
+//!
+//! struct MyRefMut<'a, T> {
+//!     token: MutableBorrow<T>,
+//!     sptr: RefMut<'a, T>,
+//! }
+//!
+//! let my_cell = MyRefCell::new(1u32);
+//! let _a = my_cell.borrow_mut();
+//!
+//! // This second mutable borrow results in an AuToken warning.
+//! let _b = my_cell.borrow_mut();
+//! ```
+//!
+//! ```plain_text
+//! warning: called a function expecting at most 0 mutable borrows of type u32 but was called in a scope with at least 1
+//!   --> src/main.rs:33:22
+//!    |
+//! 33 |     let _b = my_cell.borrow_mut();
+//!    |                      ^^^^^^^^^^^^
+//! ````
+//!
+//! You could make a reentrancy-protected function...
+//!
+//! ```rust
+//! fn do_not_reenter(f: impl FnOnce()) {
+//!     struct ISaidDoNotReenter;
+//!
+//!     let _guard = autoken::MutableBorrow::<ISaidDoNotReenter>::new();
+//!     f();
+//! }
+//!
+//! do_not_reenter(|| {
+//!     // Whoops!
+//!     do_not_reenter(|| {});
+//! });
+//! ```
+//!
+//! ```plain_text
+//! warning: called a function expecting at most 0 mutable borrows of type main::do_not_reenter::ISaidDoNotReenter but was called in a scope with at least 1
+//!  --> src/main.rs:6:9
+//!   |
+//! 6 |         f();
+//!   |         ^^^
+//! ```
+//!
+//! You could even deny an entire class of functions where calling them would be dangerous!
+//!
+//! ```rust
+//! use autoken::{ImmutableBorrow, MutableBorrow};
+//!
+//! struct IsOnMainThread;
+//!
+//! fn begin_multithreading(f: impl FnOnce()) {
+//!     let _guard = MutableBorrow::<IsOnMainThread>::new();
+//!     f();
+//! }
+//!
+//! fn only_call_me_on_main_thread() {
+//!     let _guard = ImmutableBorrow::<IsOnMainThread>::new();
+//!     // ...
+//! }
+//!
+//! begin_multithreading(|| {
+//!     // Whoops!
+//!     only_call_me_on_main_thread();
+//! });
+//! ```
+//!
+//! ```plain_text
+//! warning: called a function expecting at most 0 mutable borrows of type main::IsOnMainThread but was called in a scope with at least 1
+//!  --> src/main.rs:6:9
+//!   |
+//! 6 |         f();
+//!   |         ^^^
+//! ```
+//!
+//! Pretty neat, huh.
+//!
+//! ## Dealing with Limitations
+//!
+//! If you read the [checking projects](#checking-projects) section like I asked you not to, you'd
+//! hear about four pretty major limitations of AuToken. While most of these limitations can be overcome
+//! by tools provided by AuToken, the second limitation—[Control Flow Errors](#making-sense-of-control-flow-errors)—
+//! requires a bit of help from developers wishing to integrate with AuToken. You are strongly
+//! encouraged to read that section before this section, since it motivates the necessity for these
+//! special method variants.
+//!
+//! In summary:
+//!
+//! 1. For every guard object, provide a `strip_lifetime_analysis` function similar to
+//!    [`MutableBorrow`](crate::MutableBorrow::strip_lifetime_analysis)'s.
+//! 2. For every guard object, provide a way to acquire that object with a "loaner" borrow object. The
+//!    recommended suffix for this variant is `on_loan`. The mechanism for doing so is likely very
+//!    similar to `MutableBorrow`'s [`loan`](crate::MutableBorrow::loan) method.
+//! 3. For borrow methods which check their borrow before performing it, the method should be made
+//!    to loan a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow) or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow)
+//!    instead.
+//!
+//! All of these methods rely on being able to convert the RAII guard's type from its originally
+//! borrowed type to [`Nothing`](crate::Nothing)—a special marker type in AuToken which indicates that
+//! the borrow guard isn't actually borrowing anything. Doing this requires you to keep track of the
+//! borrowed type at the type level since AuToken lacks the power to analyze runtime mechanisms for
+//! doing that. Here's an example of how to accomplish this:
+//!
+//! ```rust
+//! # use {autoken::MutableBorrow, std::cell::RefMut};
+//! struct MyRefMut<'a, T, B = T> {
+//!     //                 ^ notice the addition of this special parameter?
+//!     token: MutableBorrow<B>,
+//!     sptr: RefMut<'a, T>,
+//! }
+//! ```
+//!
+//! With that additional parameter in place, we can implement the first required method: `strip_lifetime_analysis`.
+//! Its implementation is relatively straightforward:
+//!
+//! ```rust
+//! # use {autoken::MutableBorrow, std::cell::{RefCell, RefMut}};
+//! # struct MyRefCell<T> {
+//! #     inner: RefCell<T>,
+//! # }
+//! #
+//! # impl<T> MyRefCell<T> {
+//! #     pub fn new(value: T) -> Self {
+//! #         Self { inner: RefCell::new(value) }
+//! #     }
+//! #
+//! #     pub fn borrow_mut(&self) -> MyRefMut<'_, T> {
+//! #         MyRefMut {
+//! #             token: MutableBorrow::new(),
+//! #             sptr: self.inner.borrow_mut(),
+//! #         }
+//! #     }
+//! # }
+//! use autoken::Nothing;
+//!
+//! struct MyRefMut<'a, T, B = T> {
+//!     token: MutableBorrow<B>,
+//!     sptr: RefMut<'a, T>,
+//! }
+//!
+//! impl<'a, T, B> MyRefMut<'a, T, B> {
+//!     pub fn strip_lifetime_analysis(self) -> MyRefMut<'a, T, Nothing<'static>> {
+//!         MyRefMut {
+//!             token: self.token.strip_lifetime_analysis(),
+//!             sptr: self.sptr,
+//!         }
+//!     }
+//! }
+//!
+//! # let my_condition = true;
+//! let my_cell = MyRefCell::new(1u32);
+//! let my_guard = if my_condition {
+//!     Some(my_cell.borrow_mut().strip_lifetime_analysis())
+//! } else {
+//!     None
+//! };
+//! ```
+//!
+//! The `'static` lifetime in `Nothing` doesn't really mean anything. Indeed, the lifetime in `Nothing`
+//! is purely a convenience lifetime whose utility will become more clear when we implement the second
+//! required method: `borrow_mut_on_loan`.
+//!
+//! Writing this method is also relatively straightforward:
+//!
+//! ```rust
+//! # use {autoken::MutableBorrow, std::cell::{RefCell, RefMut}};
+//! # struct MyRefMut<'a, T, B = T> {
+//! #     token: MutableBorrow<B>,
+//! #     sptr: RefMut<'a, T>,
+//! # }
+//! use autoken::Nothing;
+//!
+//! struct MyRefCell<T> {
+//!     inner: RefCell<T>,
+//! }
+//!
+//! impl<T> MyRefCell<T> {
+//!     # pub fn new(value: T) -> Self {
+//!     #     Self { inner: RefCell::new(value) }
+//!     # }
+//!     pub fn borrow_mut_on_loan<'l>(
+//!         &self,
+//!         loaner: &'l mut MutableBorrow<T>
+//!     ) -> MyRefMut<'_, T, Nothing<'l>> {
+//!         MyRefMut {
+//!             token: loaner.loan(),
+//!             sptr: self.inner.borrow_mut(),
+//!         }
+//!     }
+//! }
+//!
+//! # let my_condition = true;
+//! let my_cell = MyRefCell::new(1u32);
+//!
+//! let mut my_loaner = MutableBorrow::<u32>::new();
+//! let my_guard = if my_condition {
+//!     Some(my_cell.borrow_mut_on_loan(&mut my_loaner))
+//! } else {
+//!     None
+//! };
+//! ```
+//!
+//! Here, we're using the placeholder lifetime in `Nothing` to limit the lifetime of the loans to
+//! the reference to the `loaner`. Pretty convenient.
+//!
+//! Finally, fallible `borrow` method variants can be implemented in a way almost identical to what
+//! was used in the previous example:
+//!
+//! ```rust
+//! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
+//! # #[derive(Debug)]
+//! # struct MyRefMut<'a, T, B = T> {
+//! #     token: MutableBorrow<B>,
+//! #     sptr: RefMut<'a, T>,
+//! # }
+//! use autoken::{Nothing, PotentialMutableBorrow};
+//!
+//! # #[derive(Debug)]
+//! struct MyRefCell<T> {
+//!     inner: RefCell<T>,
+//! }
+//!
+//! impl<T> MyRefCell<T> {
+//!     # pub fn new(value: T) -> Self {
+//!     #     Self { inner: RefCell::new(value) }
+//!     # }
+//!     pub fn try_borrow_mut<'l>(
+//!         &self,
+//!         loaner: &'l mut PotentialMutableBorrow<T>
+//!     ) -> Result<MyRefMut<'_, T, Nothing<'l>>, BorrowMutError> {
+//!         self.inner.try_borrow_mut().map(|sptr| MyRefMut {
+//!             token: loaner.loan(),
+//!             sptr,
+//!         })
+//!     }
+//! }
+//!
+//! let my_cell = MyRefCell::new(1u32);
+//!
+//! let mut my_loaner_1 = PotentialMutableBorrow::<u32>::new();
+//! let borrow_1 = my_cell.try_borrow_mut(&mut my_loaner_1).unwrap();
+//!
+//! let mut my_loaner_2 = PotentialMutableBorrow::<u32>::new();
+//! let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap_err();
+//! ```
+//!
+//! How exciting!
 
 #![no_std]
 
@@ -332,6 +670,7 @@ pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
     __autoken_assume_black_box::<T>(f)
 }
 
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Nothing<'a> {
     __autoken_nothing_type_field_indicator: PhantomData<&'a ()>,
 }
