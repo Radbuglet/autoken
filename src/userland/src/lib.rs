@@ -604,40 +604,107 @@ include!(concat!(env!("OUT_DIR"), "/version_check.rs"));
 
 // === Primitives === //
 
+/// Virtually acquires a mutable reference to a global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
+///
+/// This method is more typically called through the [`MutableBorrow`] guard's constructor.
 pub const fn borrow_mutably<T: ?Sized>() {
     const fn __autoken_borrow_mutably<T: ?Sized>() {}
 
     __autoken_borrow_mutably::<T>();
 }
 
+/// Virtually acquires an immutable reference to a global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
+///
+/// This method is more typically called through the [`ImmutableBorrow`] guard's constructor.
 pub const fn borrow_immutably<T: ?Sized>() {
     const fn __autoken_borrow_immutably<T: ?Sized>() {}
 
     __autoken_borrow_immutably::<T>();
 }
 
+/// Virtually unacquires a mutable reference to a global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
+///
+/// This method is more typically called through the [`MutableBorrow`] guard's destructor.
 pub const fn unborrow_mutably<T: ?Sized>() {
     const fn __autoken_unborrow_mutably<T: ?Sized>() {}
 
     __autoken_unborrow_mutably::<T>();
 }
 
+/// Virtually unacquires an immutable reference to a global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
+///
+/// This method is more typically called through the [`ImmutableBorrow`] guard's destructor.
 pub const fn unborrow_immutably<T: ?Sized>() {
     const fn __autoken_unborrow_immutably<T: ?Sized>() {}
 
     __autoken_unborrow_immutably::<T>();
 }
 
+/// Ensures that it is possible to virtually acquire a mutable borrow of the global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
 pub const fn assert_mutably_borrowable<T: ?Sized>() {
     borrow_mutably::<T>();
     unborrow_mutably::<T>();
 }
 
+/// Ensures that it is possible to virtually acquire an immutable borrow of the global token of type `T`.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
 pub const fn assert_immutably_borrowable<T: ?Sized>() {
     borrow_immutably::<T>();
     unborrow_immutably::<T>();
 }
 
+/// Asserts that the provided closure's virtual borrows to tokens of type `(T_1, ..., T_n)` will not
+/// cause any aliasing issues at runtime.
+///
+/// `T` must be a tuple of token types to ignore. Its maximum supported arity is 12.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When a component in `T` is [`Nothing`], it is effectively ignored.
 pub fn assume_no_alias_in_many<T, Res>(f: impl FnOnce() -> Res) -> Res
 where
     T: ?Sized + tuple_sealed::Tuple,
@@ -650,10 +717,25 @@ where
     __autoken_assume_no_alias_in::<T, Res>(f)
 }
 
+/// Asserts that the provided closure's virtual borrows to tokens of type `T` will not cause any
+/// aliasing issues at runtime.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
+///
+/// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
+/// virtual global token). When `T` is [`Nothing`], nothing happens.
 pub fn assume_no_alias_in<T: ?Sized, Res>(f: impl FnOnce() -> Res) -> Res {
     assume_no_alias_in_many::<(T,), Res>(f)
 }
 
+/// Asserts that the provided closure's virtual borrows to any token will not cause any aliasing
+/// issues at runtime.
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
 pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
     fn __autoken_assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
         f()
@@ -662,6 +744,52 @@ pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
     __autoken_assume_no_alias::<Res>(f)
 }
 
+/// Tells the AuToken static analyzer to entirely ignore the body of the provided closure. This should
+/// be a last resort for when nothing else works out.
+///
+/// This prevents both enumeration of unsizing coercions performed by the closure (which contribute
+/// to the set of dynamic dispatch targets for a given function pointer or trait type) and detection
+/// of the various `borrow` and `unborrow` function calls. This can be particularly tricky if you
+/// return a guard from the black-boxed closure since, although the call to [`borrow_mutably`] was
+/// ignored, the call to [`unborrow_mutably`] in the destructor is not:
+///
+/// ```rust
+/// use autoken::MutableBorrow;
+///
+/// // The call to `borrow_mutably` was just ignored.
+/// let guard = autoken::assume_black_box(|| MutableBorrow::<u32>::new());
+///
+/// // ...but the call to `unborrow_mutably` was not!
+/// drop(guard);
+///
+/// // Autoken now thinks that we have -1 mutable borrows in scope!
+/// ```
+///
+/// If we want to fix this, we need to make sure to `strip_lifetime_analysis` on all the guards we
+/// return:
+///
+/// ```rust
+/// use autoken::MutableBorrow;
+///
+/// // The call to `borrow_mutably` was just ignored.
+/// let guard = autoken::assume_black_box(|| {
+///     MutableBorrow::<u32>::new().strip_lifetime_analysis()
+/// });
+///
+/// // Luckily, in stripping its lifetime analysis, it no longer calls `unborrow_mutably` here.
+/// drop(guard);
+///
+/// // Autoken now has an accurate idea of the number of guards in scope.
+/// ```
+///
+/// It bears repeating that this function is super dangerous. Please consider all the alternatives
+/// listed in the crate's [Ignoring False Positives](index.html#ignoring-false-positives) and
+/// [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors) section before
+/// even thinking about reaching for this function!
+///
+/// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
+/// functions like this to determine whether a program has the possibility of virtually borrowing a
+/// global token in a way which violates XOR borrowing rules.
 pub fn assume_black_box<T>(f: impl FnOnce() -> T) -> T {
     fn __autoken_assume_black_box<T>(f: impl FnOnce() -> T) -> T {
         f()
