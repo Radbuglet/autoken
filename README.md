@@ -162,9 +162,10 @@ even thinking about touching it!
 You may occasionally see fallible borrow methods which take in a [`PotentialMutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialMutableBorrow.html)
 or [`PotentialImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialImmutableBorrow.html) "loaner" guard. The reason for
 these guards is somewhat similar to why we need loaner guards for other conditionally created
-borrows with the added caveat that, because the borrow only happens if it is allowed to happen,
-the guard need not cause a static analysis warning if its in a scope that already has confounding
-borrows since, if they truly do alias, the borrow won't actually happen at runtime.
+borrows with the added caveat that, because these borrow guards are being used with a fallible borrow
+method, it is assumed that the aliasing with an existing borrow can be handled gracefully at
+runtime. Because of this assumption, `PotentialMutableBorrows` do not emit a warning if another
+confounding borrow guard is already in scope.
 
 ```rust
 let my_cell = MyCell::new(1u32);
@@ -176,6 +177,24 @@ let borrow_1 = my_cell.try_borrow_mut(&mut my_loaner_1).unwrap();
 // borrowed, the function returns an `Err` rather than panicking.
 let mut my_loaner_2 = PotentialMutableBorrow::<u32>::new();
 let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap_err();
+```
+
+If the borrow cannot be handled gracefully, one may create a [`MutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.MutableBorrow.html)
+or [`ImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.ImmutableBorrow.html) guard and `downgrade`
+it to a `PotentialMutableBorrow` or `PotentialImmutableBorrow` guard so that the static analyzer
+will start reporting these potentially aliasing borrows again.
+
+```rust
+let my_cell = MyCell::new(1u32);
+
+let mut my_loaner_1 = PotentialMutableBorrow::<u32>::new();
+let borrow_1 = my_cell.try_borrow_mut(&mut my_loaner_1).unwrap();
+
+// Unlike the previous example, this code cannot handle aliasing borrows gracefully, so we should
+// create a `MutableBorrow` first to get the alias check and then downgrade it for use in the
+// fallible borrowing method.
+let mut my_loaner_2 = MutableBorrow::<u32>::new().downgrade();
+let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap();
 ```
 
 ### Dealing With Dynamic Dispatches

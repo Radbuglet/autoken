@@ -895,6 +895,9 @@ mod tuple_sealed {
 /// These can be thought of as [`Ref`](core::cell::Ref)s to those global tokens except that they have
 /// no impact on the runtime and only contribute to AuToken's static analysis of the binary.
 ///
+/// As with [`borrow_mutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
+/// effect on the statically-analyzed borrow counts.
+///
 /// Developers wishing to integrate their crate with AuToken will likely use this type to represent
 /// the static counterpart to a runtime borrow of some cell of type `T` as described in the
 /// [Integrating AuToken](index.html#integrating-autoken) section of the crate documentation.
@@ -907,35 +910,65 @@ pub struct MutableBorrow<T: ?Sized> {
 }
 
 impl<T: ?Sized> MutableBorrow<T> {
+    /// Constructs a new `MutableBorrow` guard.
+    ///
+    /// This function has no runtime cost but will cause the AuToken static analyzer to report
+    /// potential virtual borrowing issues with other guards.
+    ///
+    /// Internally, this function just calls [`borrow_mutably`] with the provided type `T`.
     pub const fn new() -> Self {
         borrow_mutably::<T>();
         Self { _ty: PhantomData }
     }
 
+    /// Transforms this `MutableBorrow` into a [`PotentialMutableBorrow`] of the same type.
     pub fn downgrade(self) -> PotentialMutableBorrow<T> {
         PotentialMutableBorrow(self)
     }
 
+    /// Transforms a reference to `MutableBorrow` into a reference to a [`PotentialMutableBorrow`] of
+    /// the same type.
     pub fn downgrade_ref(&self) -> &PotentialMutableBorrow<T> {
         unsafe { mem::transmute(self) }
     }
 
+    /// Transforms a mutable reference to `MutableBorrow` into a mutable reference to a [`PotentialMutableBorrow`]
+    /// of the same type.
     pub fn downgrade_mut(&mut self) -> &mut PotentialMutableBorrow<T> {
         unsafe { mem::transmute(self) }
     }
 
+    /// Creates a loaned `MutableBorrow` of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub fn loan(&mut self) -> MutableBorrow<Nothing<'_>> {
         MutableBorrow::new()
     }
 
+    /// Creates a loaned `MutableBorrow` of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// Unlike [loan](MutableBorrow::loan), this method takes an immutable reference to the loaning
+    /// `MutableBorrow`, which makes it more prone to accidental borrow aliasing.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub fn assume_no_alias_loan(&self) -> MutableBorrow<Nothing<'_>> {
         MutableBorrow::new()
     }
 
+    /// Clones the current `MutableBorrow` instance, assuming it is safe to do so.
     pub fn assume_no_alias_clone(&self) -> Self {
         assume_no_alias(|| Self::new())
     }
 
+    /// Transforms the type of `T` into [`Nothing`], effectively making it as if this borrow guard no
+    /// longer exists.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on the utility of `strip_lifetime_analysis`.
     pub fn strip_lifetime_analysis(self) -> MutableBorrow<Nothing<'static>> {
         drop(self);
         MutableBorrow::new()
@@ -980,10 +1013,13 @@ impl<T: ?Sized> Drop for MutableBorrow<T> {
     }
 }
 
-/// A guard for a virtual mutable borrow of the global token of type `T`.
+/// A guard for a virtual immutable borrow of the global token of type `T`.
 ///
 /// These can be thought of as [`Ref`](core::cell::Ref)s to those global tokens except that they have
 /// no impact on the runtime and only contribute to AuToken's static analysis of the binary.
+///
+/// As with [`borrow_mutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
+/// effect on the statically-analyzed borrow counts.
 ///
 /// Developers wishing to integrate their crate with AuToken will likely use this type to represent
 /// the static counterpart to a runtime borrow of some cell of type `T` as described in the
@@ -997,27 +1033,48 @@ pub struct ImmutableBorrow<T: ?Sized> {
 }
 
 impl<T: ?Sized> ImmutableBorrow<T> {
+    /// Constructs a new `ImmutableBorrow` guard.
+    ///
+    /// This function has no runtime cost but will cause the AuToken static analyzer to report
+    /// potential virtual borrowing issues with other guards.
+    ///
+    /// Internally, this function just calls [`borrow_immutably`] with the provided type `T`.
     pub const fn new() -> Self {
         borrow_immutably::<T>();
         Self { _ty: PhantomData }
     }
 
+    /// Transforms this `ImmutableBorrow` into a [`PotentialImmutableBorrow`] of the same type.
     pub fn downgrade(self) -> PotentialImmutableBorrow<T> {
         PotentialImmutableBorrow(self)
     }
 
+    /// Transforms a reference to `ImmutableBorrow` into a reference to a [`PotentialImmutableBorrow`]
+    /// of the same type.
     pub fn downgrade_ref(&self) -> &PotentialImmutableBorrow<T> {
         unsafe { mem::transmute(self) }
     }
 
+    /// Transforms a mutable reference to `ImmutableBorrow` into a mutable reference to a [`PotentialImmutableBorrow`]
+    /// of the same type.
     pub fn downgrade_mut(&mut self) -> &mut PotentialImmutableBorrow<T> {
         unsafe { mem::transmute(self) }
     }
 
+    /// Creates a loaned `ImmutableBorrow` of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub const fn loan(&self) -> ImmutableBorrow<Nothing<'_>> {
         ImmutableBorrow::new()
     }
 
+    /// Transforms the type of `T` into [`Nothing`], effectively making it as if this borrow guard no
+    /// longer exists.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on the utility of `strip_lifetime_analysis`.
     pub fn strip_lifetime_analysis(self) -> ImmutableBorrow<Nothing<'static>> {
         drop(self);
         ImmutableBorrow::new()
@@ -1077,6 +1134,9 @@ impl<T: ?Sized> Drop for ImmutableBorrow<T> {
 /// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
 /// ends up aliasing with something else, the error is assumed to be handled gracefully.
 ///
+/// As with [`borrow_mutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
+/// effect on the statically-analyzed borrow counts.
+///
 /// If the error cannot be handled gracefully, one may construct a `MutableBorrow` and
 /// [`downgrade`](MutableBorrow::downgrade) it to a `PotentialMutableBorrow` so that the static
 /// analyzer will start reporting these potentially aliasing borrows again.
@@ -1087,18 +1147,56 @@ impl<T: ?Sized> Drop for ImmutableBorrow<T> {
 pub struct PotentialMutableBorrow<T: ?Sized>(MutableBorrow<T>);
 
 impl<T: ?Sized> PotentialMutableBorrow<T> {
+    /// Constructs a new `PotentialMutableBorrow` guard.
+    ///
+    /// This function has no runtime cost but will cause the AuToken static analyzer to increment the
+    /// number of mutable borrows of type `T` in scope. Note, however, that it will not cause the
+    /// static analyzer to report aliases with potentially confounding borrow tokens. See the structure
+    /// documentation for details.
+    ///
+    /// Internally, this function calls:
+    ///
+    /// ```rust
+    /// # use autoken::MutableBorrow;
+    /// # type T = u32;
+    /// autoken::assume_no_alias(|| MutableBorrow::<T>::new());
+    /// ```
     pub fn new() -> Self {
         assume_no_alias(|| Self(MutableBorrow::new()))
     }
 
+    /// Creates a loaned [`MutableBorrow`] of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// This is typically used to construct the `MutableBorrow` guard for runtime borrow guards which
+    /// were successfully created in fallible code.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub fn loan(&mut self) -> MutableBorrow<Nothing<'_>> {
         MutableBorrow::new()
     }
 
+    /// Creates a loaned `MutableBorrow` of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// This is typically used to construct the `MutableBorrow` guard for runtime borrow guards which
+    /// were successfully created in fallible code.
+    ///
+    /// Unlike [loan](PotentialMutableBorrow::loan), this method takes an immutable reference to the
+    /// loaning `PotentialMutableBorrow`, which makes it more prone to accidental borrow aliasing.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub fn assume_no_alias_loan(&self) -> MutableBorrow<Nothing<'_>> {
         MutableBorrow::new()
     }
 
+    /// Transforms the type of `T` into [`Nothing`], effectively making it as if this borrow guard no
+    /// longer exists.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on the utility of `strip_lifetime_analysis`.
     pub fn strip_lifetime_analysis(self) -> PotentialMutableBorrow<Nothing<'static>> {
         drop(self);
         PotentialMutableBorrow::new()
@@ -1151,6 +1249,9 @@ impl<T: ?Sized> Clone for PotentialMutableBorrow<T> {
 /// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
 /// ends up aliasing with something else, the error is assumed to be handled gracefully.
 ///
+/// As with [`borrow_mutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
+/// effect on the statically-analyzed borrow counts.
+///
 /// If the error cannot be handled gracefully, one may construct an `ImmutableBorrow` and
 /// [`downgrade`](ImmutableBorrow::downgrade) it to a `PotentialImmutableBorrow` so that the static
 /// analyzer will start reporting these potentially aliasing borrows again.
@@ -1161,14 +1262,41 @@ impl<T: ?Sized> Clone for PotentialMutableBorrow<T> {
 pub struct PotentialImmutableBorrow<T: ?Sized>(ImmutableBorrow<T>);
 
 impl<T: ?Sized> PotentialImmutableBorrow<T> {
+    /// Constructs a new `PotentialImmutableBorrow` guard.
+    ///
+    /// This function has no runtime cost but will cause the AuToken static analyzer to increment the
+    /// number of immutable borrows of type `T` in scope. Note, however, that it will not cause the
+    /// static analyzer to report aliases with potentially confounding borrow tokens. See the structure
+    /// documentation for details.
+    ///
+    /// Internally, this function calls:
+    ///
+    /// ```rust
+    /// # use autoken::ImmutableBorrow;
+    /// # type T = u32;
+    /// autoken::assume_no_alias(|| ImmutableBorrow::<T>::new());
+    /// ```
     pub fn new() -> Self {
         assume_no_alias(|| Self(ImmutableBorrow::new()))
     }
 
+    /// Creates a loaned [`ImmutableBorrow`] of this guard which has no effect on the static analysis
+    /// borrow counters by itself, making it safe to use in conditional code.
+    ///
+    /// This is typically used to construct the `ImmutableBorrow` guard for runtime borrow guards which
+    /// were successfully created in fallible code.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on loans.
     pub const fn loan(&self) -> ImmutableBorrow<Nothing<'_>> {
         ImmutableBorrow::new()
     }
 
+    /// Transforms the type of `T` into [`Nothing`], effectively making it as if this borrow guard no
+    /// longer exists.
+    ///
+    /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
+    /// section of the crate documentation for more details on the utility of `strip_lifetime_analysis`.
     pub fn strip_lifetime_analysis(self) -> PotentialImmutableBorrow<Nothing<'static>> {
         drop(self);
         PotentialImmutableBorrow::new()
