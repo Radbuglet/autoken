@@ -23,9 +23,9 @@ In VSCode's distribution of rust-analyzer, you can populate the file `.vscode/se
 
 There are three major components to AuToken:
 
-- The `userland` crate people include in their projects to interface with AuToken.
-- The `rustc` wrapper, which is a modified version of `rustc` which adds AuToken's analysis phase and configures the `rustc` compiler to always emit the full MIR for every crate it compiles.
-- The `cargo` wrapper, which...
+- The `userland` crate (called `autoken`) people include in their projects to interface with AuToken.
+- The `rustc` wrapper (called `autoken-rustc`), which is a modified version of `rustc` which adds AuToken's analysis phase and configures the `rustc` compiler to always emit the full MIR for every crate it compiles.
+- The `cargo` wrapper (called `cargo-autoken`), which...
   - validates the `cargo` toolchain version to avoid ABI issues
   - compiles a version of the Rust standard library using our custom version of `rustc` for use as a sysroot
   - ...and re-executes the appropriate `cargo` command with `rustc` overwritten to point to our custom wrapper and with the appropriate sysroot specified.
@@ -57,3 +57,36 @@ Then, just run `cargo` on the desired project with the appropriate custom rustc 
 ```
 RUSTC="path/to/autoken_rustc_wrapper" CARGO_TARGET_DIR="target/autoken" cargo +toolchain run -Zbuild-std=core,alloc,std --target $(path/to/autoken_rustc_wrapper -vV | sed -n 's|host: ||p')
 ```
+
+## Version Update Checklist
+
+Interface updates:
+
+- [ ] Bump `autoken-rustc`'s version if need be.
+- [ ] Bump the peer version requirement in `cargo-autoken`. 
+- [ ] Bump `autoken`'s version if need be.
+- [ ] Bump `INTERFACE_VERSION.in` in both `src/userland` and `src/cargo` if need be.
+
+Documentation updates:
+
+- [ ] If the toolchain changed, update the toolchain in the `autoken` crate documentation.
+- [ ] If the version of `cargo-autoken` changed, update the toolchain in the `autoken` crate
+      documentation.
+- [ ] Regenerate the repository README from the `autoken`'s crate documentation if need be using
+      [`cargo rdme`](https://crates.io/crates/cargo-rdme).
+- [ ] Copy that regenerated README from the repository root to `src/userland/README.md` if need be.
+
+Updating repository information:
+
+- [ ] If this repository URL is changed, it needs to be changed in:
+  - [ ] All the `Cargo.toml` metadata files.
+  - [ ] The rustc driver's ICE issue config.
+  - [ ] Cargo's version checking constants.
+- [ ] If the project tag-line changes, it needs to be updated in all the `Cargo.toml` metadata files.
+
+Publishing:
+
+- [ ] Publish everything that changed in the following order:
+  - [ ] `autoken-rustc`
+  - [ ] `cargo-autoken`
+  - [ ] `autoken`

@@ -1,5 +1,8 @@
 [package]
 name = "autoken"
+description = "A rust-lang static analysis tool to automatically check for runtime borrow violations"
+repository = "https://github.com/Radbuglet/autoken"
+license = "MIT"
 version = "0.1.0"
 edition = "2021"
 

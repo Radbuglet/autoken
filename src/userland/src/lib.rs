@@ -35,7 +35,7 @@
 //! If you wish to install this tool through `cargo`, you should run a command like:
 //!
 //! ```bash
-//! cargo +nightly-2023-09-08 install cargo-autoken -Z bindeps
+//! cargo +nightly-2023-09-08 install cargo-autoken --version 0.1.0 -Z bindeps
 //! ```
 //!
 //! This will likely require you to faff around with rustup toolchains. Because this process could
