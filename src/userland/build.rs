@@ -33,9 +33,9 @@ fn main() {
         if !supported_range.matches(&my_interface_version) {
             println!(
                 "cargo:warning=Userland crate `autoken {my_version}` is not compatible with \
-				 autoken static analyzer tool version {tool_version} as its interface version \
-				 {my_interface_version} does not meet the supported interface version range \
-				 {supported_range}. {upgrade_message}"
+                 autoken static analyzer tool version {tool_version} as its interface version \
+                 {my_interface_version} does not meet the supported interface version range \
+                 {supported_range}. {upgrade_message}"
             );
         }
     }
@@ -47,9 +47,9 @@ fn main() {
         if deprecated_range.matches(&my_interface_version) {
             println!(
                 "cargo:warning=Userland crate `autoken {my_version}` is deprecated according to \
-				 autoken static analyzer tool version {tool_version} as its interface version \
-				 {my_interface_version} is in the interface version deprecation range {deprecated_range}. \
-				 {deprecation_message}"
+                 autoken static analyzer tool version {tool_version} as its interface version \
+                 {my_interface_version} is in the interface version deprecation range {deprecated_range}. \
+                 {deprecation_message}"
             );
         }
     }
@@ -70,7 +70,7 @@ fn parse_semver_req_or_err(var: &str, val: &str) -> Option<VersionReq> {
         Err(err) => {
             println!(
                 "cargo:warn=The environment variable `{var}` is not a valid semver version range: \
-				 {err}. Offending input: {val:?}."
+                 {err}. Offending input: {val:?}."
             );
             None
         }
