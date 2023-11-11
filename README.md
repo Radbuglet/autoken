@@ -20,12 +20,30 @@ fn bar() {
 }
 ```
 
+```plain_text
+warning: called a function expecting at most 0 mutable borrows of type u32 but was called in a scope with at least 1
+ --> src/main.rs:8:5
+  |
+8 |     bar();
+  |     ^^^^^
+````
+
 ### Checking Projects
 
 AuToken is a framework for adding static analysis of runtime borrowing to your crate. If you are
 an end-user of a crate with integrations with AuToken and wish to check your project with the
 tool, this is the section for you! If, instead, you're building a crate and wish to integrate with
-AuToken, you should read on to the [Integrating AuToken](#integrating-autoken) section.
+AuToken, you should skip to the [Integrating AuToken](#integrating-autoken) section.
+
+If you wish to install this tool through `cargo`, you should run a command like:
+
+```bash
+cargo +nightly-2023-09-08 install cargo-autoken -Z bindeps
+```
+
+This will likely require you to faff around with rustup toolchains. Because this process could
+vary from user to user, the best instructions for setting up an appropriate toolchain are provided
+by rustup, cargo, and rust.
 
 If you wish to install from source, assuming your current working directory is the same as the
 [repository](https://github.com/radbuglet/autoken)'s README, `cargo-autoken` can be installed
@@ -35,19 +53,21 @@ like so:
 cargo install --path src/cargo -Z bindeps
 ```
 
-...and executed in the crate you wish to validate like so:
+You can run AuToken validation on a target binary crate by running:
 
 ```bash
 cargo autoken check
 ```
+
+...in its directory.
 
 Have fun!
 
 ### Ignoring False Positives
 
 AuToken is, by nature, very conservative. After all, its whole job is to ensure that only one
-borrow of a given type exists at a given time, even if you're borrowing from several different
-sources at once!
+borrow of a given type exists at a given time, even if you're potentially borrowing from several
+different sources at once!
 
 ```rust
 let cell_1 = MyCell::new(1u32);
@@ -138,7 +158,7 @@ let my_borrow = if some_condition {
 ```
 
 If this is too hard to manage, you could also strip the token of all static borrow analysis
-entirely and all the `strip_lifetime_analysis`
+entirely using the `strip_lifetime_analysis`
 method. This is far more dangerous, however, because AuToken essentially forgets about the
 existence of that borrow and potentially lets invalid borrows slip by.
 
@@ -159,13 +179,14 @@ even thinking about touching it!
 
 #### Potential Borrows
 
-You may occasionally see fallible borrow methods which take in a [`PotentialMutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialMutableBorrow.html)
-or [`PotentialImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialImmutableBorrow.html) "loaner" guard. The reason for
-these guards is somewhat similar to why we need loaner guards for other conditionally created
-borrows with the added caveat that, because these borrow guards are being used with a fallible borrow
-method, it is assumed that the aliasing with an existing borrow can be handled gracefully at
-runtime. Because of this assumption, `PotentialMutableBorrows` do not emit a warning if another
-confounding borrow guard is already in scope.
+You may occasionally stumble across a fallible borrow method in your local AuToken-integrate crate
+which takes in a [`PotentialMutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialMutableBorrow.html) or [`PotentialImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialImmutableBorrow.html)
+"loaner" guard. The reason for these guards is somewhat similar to why we need loaner
+guards for other conditionally created borrows with the added caveat that, because these borrow
+guards are being used with a fallible borrow method, it is assumed that the aliasing with an
+existing borrow can be handled gracefully at runtime. Because of this assumption,
+`PotentialMutableBorrows` do not emit a warning if another confounding borrow guard is already
+in scope.
 
 ```rust
 let my_cell = MyCell::new(1u32);
@@ -182,7 +203,7 @@ let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap_err();
 If the borrow cannot be handled gracefully, one may create a [`MutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.MutableBorrow.html)
 or [`ImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.ImmutableBorrow.html) guard and `downgrade`
 it to a `PotentialMutableBorrow` or `PotentialImmutableBorrow` guard so that the static analyzer
-will start reporting these potentially aliasing borrows again.
+will start reporting these potentially problematic borrows again.
 
 ```rust
 let my_cell = MyCell::new(1u32);
@@ -200,11 +221,12 @@ let not_borrow_2 = my_cell.try_borrow_mut(&mut my_loaner_2).unwrap();
 ### Dealing With Dynamic Dispatches
 
 AuToken resolves dynamic dispatches by collecting all possible dispatch targets ahead of time
-based around what gets unsized to what and assumes that any of those could be called. This
-can occasionally be overly pessimistic. You can help this along by making the dynamically
-dispatched traits more fine grained. For example, instead of using an `FnMut(u32, i32, f32)`, you
-could use an `FnMut(PhantomData<MyHandlers>, u32, i32, f32)`. Likewise, if you have a trait
-`MyBehavior`, you could parameterize it by a marker generic type to make it even more fine-grained.
+based around what gets unsized to what and assumes that any of those concrete types could be
+called by an invocation of a given unsized type. This can occasionally be overly pessimistic.
+You can help this along by making the dynamically dispatched traits more fine grained. For
+example, instead of using an `FnMut(u32, i32, f32)`, you could use an
+`FnMut(PhantomData<MyHandlers>, u32, i32, f32)`. Likewise, if you have a trait `MyBehavior`, you
+could parameterize it by a marker generic type to make it even more fine-grained.
 
 If something is really wrong, you could, once again, use [`assume_black_box`](https://docs.rs/autoken/latest/autoken/fn.assume_black_box.html)
 to hide the unsizing coercions that create these dynamic dispatch targets. Once again, this is,
@@ -233,15 +255,15 @@ section.
 
 There are four primitive borrowing functions offered by this library:
 
-- [`borrow_mutably`](https://docs.rs/autoken/latest/autoken/fn.borrow_mutably.html)
-- [`borrow_immutably`](https://docs.rs/autoken/latest/autoken/fn.borrow_immutably.html)
-- [`unborrow_mutably`](https://docs.rs/autoken/latest/autoken/fn.unborrow_mutably.html)
-- [`unborrow_immutably`](https://docs.rs/autoken/latest/autoken/fn.unborrow_immutably.html)
+- [`borrow_mutably<T>`](https://docs.rs/autoken/latest/autoken/fn.borrow_mutably.html)
+- [`borrow_immutably<T>`](https://docs.rs/autoken/latest/autoken/fn.borrow_immutably.html)
+- [`unborrow_mutably<T>`](https://docs.rs/autoken/latest/autoken/fn.unborrow_mutably.html)
+- [`unborrow_immutably<T>`](https://docs.rs/autoken/latest/autoken/fn.unborrow_immutably.html)
 
 These functions, in reality, do absolutely nothing and are compiled away. However, when checked
 by the custom AuToken rustc wrapper, they virtually "borrow" and "unborrow" a global token of
-the type specified by their single generic parameter and raise a warning if it is possible to
-violate the XOR mutability rules of that virtual global token.
+the type `T` and raise a warning if it is possible to violate the XOR mutability rules of that
+virtual global token.
 
 Usually, these functions aren't called directly and are instead called indirectly through their
 RAII'd counterparts [`MutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.MutableBorrow.html) and [`ImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.ImmutableBorrow.html).
@@ -365,8 +387,8 @@ In summary:
 2. For every guard object, provide a way to acquire that object with a "loaner" borrow object. The
    recommended suffix for this variant is `on_loan`. The mechanism for doing so is likely very
    similar to `MutableBorrow`'s `loan` method.
-3. For borrow methods which check their borrow before performing it, the method should be made
-   to loan a [`PotentialMutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialMutableBorrow.html) or [`PotentialImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialImmutableBorrow.html)
+3. For conditional borrow methods which check their borrow before performing it, the method should
+   be made to loan a [`PotentialMutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialMutableBorrow.html) or [`PotentialImmutableBorrow`](https://docs.rs/autoken/latest/autoken/struct.PotentialImmutableBorrow.html)
    instead.
 
 All of these methods rely on being able to convert the RAII guard's type from its originally
@@ -449,8 +471,8 @@ let my_guard = if my_condition {
 Here, we're using the placeholder lifetime in `Nothing` to limit the lifetime of the loans to
 the reference to the `loaner`. Pretty convenient.
 
-Finally, fallible `borrow` method variants can be implemented in a way almost identical to what
-was used in the previous example:
+Finally, fallible `borrow` method variants can be implemented in a way almost identical to the
+previous example's:
 
 ```rust
 use autoken::{Nothing, PotentialMutableBorrow};

@@ -17,12 +17,30 @@
 //! }
 //! ```
 //!
+//! ```plain_text
+//! warning: called a function expecting at most 0 mutable borrows of type u32 but was called in a scope with at least 1
+//!  --> src/main.rs:8:5
+//!   |
+//! 8 |     bar();
+//!   |     ^^^^^
+//! ````
+//!
 //! ## Checking Projects
 //!
 //! AuToken is a framework for adding static analysis of runtime borrowing to your crate. If you are
 //! an end-user of a crate with integrations with AuToken and wish to check your project with the
 //! tool, this is the section for you! If, instead, you're building a crate and wish to integrate with
-//! AuToken, you should read on to the [Integrating AuToken](#integrating-autoken) section.
+//! AuToken, you should skip to the [Integrating AuToken](#integrating-autoken) section.
+//!
+//! If you wish to install this tool through `cargo`, you should run a command like:
+//!
+//! ```bash
+//! cargo +nightly-2023-09-08 install cargo-autoken -Z bindeps
+//! ```
+//!
+//! This will likely require you to faff around with rustup toolchains. Because this process could
+//! vary from user to user, the best instructions for setting up an appropriate toolchain are provided
+//! by rustup, cargo, and rust.
 //!
 //! If you wish to install from source, assuming your current working directory is the same as the
 //! [repository](https://github.com/radbuglet/autoken)'s README, `cargo-autoken` can be installed
@@ -32,19 +50,21 @@
 //! cargo install --path src/cargo -Z bindeps
 //! ```
 //!
-//! ...and executed in the crate you wish to validate like so:
+//! You can run AuToken validation on a target binary crate by running:
 //!
 //! ```bash
 //! cargo autoken check
 //! ```
+//!
+//! ...in its directory.
 //!
 //! Have fun!
 //!
 //! ## Ignoring False Positives
 //!
 //! AuToken is, by nature, very conservative. After all, its whole job is to ensure that only one
-//! borrow of a given type exists at a given time, even if you're borrowing from several different
-//! sources at once!
+//! borrow of a given type exists at a given time, even if you're potentially borrowing from several
+//! different sources at once!
 //!
 //! ```rust
 //! # use autoken::MutableBorrow;
@@ -189,7 +209,7 @@
 //! ```
 //!
 //! If this is too hard to manage, you could also strip the token of all static borrow analysis
-//! entirely and all the [`strip_lifetime_analysis`](crate::MutableBorrow::strip_lifetime_analysis)
+//! entirely using the [`strip_lifetime_analysis`](crate::MutableBorrow::strip_lifetime_analysis)
 //! method. This is far more dangerous, however, because AuToken essentially forgets about the
 //! existence of that borrow and potentially lets invalid borrows slip by.
 //!
@@ -224,13 +244,14 @@
 //!
 //! ### Potential Borrows
 //!
-//! You may occasionally see fallible borrow methods which take in a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow)
-//! or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow) "loaner" guard. The reason for
-//! these guards is somewhat similar to why we need loaner guards for other conditionally created
-//! borrows with the added caveat that, because these borrow guards are being used with a fallible borrow
-//! method, it is assumed that the aliasing with an existing borrow can be handled gracefully at
-//! runtime. Because of this assumption, `PotentialMutableBorrows` do not emit a warning if another
-//! confounding borrow guard is already in scope.
+//! You may occasionally stumble across a fallible borrow method in your local AuToken-integrate crate
+//! which takes in a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow) or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow)
+//! "loaner" guard. The reason for these guards is somewhat similar to why we need loaner
+//! guards for other conditionally created borrows with the added caveat that, because these borrow
+//! guards are being used with a fallible borrow method, it is assumed that the aliasing with an
+//! existing borrow can be handled gracefully at runtime. Because of this assumption,
+//! `PotentialMutableBorrows` do not emit a warning if another confounding borrow guard is already
+//! in scope.
 //!
 //! ```rust
 //! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
@@ -273,7 +294,7 @@
 //! If the borrow cannot be handled gracefully, one may create a [`MutableBorrow`](crate::MutableBorrow)
 //! or [`ImmutableBorrow`](crate::ImmutableBorrow) guard and [`downgrade`](crate::MutableBorrow::downgrade)
 //! it to a `PotentialMutableBorrow` or `PotentialImmutableBorrow` guard so that the static analyzer
-//! will start reporting these potentially aliasing borrows again.
+//! will start reporting these potentially problematic borrows again.
 //!
 //! ```no_run
 //! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
@@ -317,11 +338,12 @@
 //! ## Dealing With Dynamic Dispatches
 //!
 //! AuToken resolves dynamic dispatches by collecting all possible dispatch targets ahead of time
-//! based around what gets unsized to what and assumes that any of those could be called. This
-//! can occasionally be overly pessimistic. You can help this along by making the dynamically
-//! dispatched traits more fine grained. For example, instead of using an `FnMut(u32, i32, f32)`, you
-//! could use an `FnMut(PhantomData<MyHandlers>, u32, i32, f32)`. Likewise, if you have a trait
-//! `MyBehavior`, you could parameterize it by a marker generic type to make it even more fine-grained.
+//! based around what gets unsized to what and assumes that any of those concrete types could be
+//! called by an invocation of a given unsized type. This can occasionally be overly pessimistic.
+//! You can help this along by making the dynamically dispatched traits more fine grained. For
+//! example, instead of using an `FnMut(u32, i32, f32)`, you could use an
+//! `FnMut(PhantomData<MyHandlers>, u32, i32, f32)`. Likewise, if you have a trait `MyBehavior`, you
+//! could parameterize it by a marker generic type to make it even more fine-grained.
 //!
 //! If something is really wrong, you could, once again, use [`assume_black_box`](crate::assume_black_box)
 //! to hide the unsizing coercions that create these dynamic dispatch targets. Once again, this is,
@@ -352,15 +374,15 @@
 //!
 //! There are four primitive borrowing functions offered by this library:
 //!
-//! - [`borrow_mutably`](crate::borrow_mutably)
-//! - [`borrow_immutably`](crate::borrow_immutably)
-//! - [`unborrow_mutably`](crate::unborrow_mutably)
-//! - [`unborrow_immutably`](crate::unborrow_immutably)
+//! - [`borrow_mutably<T>`](crate::borrow_mutably)
+//! - [`borrow_immutably<T>`](crate::borrow_immutably)
+//! - [`unborrow_mutably<T>`](crate::unborrow_mutably)
+//! - [`unborrow_immutably<T>`](crate::unborrow_immutably)
 //!
 //! These functions, in reality, do absolutely nothing and are compiled away. However, when checked
 //! by the custom AuToken rustc wrapper, they virtually "borrow" and "unborrow" a global token of
-//! the type specified by their single generic parameter and raise a warning if it is possible to
-//! violate the XOR mutability rules of that virtual global token.
+//! the type `T` and raise a warning if it is possible to violate the XOR mutability rules of that
+//! virtual global token.
 //!
 //! Usually, these functions aren't called directly and are instead called indirectly through their
 //! RAII'd counterparts [`MutableBorrow`](crate::MutableBorrow) and [`ImmutableBorrow`](crate::ImmutableBorrow).
@@ -484,8 +506,8 @@
 //! 2. For every guard object, provide a way to acquire that object with a "loaner" borrow object. The
 //!    recommended suffix for this variant is `on_loan`. The mechanism for doing so is likely very
 //!    similar to `MutableBorrow`'s [`loan`](crate::MutableBorrow::loan) method.
-//! 3. For borrow methods which check their borrow before performing it, the method should be made
-//!    to loan a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow) or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow)
+//! 3. For conditional borrow methods which check their borrow before performing it, the method should
+//!    be made to loan a [`PotentialMutableBorrow`](crate::PotentialMutableBorrow) or [`PotentialImmutableBorrow`](crate::PotentialImmutableBorrow)
 //!    instead.
 //!
 //! All of these methods rely on being able to convert the RAII guard's type from its originally
@@ -596,8 +618,8 @@
 //! Here, we're using the placeholder lifetime in `Nothing` to limit the lifetime of the loans to
 //! the reference to the `loaner`. Pretty convenient.
 //!
-//! Finally, fallible `borrow` method variants can be implemented in a way almost identical to what
-//! was used in the previous example:
+//! Finally, fallible `borrow` method variants can be implemented in a way almost identical to the
+//! previous example's:
 //!
 //! ```rust
 //! # use {autoken::MutableBorrow, std::cell::{BorrowMutError, RefCell, RefMut}};
@@ -647,14 +669,14 @@ use core::{cmp::Ordering, fmt, marker::PhantomData, mem};
 
 /// Virtually acquires a mutable reference to a global token of type `T`.
 ///
+/// This method is more typically called through the [`MutableBorrow`] guard's constructor.
+///
 /// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
 /// functions like this to determine whether a program has the possibility of virtually borrowing a
 /// global token in a way which violates XOR borrowing rules.
 ///
 /// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
 /// virtual global token). When `T` is [`Nothing`], nothing happens.
-///
-/// This method is more typically called through the [`MutableBorrow`] guard's constructor.
 pub const fn borrow_mutably<T: ?Sized>() {
     const fn __autoken_borrow_mutably<T: ?Sized>() {}
 
@@ -663,14 +685,14 @@ pub const fn borrow_mutably<T: ?Sized>() {
 
 /// Virtually acquires an immutable reference to a global token of type `T`.
 ///
+/// This method is more typically called through the [`ImmutableBorrow`] guard's constructor.
+///
 /// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
 /// functions like this to determine whether a program has the possibility of virtually borrowing a
 /// global token in a way which violates XOR borrowing rules.
 ///
 /// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
 /// virtual global token). When `T` is [`Nothing`], nothing happens.
-///
-/// This method is more typically called through the [`ImmutableBorrow`] guard's constructor.
 pub const fn borrow_immutably<T: ?Sized>() {
     const fn __autoken_borrow_immutably<T: ?Sized>() {}
 
@@ -679,14 +701,14 @@ pub const fn borrow_immutably<T: ?Sized>() {
 
 /// Virtually unacquires a mutable reference to a global token of type `T`.
 ///
+/// This method is more typically called through the [`MutableBorrow`] guard's destructor.
+///
 /// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
 /// functions like this to determine whether a program has the possibility of virtually borrowing a
 /// global token in a way which violates XOR borrowing rules.
 ///
 /// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
 /// virtual global token). When `T` is [`Nothing`], nothing happens.
-///
-/// This method is more typically called through the [`MutableBorrow`] guard's destructor.
 pub const fn unborrow_mutably<T: ?Sized>() {
     const fn __autoken_unborrow_mutably<T: ?Sized>() {}
 
@@ -695,14 +717,14 @@ pub const fn unborrow_mutably<T: ?Sized>() {
 
 /// Virtually unacquires an immutable reference to a global token of type `T`.
 ///
+/// This method is more typically called through the [`ImmutableBorrow`] guard's destructor.
+///
 /// In regular builds, this does nothing, but when AuToken checks a given binary, it uses calls to
 /// functions like this to determine whether a program has the possibility of virtually borrowing a
 /// global token in a way which violates XOR borrowing rules.
 ///
 /// Global token identity is lifetime-erased (i.e. `&'a u32` and `&'b u32` always refer to the same
 /// virtual global token). When `T` is [`Nothing`], nothing happens.
-///
-/// This method is more typically called through the [`ImmutableBorrow`] guard's destructor.
 pub const fn unborrow_immutably<T: ?Sized>() {
     const fn __autoken_unborrow_immutably<T: ?Sized>() {}
 
@@ -789,10 +811,10 @@ pub fn assume_no_alias<Res>(f: impl FnOnce() -> Res) -> Res {
 /// be a last resort for when nothing else works out.
 ///
 /// This prevents both enumeration of unsizing coercions performed by the closure (which contribute
-/// to the set of dynamic dispatch targets for a given function pointer or trait type) and detection
-/// of the various `borrow` and `unborrow` function calls. This can be particularly tricky if you
-/// return a guard from the black-boxed closure since, although the call to [`borrow_mutably`] was
-/// ignored, the call to [`unborrow_mutably`] in the destructor is not:
+/// to the set of potential dynamic dispatch targets for a given function pointer or trait type) and
+/// detection of the various `borrow` and `unborrow` function calls. This can be particularly tricky
+/// if you return a guard from the black-boxed closure since, although the call to [`borrow_mutably`]
+/// was ignored, the call to [`unborrow_mutably`] in the destructor is not:
 ///
 /// ```rust
 /// use autoken::MutableBorrow;
@@ -946,7 +968,7 @@ impl<T: ?Sized> MutableBorrow<T> {
     /// Creates a loaned `MutableBorrow` of this guard which has no effect on the static analysis
     /// borrow counters by itself, making it safe to use in conditional code.
     ///
-    /// Unlike [loan](MutableBorrow::loan), this method takes an immutable reference to the loaning
+    /// Unlike [`loan`](MutableBorrow::loan), this method takes an immutable reference to the loaning
     /// `MutableBorrow`, which makes it more prone to accidental borrow aliasing.
     ///
     /// See the [Making Sense of Control Flow Errors](index.html#making-sense-of-control-flow-errors)
@@ -955,7 +977,7 @@ impl<T: ?Sized> MutableBorrow<T> {
         MutableBorrow::new()
     }
 
-    /// Clones the current `MutableBorrow` instance, assuming it is safe to do so.
+    /// Clones the current `MutableBorrow` instance and assumes that it is safe to do so.
     pub fn assume_no_alias_clone(&self) -> Self {
         assume_no_alias(|| Self::new())
     }
@@ -1123,8 +1145,8 @@ impl<T: ?Sized> Drop for ImmutableBorrow<T> {
 
 // === Potential RAII === //
 
-/// A variant of [`MutableBorrow`] which represents a mutable borrow which only really happens if
-/// doing so is safe.
+/// A variant of [`MutableBorrow`] which represents a mutable borrow which can gracefully recover from
+/// borrow errors if they end up occurring.
 ///
 /// Unlike a `MutableBorrow`, this token will not trigger a warning if a confounding borrow is
 /// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
@@ -1238,14 +1260,14 @@ impl<T: ?Sized> Clone for PotentialMutableBorrow<T> {
     }
 }
 
-/// A variant of [`ImmutableBorrow`] which represents a mutable borrow which only really happens if
-/// doing so is safe.
+/// A variant of [`ImmutableBorrow`] which represents an immutable borrow which can gracefully recover from
+/// borrow errors if they end up occurring.
 ///
 /// Unlike an `ImmutableBorrow`, this token will not trigger a warning if a confounding borrow is
 /// potentially alive at the same time as it since, if the dynamic borrow this borrow guard backs
 /// ends up aliasing with something else, the error is assumed to be handled gracefully.
 ///
-/// As with [`borrow_mutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
+/// As with [`borrow_immutably`] and friends, setting `T` to [`Nothing`] causes this guard to have no
 /// effect on the statically-analyzed borrow counts.
 ///
 /// If the error cannot be handled gracefully, one may construct an `ImmutableBorrow` and

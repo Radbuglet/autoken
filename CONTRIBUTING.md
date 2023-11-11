@@ -36,7 +36,7 @@ The `cargo-autoken` binary automatically builds its own version of `autoken-rust
 
 ## Executing Rustc
 
-The easiest way to execute `rustc-autoken` directly is through `cargo-autoken`'s `rustc` subcommand.
+The easiest way to execute `autoken-rustc` directly is through `cargo-autoken`'s `rustc` subcommand.
 
 Alternatively, you could build the custom rustc driver manually. If you want to call it directly without the help of `cargo`, you have to build it with an appropriate rpath:
 

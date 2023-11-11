@@ -2,6 +2,6 @@
 // `userland/INTERFACE_VERSION.in` and should be updated in tandem with this one.
 
 const SUPPORTED_RANGE: &str = "^0.1.0";
-const UPGRADE_MESSAGE: &str = "Consider upgrading either the autoken analysis tool or the autoken crate.";
+const UPGRADE_MESSAGE: &str = "Consider upgrading either the autoken analysis tool or the autoken crate. See https://github.com/radbuglet/autoken for details on both.";
 const DEPRECATED_RANGE: &str = "";
 const DEPRECATION_MESSAGE: &str = "<this message should be unreachable>";

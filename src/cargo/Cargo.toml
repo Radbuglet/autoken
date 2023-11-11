@@ -12,5 +12,5 @@ rustc-build-sysroot = "0.4.2"
 
 [build-dependencies]
 anyhow = "1.0.75"
-autoken-rustc = { path = "../rustc", artifact = "bin" }
+autoken-rustc = { path = "../rustc", version = "=0.1.0", artifact = "bin" }
 sha256 = { version = "1.4.0", default-features = false }
