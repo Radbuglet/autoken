@@ -1,0 +1,4 @@
+// N.B. this is an interface version, not a crate version! The corresponding analyzer file is
+// `cargo/INTERFACE_VERSION.in` and should be updated in tandem with this one.
+
+const MY_INTERFACE_VERSION: &str = "0.2.0";

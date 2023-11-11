@@ -45,33 +45,6 @@ impl Callbacks for AnalyzeMirCallbacks {
         // which are reachable from the main function so this is an okay limitation.
         config.opts.unstable_opts.always_encode_mir = true;
 
-        // Define version-checking CFGs
-        {
-            // Never update these!
-            const CFG_AUTOKEN_CHECKING_VERSIONS: &str = "__autoken_checking_versions";
-            const CFG_MAJOR_IS_PREFIX: &str = "__autoken_major_is_";
-            const CFG_SUPPORTED_MINOR_OR_LESS_IS_PREFIX: &str =
-                "__autoken_supported_minor_or_less_is_";
-            const CFG_DEPRECATED_MINOR_OR_LESS_IS_PREFIX: &str =
-                "__autoken_deprecated_minor_or_less_is_";
-
-            // Keep these in sync with `userland/build.rs`
-
-            // Emit the CFGS
-            let mut set = |var: String| config.crate_cfg.insert((var, None));
-
-            set(CFG_AUTOKEN_CHECKING_VERSIONS.to_string());
-            set(format!("{CFG_MAJOR_IS_PREFIX}{CURRENT_FORMAT_MAJOR}"));
-
-            for v in (DEPRECATED_FORMAT_MINOR + 1)..=CURRENT_FORMAT_MINOR {
-                set(format!("{CFG_SUPPORTED_MINOR_OR_LESS_IS_PREFIX}{v}"));
-            }
-
-            for v in 0..=DEPRECATED_FORMAT_MINOR {
-                set(format!("{CFG_DEPRECATED_MINOR_OR_LESS_IS_PREFIX}{v}"));
-            }
-        }
-
         // We also have to hack in a little environment variable to override the sysroot.
         if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {
             config.opts.maybe_sysroot = Some(PathBuf::from(ovr));
@@ -96,5 +69,3 @@ impl Callbacks for AnalyzeMirCallbacks {
         Compilation::Continue
     }
 }
-
-include!("../CURRENT_FORMAT.in");

@@ -1,98 +1,78 @@
-use std::{fmt::Write, fs, path::PathBuf};
+use semver::{Version, VersionReq};
 
-include!("CURRENT_FORMAT.in");
+include!("INTERFACE_VERSION.in");
 
 fn main() {
     // Don't rebuild this crate when nothing changed.
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Fetch the environment variables.
-    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    // Get environment variables
+    let my_version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let tool_version = get_opt_env("AUTOKEN_ANALYZER_VERSION").unwrap_or_else(|| {
+        "<unknown (missing `AUTOKEN_ANALYZER_VERSION` environment variable)>".to_string()
+    });
 
-    // Just export a version check file.
-    let mut p_version_check = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    p_version_check.push("version_check.rs");
+    let my_interface_version = Version::parse(MY_INTERFACE_VERSION).unwrap();
 
-    let version_check_file = {
-        // Never update these!
-        const CFG_AUTOKEN_CHECKING_VERSIONS: &str = "__autoken_checking_versions";
-        const CFG_MAJOR_IS_PREFIX: &str = "__autoken_major_is_";
-        const CFG_SUPPORTED_MINOR_OR_LESS_IS_PREFIX: &str = "__autoken_supported_minor_or_less_is_";
-        const CFG_DEPRECATED_MINOR_OR_LESS_IS_PREFIX: &str =
-            "__autoken_deprecated_minor_or_less_is_";
+    let supported_range = get_opt_env("AUTOKEN_ANALYZER_SUPPORTED_RANGE");
+    let upgrade_message = get_fallback_env(
+        "AUTOKEN_ANALYZER_UPGRADE_MESSAGE",
+        "No upgrade message was provided by the analyzer.",
+    );
 
-        let mut builder = String::new();
+    let deprecated_range = get_opt_env("AUTOKEN_ANALYZER_DEPRECATED_RANGE");
+    let deprecation_message = get_fallback_env(
+        "AUTOKEN_ANALYZER_DEPRECATION_MESSAGE",
+        "No upgrade message was provided by the analyzer.",
+    );
 
-        let userland_mismatch_warn_suffix = format!(
-			"Userland crate *internal format* version is {CURRENT_FORMAT_MAJOR}.{CURRENT_FORMAT_MINOR}. \
-			The userland crate at fault is running AuToken version {pkg_version}. \
-			Run `cargo autoken --version` to see the version of your currently installed static analysis tool."
-		);
+    // Handle the supported range.
+    if let Some(supported_range) = supported_range
+        .and_then(|v| parse_semver_req_or_err("AUTOKEN_ANALYZER_SUPPORTED_RANGE", &v))
+    {
+        if !supported_range.matches(&my_interface_version) {
+            println!(
+                "cargo:warning=Userland crate `autoken {my_version}` is not compatible with \
+				 autoken static analyzer tool version {tool_version} as its interface version \
+				 {my_interface_version} does not meet the supported interface version range \
+				 {supported_range}. {upgrade_message}"
+            );
+        }
+    }
 
-        let correct_major_cfg = format!("{CFG_MAJOR_IS_PREFIX}{CURRENT_FORMAT_MAJOR}");
+    // Handle the deprecation range.
+    if let Some(deprecated_range) = deprecated_range
+        .and_then(|v| parse_semver_req_or_err("AUTOKEN_ANALYZER_DEPRECATED_RANGE", &v))
+    {
+        if deprecated_range.matches(&my_interface_version) {
+            println!(
+                "cargo:warning=Userland crate `autoken {my_version}` is deprecated according to \
+				 autoken static analyzer tool version {tool_version} as its interface version \
+				 {my_interface_version} is in the interface version deprecation range {deprecated_range}. \
+				 {deprecation_message}"
+            );
+        }
+    }
+}
 
-        // Major version validation
-        writeln!(
-            builder,
-            "#[cfg(all({CFG_AUTOKEN_CHECKING_VERSIONS}, not({correct_major_cfg})))]"
-        )
-        .unwrap();
+fn get_opt_env(var: &str) -> Option<String> {
+    println!("cargo:rerun-if-env-changed={var}");
+    std::env::var(var).ok()
+}
 
-        writeln!(
-			builder,
-			"compile_error!(\"Major version mismatch in AuToken format: this version of the AuToken \
-			userland crate is entirely incompatible with the version of the analyzer. \
-			{userland_mismatch_warn_suffix}\");\n"
-		)
-        .unwrap();
+fn get_fallback_env(var: &str, fallback: &str) -> String {
+    get_opt_env(var).unwrap_or_else(|| fallback.to_string())
+}
 
-        // Minor version validation
-        writeln!(
-			builder,
-			"#[cfg(all({CFG_AUTOKEN_CHECKING_VERSIONS}, {correct_major_cfg}, not({CFG_SUPPORTED_MINOR_OR_LESS_IS_PREFIX}{CURRENT_FORMAT_MINOR})))]"
-		)
-		.unwrap();
-        writeln!(builder, "const _: () = autoken_minor_version_mismatch();\n").unwrap();
-
-        writeln!(builder, "#[allow(dead_code)]").unwrap();
-        writeln!(
-			builder,
-			"#[deprecated(note = \"Minor version mismatch in AuToken format: this version of the AuToken \
-			userland crate is using features only available in a later version of the analyzer. \
-			{userland_mismatch_warn_suffix}\")]",
-		)
-        .unwrap();
-        writeln!(builder, "const fn autoken_minor_version_mismatch() {{}}\n").unwrap();
-
-        // Deprecated version validation
-        writeln!(
-			builder,
-			"#[cfg(all({CFG_AUTOKEN_CHECKING_VERSIONS}, {correct_major_cfg}, not({CFG_DEPRECATED_MINOR_OR_LESS_IS_PREFIX}{DEPRECATED_FORMAT_MINOR})))]"
-		)
-		.unwrap();
-        writeln!(
-            builder,
-            "const _: () = autoken_minor_version_deprecated();\n"
-        )
-        .unwrap();
-
-        writeln!(builder, "#[allow(dead_code)]").unwrap();
-        writeln!(
-			builder,
-			"#[deprecated(note = \"This minor version of the AuToken format has been deprecated: this version \
-			of the AuToken userland crate is severely outdated and will likely soon become incompatible with \
-			a future version of the analyzer. You are strongly encouraged to upgrade your userland crate! \
-			{userland_mismatch_warn_suffix}\")]",
-		)
-        .unwrap();
-        writeln!(
-            builder,
-            "const fn autoken_minor_version_deprecated() {{}}\n"
-        )
-        .unwrap();
-
-        builder
-    };
-
-    fs::write(p_version_check, version_check_file).unwrap();
+fn parse_semver_req_or_err(var: &str, val: &str) -> Option<VersionReq> {
+    match VersionReq::parse(val) {
+        Ok(req) => Some(req),
+        Err(err) => {
+            println!(
+                "cargo:warn=The environment variable `{var}` is not a valid semver version range: \
+				 {err}. Offending input: {val:?}."
+            );
+            None
+        }
+    }
 }

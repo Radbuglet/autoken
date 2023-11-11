@@ -11,6 +11,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use rustc_build_sysroot::{SysrootBuilder, SysrootConfig};
 
+include!("../INTERFACE_VERSION.in");
+
 // === Command-Line Parsing == //
 
 #[derive(Debug, Parser)]
@@ -136,6 +138,14 @@ struct CliBinaryOverrides {
         default_value = None,
     )]
     custom_rustc_wrapper: Option<PathBuf>,
+
+    #[arg(
+        short = 'k',
+        long = "disable-interface-checks",
+        help = "Disable all interface version validation checks with the userland autoken crate.",
+        default_value_t = false
+    )]
+    disable_interface_checks: bool,
 }
 
 #[derive(Debug, Args)]
@@ -148,7 +158,6 @@ struct CliRustcOverrides {
     )]
     custom_rustc_sysroot: Option<PathBuf>,
 
-    // Check options
     #[arg(
         short = 't',
         long = "target",
@@ -379,6 +388,7 @@ fn main() -> anyhow::Result<()> {
 struct BinaryCollection {
     cargo_exe: PathBuf,
     rustc_wrapper_path: PathBuf,
+    disable_interface_checks: bool,
 }
 
 impl BinaryCollection {
@@ -469,15 +479,46 @@ impl BinaryCollection {
         Ok(Self {
             cargo_exe,
             rustc_wrapper_path,
+            disable_interface_checks: args.disable_interface_checks,
         })
     }
 
     pub fn cargo_cmd(&self, rustc: Command) -> Command {
-        get_cargo_wrapper_cmd_gen(&self.cargo_exe)(rustc)
+        let mut cmd = Command::new(&self.cargo_exe);
+        cmd.env("RUSTC", rustc.get_program());
+        cmd.envs(rustc.get_envs().filter_map(|(a, b)| Some((a, b?))));
+        if !self.disable_interface_checks {
+            cmd.env("AUTOKEN_ANALYZER_VERSION", env!("CARGO_PKG_VERSION"));
+            cmd.env("AUTOKEN_ANALYZER_SUPPORTED_RANGE", SUPPORTED_RANGE);
+            cmd.env("AUTOKEN_ANALYZER_UPGRADE_MESSAGE", UPGRADE_MESSAGE);
+            cmd.env("AUTOKEN_ANALYZER_DEPRECATED_RANGE", DEPRECATED_RANGE);
+            cmd.env("AUTOKEN_ANALYZER_DEPRECATION_MESSAGE", DEPRECATION_MESSAGE);
+        } else {
+            cmd.env_remove("AUTOKEN_ANALYZER_VERSION");
+            cmd.env_remove("AUTOKEN_ANALYZER_SUPPORTED_RANGE");
+            cmd.env_remove("AUTOKEN_ANALYZER_UPGRADE_MESSAGE");
+            cmd.env_remove("AUTOKEN_ANALYZER_DEPRECATED_RANGE");
+            cmd.env_remove("AUTOKEN_ANALYZER_DEPRECATION_MESSAGE");
+        }
+        cmd
     }
 
     pub fn rustc_cmd(&self, skip_analysis: bool, sysroot: Option<&Path>) -> Command {
-        get_rustc_wrapper_cmd_gen(&self.rustc_wrapper_path)(skip_analysis, sysroot)
+        let mut cmd = Command::new(&self.rustc_wrapper_path);
+
+        if skip_analysis {
+            cmd.env("AUTOKEN_SKIP_ANALYSIS", "yes");
+        } else {
+            cmd.env_remove("AUTOKEN_SKIP_ANALYSIS");
+        }
+
+        if let Some(sysroot) = sysroot {
+            cmd.env("AUTOKEN_OVERRIDE_SYSROOT", sysroot);
+        } else {
+            cmd.env_remove("AUTOKEN_OVERRIDE_SYSROOT");
+        }
+
+        cmd
     }
 }
 
@@ -523,37 +564,6 @@ fn write_rustc_wrapper_exe(path: &Path) -> anyhow::Result<()> {
     })?;
 
     Ok(())
-}
-
-fn get_cargo_wrapper_cmd_gen(cargo_exe: &Path) -> impl Fn(Command) -> Command + '_ {
-    move |rust_cmd: Command| {
-        let mut cmd = Command::new(cargo_exe);
-        cmd.env("RUSTC", rust_cmd.get_program());
-        cmd.envs(rust_cmd.get_envs().filter_map(|(a, b)| Some((a, b?))));
-        cmd
-    }
-}
-
-fn get_rustc_wrapper_cmd_gen(
-    rustc_wrapper_path: &Path,
-) -> impl Fn(bool, Option<&Path>) -> Command + '_ {
-    move |skip_analysis: bool, sysroot: Option<&Path>| {
-        let mut cmd = Command::new(rustc_wrapper_path);
-
-        if skip_analysis {
-            cmd.env("AUTOKEN_SKIP_ANALYSIS", "yes");
-        } else {
-            cmd.env_remove("AUTOKEN_SKIP_ANALYSIS");
-        }
-
-        if let Some(sysroot) = sysroot {
-            cmd.env("AUTOKEN_OVERRIDE_SYSROOT", sysroot);
-        } else {
-            cmd.env_remove("AUTOKEN_OVERRIDE_SYSROOT");
-        }
-
-        cmd
-    }
 }
 
 fn get_host_target(mut rust_cmd: Command) -> anyhow::Result<String> {

@@ -643,10 +643,6 @@
 
 use core::{cmp::Ordering, fmt, marker::PhantomData, mem};
 
-// === Version Validation === //
-
-include!(concat!(env!("OUT_DIR"), "/version_check.rs"));
-
 // === Primitives === //
 
 /// Virtually acquires a mutable reference to a global token of type `T`.
