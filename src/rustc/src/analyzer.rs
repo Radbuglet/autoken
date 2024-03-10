@@ -1,45 +1,35 @@
-use std::{collections::HashMap, ptr::NonNull, sync::OnceLock};
+use std::sync::OnceLock;
 
-use rustc_data_structures::{graph::WithStartNode, steal::Steal, sync::RwLock};
-use rustc_hir::{def_id::LocalDefId, definitions::DefPathData};
+use rustc_data_structures::graph::WithStartNode;
+use rustc_hir::{def::DefKind, Constness};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         AggregateKind, Body, BorrowKind, LocalDecl, MutBorrowKind, Place, Rvalue, SourceInfo,
         SourceScope, Statement, StatementKind,
     },
-    ty::{GlobalCtxt, Instance, InstanceDef, List, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{Instance, InstanceDef, List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Symbol;
-use scopeguard::guard;
+
+use crate::feeder::{
+    enter_feeder, feed,
+    feeders::{ConstnessFeeder, MirBuiltFeeder},
+};
 
 // === Engine === //
 
-type MirBodyLookupFn = for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>>;
-
-pub struct AnalysisDriver {
-    mir_body: MirBodyLookupFn,
-    feeder: MirFeeder,
+pub struct AnalysisDriver<'tcx> {
+    tcx: TyCtxt<'tcx>,
 }
 
-impl AnalysisDriver {
-    pub fn new(mir_body: MirBodyLookupFn) -> Self {
-        Self {
-            mir_body,
-            feeder: MirFeeder::default(),
-        }
+impl<'tcx> AnalysisDriver<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self { tcx }
     }
 
-    pub fn mir_body<'tcx>(&self, tcx: TyCtxt<'tcx>, id: LocalDefId) -> &'tcx Steal<Body<'tcx>> {
-        if let Some(body) = self.feeder.read(tcx, id) {
-            body
-        } else {
-            (self.mir_body)(tcx, id)
-        }
-    }
-
-    pub fn analyze(&self, tcx: TyCtxt<'_>) {
-        self.feeder.enter(tcx, || {
+    pub fn analyze(&mut self, tcx: TyCtxt<'_>) {
+        enter_feeder(tcx, || {
             // Find the main function
             let Some((main_fn, _)) = tcx.entry_fn(()) else {
                 return;
@@ -122,73 +112,20 @@ impl AnalysisDriver {
                 .at(body.span)
                 .create_def(
                     tcx.local_parent(main_fn),
-                    DefPathData::TypeNs(Symbol::intern(&format!(
+                    Symbol::intern(&format!(
                         "{}_autoken_shadow",
                         tcx.item_name(main_fn.to_def_id()),
-                    ))),
+                    )),
+                    DefKind::Fn,
                 )
                 .def_id();
 
-            self.feeder
-                .feed(tcx, main_fn_shadow, tcx.alloc_steal_mir(body));
+            // We might actually have to reflect this.
+            feed::<ConstnessFeeder>(tcx, main_fn_shadow.to_def_id(), Constness::NotConst);
+            feed::<MirBuiltFeeder>(tcx, main_fn_shadow.to_def_id(), tcx.alloc_steal_mir(body));
 
             dbg!(tcx.mir_borrowck(main_fn_shadow));
         });
-    }
-}
-
-// === Helpers === //
-
-#[derive(Default)]
-struct MirFeeder(RwLock<MirFeederInner>);
-
-#[derive(Default)]
-struct MirFeederInner {
-    active_gtcx: Option<NonNull<()>>,
-    mir_feeds: HashMap<LocalDefId, NonNull<()>>,
-}
-
-unsafe impl Send for MirFeeder {}
-unsafe impl Sync for MirFeeder {}
-
-impl MirFeeder {
-    fn tcx_to_ptr(tcx: TyCtxt<'_>) -> NonNull<()> {
-        NonNull::<GlobalCtxt>::from(&**tcx).cast()
-    }
-
-    pub fn enter<R>(&self, tcx: TyCtxt<'_>, f: impl FnOnce() -> R) -> R {
-        // Acquire the global context.
-        let mut inner = self.0.write();
-        assert!(inner.active_gtcx.is_none());
-        assert!(inner.mir_feeds.is_empty());
-        inner.active_gtcx = Some(Self::tcx_to_ptr(tcx));
-        drop(inner);
-
-        // Setup a cleanup guard.
-        let gua = guard(self, |me| {
-            let mut inner = me.0.write();
-            inner.active_gtcx = None;
-            inner.mir_feeds.clear();
-        });
-
-        let res = f();
-        drop(gua);
-        res
-    }
-
-    pub fn feed<'tcx>(&self, tcx: TyCtxt<'tcx>, id: LocalDefId, body: &'tcx Steal<Body<'tcx>>) {
-        let mut inner = self.0.write();
-        assert_eq!(inner.active_gtcx, Some(Self::tcx_to_ptr(tcx)));
-        inner.mir_feeds.insert(id, NonNull::from(body).cast());
-    }
-
-    pub fn read<'tcx>(&self, tcx: TyCtxt<'tcx>, id: LocalDefId) -> Option<&'tcx Steal<Body<'tcx>>> {
-        let inner = self.0.read();
-        assert!(inner.active_gtcx.is_none() || inner.active_gtcx == Some(Self::tcx_to_ptr(tcx)));
-        inner
-            .mir_feeds
-            .get(&id)
-            .map(|v| unsafe { v.cast::<Steal<Body<'tcx>>>().as_ref() })
     }
 }
 
@@ -247,6 +184,10 @@ fn safeishly_grab_instance_mir<'tcx>(
         InstanceDef::VTableShim(_) | InstanceDef::ReifyShim(_) | InstanceDef::Virtual(_, _) => {
             MirGrabResult::Dynamic
         }
+
+        // TODO: Handle these properly.
+        InstanceDef::ConstructCoroutineInClosureShim { .. }
+        | InstanceDef::CoroutineKindShim { .. } => MirGrabResult::Dynamic,
     }
 }
 

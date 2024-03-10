@@ -1,22 +1,29 @@
-use std::{path::PathBuf, process, sync::OnceLock};
+use std::{path::PathBuf, process};
 
+use rustc_data_structures::steal::Steal;
 use rustc_driver::{
     catch_with_exit_code, init_rustc_env_logger, install_ice_hook, Callbacks, Compilation,
     RunCompiler,
 };
 
+use rustc_hir::{def_id::LocalDefId, Constness};
 use rustc_interface::{interface::Compiler, Queries};
-use rustc_session::{config::ErrorOutputType, EarlyErrorHandler};
+use rustc_middle::{mir::Body, ty::TyCtxt};
+use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
-use crate::analyzer::AnalysisDriver;
+use crate::{
+    analyzer::AnalysisDriver,
+    feeder::{
+        feeders::{ConstnessFeeder, MirBuiltFeeder},
+        once_val, read_feed,
+    },
+};
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
 
-static DRIVER: OnceLock<AnalysisDriver> = OnceLock::new();
-
 pub fn main_inner(args: Vec<String>) -> ! {
     // Install rustc's default logger
-    let handler = EarlyErrorHandler::new(ErrorOutputType::default());
+    let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
     init_rustc_env_logger(&handler);
 
     // Install a custom ICE hook for ourselves
@@ -49,39 +56,24 @@ impl Callbacks for AnalyzeMirCallbacks {
         }
 
         if should_run_analysis() {
-            config.override_queries = Some(|_sess, loc, _ext| {
-                DRIVER
-                    .set(AnalysisDriver::new(loc.mir_built))
-                    .ok()
-                    .expect("`override_queries` called more than once");
+            config.override_queries = Some(|_sess, query| {
+                once_val! {
+                    mir_built: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>> = query.mir_built;
+                    constness: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Constness = query.constness;
+                }
 
-                loc.mir_built = |tcx, id| {
-                    DRIVER
-                        .get()
-                        .expect("analysis driver never initialized")
-                        .mir_body(tcx, id)
+                query.mir_built = |tcx, id| {
+                    read_feed::<MirBuiltFeeder>(tcx, id.into())
+                        .unwrap_or_else(|| mir_built.get()(tcx, id))
+                };
+
+                query.constness = |tcx, id| {
+                    read_feed::<ConstnessFeeder>(tcx, id.into())
+                        .unwrap_or_else(|| constness.get()(tcx, id))
                 };
             });
         }
     }
-
-    //     fn after_analysis<'tcx>(
-    //         &mut self,
-    //         _handler: &EarlyErrorHandler,
-    //         _compiler: &Compiler,
-    //         queries: &'tcx Queries<'tcx>,
-    //     ) -> Compilation {
-    //         if should_run_analysis() {
-    //             queries.global_ctxt().unwrap().enter(|tcx| {
-    //                 DRIVER
-    //                     .get()
-    //                     .expect("analysis driver never initialized")
-    //                     .analyze(tcx);
-    //             });
-    //         }
-    //
-    //         Compilation::Continue
-    //     }
 
     fn after_expansion<'tcx>(
         &mut self,
@@ -90,10 +82,7 @@ impl Callbacks for AnalyzeMirCallbacks {
     ) -> Compilation {
         if should_run_analysis() {
             queries.global_ctxt().unwrap().enter(|tcx| {
-                DRIVER
-                    .get()
-                    .expect("analysis driver never initialized")
-                    .analyze(tcx);
+                AnalysisDriver::new(tcx).analyze(tcx);
             });
         }
 
