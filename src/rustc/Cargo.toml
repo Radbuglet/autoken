@@ -10,4 +10,5 @@ edition = "2021"
 rustc_private = true
 
 [dependencies]
+scopeguard = "1.2.0"
 smallvec = "1.11.1"
