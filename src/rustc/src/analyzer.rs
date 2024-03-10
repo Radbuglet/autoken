@@ -14,7 +14,7 @@ use rustc_span::Symbol;
 
 use crate::feeder::{
     enter_feeder, feed,
-    feeders::{ConstnessFeeder, MirBuiltFeeder},
+    feeders::{CodegenFnAttrsFeeder, ConstnessFeeder, MirBuiltFeeder},
 };
 
 // === Engine === //
@@ -37,17 +37,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             let Some(main_fn) = main_fn.as_local() else {
                 return;
-            };
-
-            // Find the `__autoken_helper_limit_to` "driver-item"
-            let limit_to_fn = {
-                let mut limit_to_fn = None;
-                for &item in tcx.hir().root_module().item_ids {
-                    if tcx.hir().name(item.hir_id()) == sym::__autoken_helper_limit_to.get() {
-                        limit_to_fn = Some(item.owner_id.def_id);
-                    }
-                }
-                limit_to_fn.expect("missing `__autoken_helper_limit_to` in crate root")
             };
 
             // Get the MIR for the function.
@@ -108,21 +97,26 @@ impl<'tcx> AnalysisDriver<'tcx> {
             ]);
 
             // Define and setup the shadow.
-            let main_fn_shadow = tcx
-                .at(body.span)
-                .create_def(
-                    tcx.local_parent(main_fn),
-                    Symbol::intern(&format!(
-                        "{}_autoken_shadow",
-                        tcx.item_name(main_fn.to_def_id()),
-                    )),
-                    DefKind::Fn,
-                )
-                .def_id();
+            let main_fn_shadow = tcx.at(body.span).create_def(
+                tcx.local_parent(main_fn),
+                Symbol::intern(&format!(
+                    "{}_autoken_shadow",
+                    tcx.item_name(main_fn.to_def_id()),
+                )),
+                DefKind::Fn,
+            );
+
+            main_fn_shadow.type_of(tcx.type_of(main_fn));
+            let main_fn_shadow = main_fn_shadow.def_id();
 
             // We might actually have to reflect this.
-            feed::<ConstnessFeeder>(tcx, main_fn_shadow.to_def_id(), Constness::NotConst);
-            feed::<MirBuiltFeeder>(tcx, main_fn_shadow.to_def_id(), tcx.alloc_steal_mir(body));
+            feed::<MirBuiltFeeder>(tcx, main_fn_shadow, tcx.alloc_steal_mir(body));
+            feed::<ConstnessFeeder>(tcx, main_fn_shadow, tcx.constness(main_fn));
+            feed::<CodegenFnAttrsFeeder>(
+                tcx,
+                main_fn_shadow,
+                tcx.codegen_fn_attrs(main_fn).clone(),
+            );
 
             dbg!(tcx.mir_borrowck(main_fn_shadow));
         });

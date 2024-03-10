@@ -47,7 +47,8 @@ pub fn enter_feeder<R>(tcx: TyCtxt<'_>, f: impl FnOnce() -> R) -> R {
     res
 }
 
-pub fn feed<'tcx, F: Feedable>(tcx: TyCtxt<'tcx>, id: DefId, val: F::Fed<'tcx>) {
+pub fn feed<'tcx, F: Feedable>(tcx: TyCtxt<'tcx>, id: impl Into<DefId>, val: F::Fed<'tcx>) {
+    let id = id.into();
     let mut feeder = FEEDER.write().unwrap();
     assert_eq!(feeder.tcx_addr, Some(tcx_addr(tcx)));
     feeder.mappings.insert((TypeId::of::<F>(), id), unsafe {
@@ -56,19 +57,22 @@ pub fn feed<'tcx, F: Feedable>(tcx: TyCtxt<'tcx>, id: DefId, val: F::Fed<'tcx>) 
     });
 }
 
-pub fn read_feed<F: Feedable>(tcx: TyCtxt<'_>, id: DefId) -> Option<F::Fed<'_>> {
+pub fn read_feed<F: Feedable>(tcx: TyCtxt<'_>, id: impl Into<DefId>) -> Option<F::Fed<'_>> {
+    let id = id.into();
     let feeder = FEEDER.read().unwrap();
     assert_eq!(feeder.tcx_addr, Some(tcx_addr(tcx)));
 
     feeder
         .mappings
         .get(&(TypeId::of::<F>(), id))
-        .map(|v| unsafe { *(&**v as &dyn ReallyAny as *const dyn ReallyAny as *const F::Fed<'_>) })
+        .map(|v| unsafe {
+            (*(&**v as &dyn ReallyAny as *const dyn ReallyAny as *const F::Fed<'_>)).clone()
+        })
 }
 
 // Feedable
 pub unsafe trait Feedable: 'static {
-    type Fed<'tcx>: Send + Sync + Copy;
+    type Fed<'tcx>: Send + Sync + Clone;
 }
 
 macro_rules! define_feedable {
@@ -87,11 +91,12 @@ pub(crate) use define_feedable;
 pub mod feeders {
     use rustc_data_structures::steal::Steal;
     use rustc_hir::Constness;
-    use rustc_middle::mir::Body;
+    use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrs, mir::Body};
 
     super::define_feedable! {
         MirBuiltFeeder => &'tcx Steal<Body<'tcx>>,
         ConstnessFeeder => Constness,
+        CodegenFnAttrsFeeder => CodegenFnAttrs,
     }
 }
 
