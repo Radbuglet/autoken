@@ -1,21 +1,18 @@
 use std::sync::OnceLock;
 
 use rustc_data_structures::graph::WithStartNode;
-use rustc_hir::{def::DefKind, Constness};
+use rustc_hir::def::DefKind;
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         AggregateKind, Body, BorrowKind, LocalDecl, MutBorrowKind, Place, Rvalue, SourceInfo,
         SourceScope, Statement, StatementKind,
     },
-    ty::{Instance, InstanceDef, List, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{InstanceDef, List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Symbol;
 
-use crate::feeder::{
-    enter_feeder, feed,
-    feeders::{CodegenFnAttrsFeeder, ConstnessFeeder, MirBuiltFeeder},
-};
+use crate::feeder::{feed, feeders::MirBuiltFeeder};
 
 // === Engine === //
 
@@ -29,97 +26,85 @@ impl<'tcx> AnalysisDriver<'tcx> {
     }
 
     pub fn analyze(&mut self, tcx: TyCtxt<'_>) {
-        enter_feeder(tcx, || {
-            // Find the main function
-            let Some((main_fn, _)) = tcx.entry_fn(()) else {
-                return;
-            };
+        // Find the main function
+        let Some((main_fn, _)) = tcx.entry_fn(()) else {
+            return;
+        };
 
-            let Some(main_fn) = main_fn.as_local() else {
-                return;
-            };
+        let Some(main_fn) = main_fn.as_local() else {
+            return;
+        };
 
-            // Get the MIR for the function.
-            let MirGrabResult::Found(body) =
-                safeishly_grab_instance_mir(tcx, Instance::mono(tcx, main_fn.to_def_id()).def)
-            else {
-                unreachable!();
-            };
+        // Get the MIR for the function.
+        let body = tcx.mir_built(main_fn);
 
-            // Create a new body for it.
-            let mut body = body.clone();
+        // Create a new body for it.
+        let mut body = body.borrow().clone();
+        let token_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.unit, body.span));
 
-            let token_local = body
-                .local_decls
-                .push(LocalDecl::new(tcx.types.unit, body.span));
+        let token_local_ref = body.local_decls.push(LocalDecl::new(
+            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
+            body.span,
+        ));
 
-            let token_local_ref = body.local_decls.push(LocalDecl::new(
-                Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
-                body.span,
-            ));
+        let start = body.basic_blocks.start_node();
+        let source_info = SourceInfo {
+            scope: SourceScope::from_u32(0),
+            span: body.span,
+        };
 
-            let start = body.basic_blocks.start_node();
-            let source_info = SourceInfo {
-                scope: SourceScope::from_u32(0),
-                span: body.span,
-            };
-
-            body.basic_blocks.as_mut()[start].statements.extend([
-                Statement {
-                    source_info,
-                    kind: StatementKind::Assign(Box::new((
+        body.basic_blocks.as_mut()[start].statements.extend([
+            Statement {
+                source_info,
+                kind: StatementKind::Assign(Box::new((
+                    Place {
+                        local: token_local,
+                        projection: List::empty(),
+                    },
+                    Rvalue::Aggregate(Box::new(AggregateKind::Tuple), IndexVec::new()),
+                ))),
+            },
+            Statement {
+                source_info,
+                kind: StatementKind::Assign(Box::new((
+                    Place {
+                        local: token_local_ref,
+                        projection: List::empty(),
+                    },
+                    Rvalue::Ref(
+                        tcx.lifetimes.re_erased,
+                        BorrowKind::Mut {
+                            kind: MutBorrowKind::Default,
+                        },
                         Place {
                             local: token_local,
                             projection: List::empty(),
                         },
-                        Rvalue::Aggregate(Box::new(AggregateKind::Tuple), IndexVec::new()),
-                    ))),
-                },
-                Statement {
-                    source_info,
-                    kind: StatementKind::Assign(Box::new((
-                        Place {
-                            local: token_local_ref,
-                            projection: List::empty(),
-                        },
-                        Rvalue::Ref(
-                            tcx.lifetimes.re_erased,
-                            BorrowKind::Mut {
-                                kind: MutBorrowKind::Default,
-                            },
-                            Place {
-                                local: token_local,
-                                projection: List::empty(),
-                            },
-                        ),
-                    ))),
-                },
-            ]);
+                    ),
+                ))),
+            },
+        ]);
 
-            // Define and setup the shadow.
-            let main_fn_shadow = tcx.at(body.span).create_def(
-                tcx.local_parent(main_fn),
-                Symbol::intern(&format!(
-                    "{}_autoken_shadow",
-                    tcx.item_name(main_fn.to_def_id()),
-                )),
-                DefKind::Fn,
-            );
+        // Define and setup the shadow.
+        let main_fn_shadow = tcx.at(body.span).create_def(
+            tcx.local_parent(main_fn),
+            Symbol::intern(&format!(
+                "{}_autoken_shadow",
+                tcx.item_name(main_fn.to_def_id()),
+            )),
+            DefKind::Fn,
+        );
 
-            main_fn_shadow.type_of(tcx.type_of(main_fn));
-            let main_fn_shadow = main_fn_shadow.def_id();
+        main_fn_shadow.opt_local_def_id_to_hir_id(tcx.opt_local_def_id_to_hir_id(main_fn));
+        let main_fn_shadow = main_fn_shadow.def_id();
 
-            // We might actually have to reflect this.
-            feed::<MirBuiltFeeder>(tcx, main_fn_shadow, tcx.alloc_steal_mir(body));
-            feed::<ConstnessFeeder>(tcx, main_fn_shadow, tcx.constness(main_fn));
-            feed::<CodegenFnAttrsFeeder>(
-                tcx,
-                main_fn_shadow,
-                tcx.codegen_fn_attrs(main_fn).clone(),
-            );
+        // Give it some MIR
+        feed::<MirBuiltFeeder>(tcx, main_fn_shadow, tcx.alloc_steal_mir(body));
 
-            dbg!(tcx.mir_borrowck(main_fn_shadow));
-        });
+        // Borrow check the shadow function
+        dbg!(&tcx.mir_borrowck(main_fn_shadow));
     }
 }
 

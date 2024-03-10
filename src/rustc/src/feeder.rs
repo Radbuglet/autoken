@@ -4,7 +4,6 @@ use std::{any::TypeId, mem::transmute, ptr::NonNull, sync::RwLock};
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
-use scopeguard::guard;
 use smallbox::{space::S2, SmallBox};
 
 use crate::hash::{ConstSafeBuildHasherDefault, FxHashMap};
@@ -34,23 +33,19 @@ fn tcx_addr(tcx: TyCtxt<'_>) -> NonNull<()> {
     NonNull::from(&**tcx).cast()
 }
 
-pub fn enter_feeder<R>(tcx: TyCtxt<'_>, f: impl FnOnce() -> R) -> R {
-    let mut feeder = FEEDER.write().unwrap();
-    assert_eq!(feeder.tcx_addr, None);
-    assert!(feeder.mappings.is_empty());
-    feeder.tcx_addr = Some(tcx_addr(tcx));
-    drop(feeder);
-
-    let gua = guard((), |()| FEEDER.write().unwrap().tcx_addr = None);
-    let res = f();
-    drop(gua);
-    res
-}
-
 pub fn feed<'tcx, F: Feedable>(tcx: TyCtxt<'tcx>, id: impl Into<DefId>, val: F::Fed<'tcx>) {
     let id = id.into();
+
     let mut feeder = FEEDER.write().unwrap();
-    assert_eq!(feeder.tcx_addr, Some(tcx_addr(tcx)));
+
+    // Ensure that all values come from the same TyCtxt.
+    if let Some(old_addr) = feeder.tcx_addr {
+        assert_eq!(tcx_addr(tcx), old_addr);
+    } else {
+        feeder.tcx_addr = Some(tcx_addr(tcx));
+    }
+
+    // Insert the mapping
     feeder.mappings.insert((TypeId::of::<F>(), id), unsafe {
         let val: SmallBox<dyn ReallyAny + 'tcx, S2> = smallbox::smallbox!(val);
         transmute::<ErasedFeedValue<'tcx>, ErasedFeedValue<'static>>(val)
@@ -60,8 +55,11 @@ pub fn feed<'tcx, F: Feedable>(tcx: TyCtxt<'tcx>, id: impl Into<DefId>, val: F::
 pub fn read_feed<F: Feedable>(tcx: TyCtxt<'_>, id: impl Into<DefId>) -> Option<F::Fed<'_>> {
     let id = id.into();
     let feeder = FEEDER.read().unwrap();
-    assert_eq!(feeder.tcx_addr, Some(tcx_addr(tcx)));
 
+    // Ensure that all values come from the same TyCtxt
+    assert!(feeder.tcx_addr.is_none() || feeder.tcx_addr == Some(tcx_addr(tcx)));
+
+    // Fetch the mapping
     feeder
         .mappings
         .get(&(TypeId::of::<F>(), id))
@@ -90,13 +88,10 @@ pub(crate) use define_feedable;
 
 pub mod feeders {
     use rustc_data_structures::steal::Steal;
-    use rustc_hir::Constness;
-    use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrs, mir::Body};
+    use rustc_middle::mir::Body;
 
     super::define_feedable! {
         MirBuiltFeeder => &'tcx Steal<Body<'tcx>>,
-        ConstnessFeeder => Constness,
-        CodegenFnAttrsFeeder => CodegenFnAttrs,
     }
 }
 

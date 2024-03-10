@@ -6,17 +6,14 @@ use rustc_driver::{
     RunCompiler,
 };
 
-use rustc_hir::{def_id::LocalDefId, Constness};
+use rustc_hir::def_id::LocalDefId;
 use rustc_interface::{interface::Compiler, Queries};
-use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrs, mir::Body, ty::TyCtxt};
+use rustc_middle::{mir::Body, ty::TyCtxt};
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
     analyzer::AnalysisDriver,
-    feeder::{
-        feeders::{CodegenFnAttrsFeeder, ConstnessFeeder, MirBuiltFeeder},
-        once_val, read_feed,
-    },
+    feeder::{feeders::MirBuiltFeeder, once_val, read_feed},
 };
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
@@ -59,22 +56,10 @@ impl Callbacks for AnalyzeMirCallbacks {
             config.override_queries = Some(|_sess, query| {
                 once_val! {
                     mir_built: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>> = query.mir_built;
-                    constness: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Constness = query.constness;
-                    codegen_fn_attrs: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> CodegenFnAttrs = query.codegen_fn_attrs;
                 }
 
                 query.mir_built = |tcx, id| {
                     read_feed::<MirBuiltFeeder>(tcx, id).unwrap_or_else(|| mir_built.get()(tcx, id))
-                };
-
-                query.constness = |tcx, id| {
-                    read_feed::<ConstnessFeeder>(tcx, id)
-                        .unwrap_or_else(|| constness.get()(tcx, id))
-                };
-
-                query.codegen_fn_attrs = |tcx, id| {
-                    read_feed::<CodegenFnAttrsFeeder>(tcx, id)
-                        .unwrap_or_else(|| codegen_fn_attrs.get()(tcx, id))
                 };
             });
         }
