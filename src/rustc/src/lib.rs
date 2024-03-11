@@ -16,5 +16,4 @@ extern crate rustc_span;
 
 pub mod analyzer;
 pub mod entry;
-pub mod feeder;
-pub mod hash;
+pub mod util;

@@ -13,7 +13,7 @@ use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
     analyzer::AnalysisDriver,
-    feeder::{feeders::MirBuiltFeeder, once_val, read_feed},
+    util::feeder::{feeders::MirBuiltFeeder, once_val, read_feed},
 };
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";

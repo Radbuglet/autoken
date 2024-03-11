@@ -6,7 +6,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 use smallbox::{space::S2, SmallBox};
 
-use crate::hash::{ConstSafeBuildHasherDefault, FxHashMap};
+use super::hash::{ConstSafeBuildHasherDefault, FxHashMap};
 
 // Store
 static FEEDER: RwLock<FeederState> = RwLock::new(FeederState {
@@ -78,7 +78,7 @@ macro_rules! define_feedable {
         #[non_exhaustive]
         pub struct $name;
 
-        unsafe impl $crate::feeder::Feedable for $name {
+        unsafe impl $crate::util::feeder::Feedable for $name {
             type Fed<'tcx> = $ty;
         }
     )*};
@@ -126,8 +126,8 @@ macro_rules! once_val {
         $vis:vis $name:ident: $ty:ty = $expr:expr;
     )*) => {$(
         #[allow(non_upper_case_globals)]
-        static $name: $crate::feeder::once_val_macro_internals::MyOnceLock<$ty> =
-            $crate::feeder::once_val_macro_internals::MyOnceLock::new();
+        static $name: $crate::util::feeder::once_val_macro_internals::MyOnceLock<$ty> =
+            $crate::util::feeder::once_val_macro_internals::MyOnceLock::new();
 
         $name.init($expr);
     )*};
