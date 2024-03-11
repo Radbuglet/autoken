@@ -1,6 +1,8 @@
 use std::collections::{hash_map, HashMap};
 
-use rustc_hir::{def::DefKind, HirId, ItemLocalId, Node, OwnerId, OwnerNodes, ParentedNode};
+use rustc_hir::{
+    def::DefKind, HirId, ItemLocalId, Lifetime, MutTy, Node, OwnerId, OwnerNodes, ParentedNode,
+};
 
 use rustc_middle::{
     mir::{
@@ -9,7 +11,7 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, InstanceDef, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{source_map::dummy_spanned, Symbol, DUMMY_SP};
+use rustc_span::{source_map::dummy_spanned, symbol::Ident, Symbol, DUMMY_SP};
 
 use crate::util::{
     feeder::{
@@ -263,6 +265,38 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     let mut nodes = main_fn_owner_nodes.nodes.clone();
 
                     // Create a new node to hold the parameter type.
+
+                    //> Unit
+                    let unit_ty = HirId {
+                        owner: own_owner,
+                        local_id: ItemLocalId::from_usize(nodes.len()),
+                    };
+                    let unit_ty_data = tcx.arena.alloc(rustc_hir::Ty {
+                        hir_id: unit_ty,
+                        kind: rustc_hir::TyKind::Tup(&[]),
+                        span: DUMMY_SP,
+                    });
+                    nodes.push(ParentedNode {
+                        parent: ItemLocalId::from_u32(0),
+                        node: Node::Ty(unit_ty_data),
+                    });
+
+                    //> Lifetime
+                    let token_local_lt = HirId {
+                        owner: own_owner,
+                        local_id: ItemLocalId::from_usize(nodes.len()),
+                    };
+                    let token_local_lt_data = tcx.arena.alloc(Lifetime {
+                        hir_id: token_local_lt,
+                        ident: Ident::new(Symbol::intern("hehe_i_hah_the"), DUMMY_SP),
+                        res: rustc_hir::LifetimeName::Static,
+                    });
+                    nodes.push(ParentedNode {
+                        parent: ItemLocalId::from_u32(0),
+                        node: Node::Lifetime(token_local_lt_data),
+                    });
+
+                    //> Full type
                     let token_local_hir_ty = HirId {
                         owner: own_owner,
                         local_id: ItemLocalId::from_usize(nodes.len()),
@@ -270,7 +304,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     let token_local_hir_ty = tcx.arena.alloc(rustc_hir::Ty {
                         hir_id: token_local_hir_ty,
                         // TODO: Rewrite it as a reference
-                        kind: rustc_hir::TyKind::Tup(&[]),
+                        kind: rustc_hir::TyKind::Ref(
+                            token_local_lt_data,
+                            MutTy {
+                                mutbl: Mutability::Mut,
+                                ty: unit_ty_data,
+                            },
+                        ),
                         span: DUMMY_SP,
                     });
                     nodes.push(ParentedNode {
