@@ -6,14 +6,17 @@ use rustc_driver::{
     RunCompiler,
 };
 
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{def_id::LocalDefId, AttributeMap, OwnerId, OwnerNodes};
 use rustc_interface::{interface::Compiler, Queries};
 use rustc_middle::{mir::Body, ty::TyCtxt};
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
     analyzer::AnalysisDriver,
-    util::feeder::{feeders::MirBuiltFeeder, once_val, read_feed},
+    util::feeder::{
+        feeders::{HirOwnerNode, MirBuiltFeeder},
+        once_val, read_feed,
+    },
 };
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
@@ -54,12 +57,29 @@ impl Callbacks for AnalyzeMirCallbacks {
 
         if should_run_analysis() {
             config.override_queries = Some(|_sess, query| {
+                // Feeders
                 once_val! {
                     mir_built: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>> = query.mir_built;
+                    opt_hir_owner_nodes: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Option<&'tcx OwnerNodes<'tcx>> = query.opt_hir_owner_nodes;
+                    hir_attrs: for<'tcx> fn(TyCtxt<'tcx>, OwnerId) -> &'tcx AttributeMap = query.hir_attrs;
                 }
 
                 query.mir_built = |tcx, id| {
                     read_feed::<MirBuiltFeeder>(tcx, id).unwrap_or_else(|| mir_built.get()(tcx, id))
+                };
+
+                query.opt_hir_owner_nodes = |tcx, id| match read_feed::<HirOwnerNode>(tcx, id) {
+                    Some(fed) => Some(fed),
+                    None => (opt_hir_owner_nodes.get())(tcx, id),
+                };
+
+                // Overrides
+                query.hir_attrs = |tcx, id| {
+                    if read_feed::<HirOwnerNode>(tcx, id).is_some() {
+                        AttributeMap::EMPTY
+                    } else {
+                        (hir_attrs.get())(tcx, id)
+                    }
                 };
             });
         }
@@ -72,7 +92,7 @@ impl Callbacks for AnalyzeMirCallbacks {
     ) -> Compilation {
         if should_run_analysis() {
             queries.global_ctxt().unwrap().enter(|tcx| {
-                AnalysisDriver::default().analyze(tcx);
+                AnalysisDriver::default().analyze_old(tcx);
             });
         }
 

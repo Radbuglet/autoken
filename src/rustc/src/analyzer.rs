@@ -1,19 +1,25 @@
 use std::collections::{hash_map, HashMap};
 
-use rustc_data_structures::graph::WithStartNode;
-use rustc_hir::def::DefKind;
+use rustc_data_structures::sorted_map::SortedMap;
+use rustc_hir::{
+    def::DefKind, Body, HirId, Item, ItemLocalId, Node, OwnerId, OwnerNodes, ParentedNode,
+};
+
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        AggregateKind, BorrowKind, LocalDecl, MutBorrowKind, Mutability, Operand, Place, Rvalue,
-        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
+        BorrowKind, Local, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem,
+        Rvalue, SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
     },
     ty::{EarlyBinder, Instance, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{source_map::dummy_spanned, Symbol};
+use rustc_span::{source_map::dummy_spanned, symbol::Ident, Symbol};
 
 use crate::util::{
-    feeder::{feed, feeders::MirBuiltFeeder},
+    feeder::{
+        feed,
+        feeders::{HirOwnerNode, MirBuiltFeeder},
+    },
     hash::FxHashMap,
     mir::{safeishly_grab_instance_mir, MirGrabResult},
 };
@@ -140,12 +146,14 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
     pub fn analyze_old(&mut self, tcx: TyCtxt<'tcx>) {
         // Find the main function
-        let Some((main_fn, _)) = tcx.entry_fn(()) else {
-            return;
-        };
-
-        let Some(main_fn) = main_fn.as_local() else {
-            return;
+        let main_fn = {
+            let mut fn_id = None;
+            for &item in tcx.hir().root_module().item_ids {
+                if tcx.hir().name(item.hir_id()) == Symbol::intern("whee") {
+                    fn_id = Some(item.owner_id.def_id);
+                }
+            }
+            fn_id.expect("missing `whee` in crate root")
         };
 
         // Find helper functions
@@ -162,35 +170,21 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Get the MIR for the function.
         let body = tcx.mir_built(main_fn);
 
-        // Create a new body for it.
+        // Create the shadow function's MIR.
         let mut body = body.borrow().clone();
-        let token_local = body
-            .local_decls
-            .push(LocalDecl::new(tcx.types.unit, body.span));
-
-        let token_local_ref = body.local_decls.push(LocalDecl::new(
-            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
-            body.span,
-        ));
-
-        let start = body.basic_blocks.start_node();
         let source_info = SourceInfo {
             scope: SourceScope::from_u32(0),
             span: body.span,
         };
 
-        body.basic_blocks.as_mut()[start]
-            .statements
-            .extend([Statement {
-                source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place {
-                        local: token_local,
-                        projection: List::empty(),
-                    },
-                    Rvalue::Aggregate(Box::new(AggregateKind::Tuple), IndexVec::new()),
-                ))),
-            }]);
+        let token_local = Local::from_u32(1);
+        body.local_decls.as_mut_slice()[token_local].ty =
+            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+
+        let token_local_rb = body.local_decls.push(LocalDecl::new(
+            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
+            source_info.span,
+        ));
 
         for bb in body.basic_blocks.as_mut().iter_mut() {
             let Some(Terminator {
@@ -216,7 +210,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 );
 
                 args.push(dummy_spanned(Operand::Move(Place {
-                    local: token_local_ref,
+                    local: token_local_rb,
                     projection: List::empty(),
                 })));
 
@@ -224,7 +218,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     source_info,
                     kind: StatementKind::Assign(Box::new((
                         Place {
-                            local: token_local_ref,
+                            local: token_local_rb,
                             projection: List::empty(),
                         },
                         Rvalue::Ref(
@@ -234,7 +228,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             },
                             Place {
                                 local: token_local,
-                                projection: List::empty(),
+                                projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
                             },
                         ),
                     ))),
@@ -242,23 +236,86 @@ impl<'tcx> AnalysisDriver<'tcx> {
             }
         }
 
-        // Define and setup the shadow.
+        // Create the shadow function's DefId.
+
+        //> Reserve its DefId.
+        let main_fn_shadow_name = Symbol::intern(&format!(
+            "{}_autoken_shadow",
+            tcx.item_name(main_fn.to_def_id()),
+        ));
         let main_fn_shadow = tcx.at(body.span).create_def(
             tcx.local_parent(main_fn),
-            Symbol::intern(&format!(
-                "{}_autoken_shadow",
-                tcx.item_name(main_fn.to_def_id()),
-            )),
+            main_fn_shadow_name,
             DefKind::Fn,
         );
 
-        main_fn_shadow.opt_local_def_id_to_hir_id(tcx.opt_local_def_id_to_hir_id(main_fn));
+        //> Create its HIR
+        let main_fn_hir_id = tcx.local_def_id_to_hir_id(main_fn);
+        let main_fn_owner_nodes = tcx.hir_owner_nodes(main_fn_hir_id.owner);
+
+        let main_fn_shadow_owner_nodes = {
+            Box::leak(Box::new(OwnerNodes {
+                opt_hash_including_bodies: None,
+                nodes: IndexVec::from_iter(main_fn_owner_nodes.nodes.iter().enumerate().map(
+                    |(i, node)| {
+                        let own_owner = OwnerId {
+                            def_id: main_fn_shadow.def_id(),
+                        };
+                        let own_hir_id = HirId {
+                            owner: own_owner,
+                            local_id: ItemLocalId::from_usize(i),
+                        };
+
+                        ParentedNode {
+                            parent: node.parent,
+                            node: match &node.node {
+                                Node::Item(node) => Node::Item(tcx.arena.alloc(Item {
+                                    ident: Ident {
+                                        name: main_fn_shadow_name,
+                                        span: node.ident.span,
+                                    },
+                                    owner_id: own_owner,
+                                    // TODO: Modify these as well?
+                                    kind: node.kind,
+                                    span: node.span,
+                                    vis_span: node.vis_span,
+                                })),
+                                // TODO: Modify these as well?
+                                node => *node,
+                            },
+                        }
+                    },
+                )),
+                bodies: SortedMap::from_iter(main_fn_owner_nodes.bodies.iter().map(
+                    |(id, body)| {
+                        (
+                            *id,
+                            &*tcx.arena.alloc(Body {
+                                // TODO: Modify these as well?
+                                params: body.params,
+                                value: body.value,
+                            }),
+                        )
+                    },
+                )),
+            }))
+        };
+
+        //> Feed the query system the shadow function's properties.
+        main_fn_shadow.opt_local_def_id_to_hir_id(Some(HirId {
+            local_id: main_fn_hir_id.local_id,
+            owner: OwnerId {
+                def_id: main_fn_shadow.def_id(),
+            },
+        }));
+
+        feed::<MirBuiltFeeder>(tcx, main_fn_shadow.def_id(), tcx.alloc_steal_mir(body));
+        feed::<HirOwnerNode>(tcx, main_fn_shadow.def_id(), main_fn_shadow_owner_nodes);
+
         let main_fn_shadow = main_fn_shadow.def_id();
 
-        // Give it some MIR
-        feed::<MirBuiltFeeder>(tcx, main_fn_shadow, tcx.alloc_steal_mir(body));
-
         // Borrow check the shadow function
+
         dbg!(&tcx.mir_borrowck(main_fn_shadow));
     }
 }

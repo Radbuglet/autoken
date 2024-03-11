@@ -7,6 +7,11 @@ fn main() {
     let _ = a;
 }
 
+fn whee(hehe: u32) {
+    // let foo = __autoken_tie_mut(v);
+    // let bar = __autoken_tie_mut(v);
+}
+
 fn __autoken_tie_ref_shadow<'a, T: ?Sized>(v: &'a T, _: &'a ()) -> &'a T {
     v
 }

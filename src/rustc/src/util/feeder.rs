@@ -70,7 +70,7 @@ pub fn read_feed<F: Feedable>(tcx: TyCtxt<'_>, id: impl Into<DefId>) -> Option<F
 
 // Feedable
 pub unsafe trait Feedable: 'static {
-    type Fed<'tcx>: Send + Sync + Clone;
+    type Fed<'tcx>: Clone;
 }
 
 macro_rules! define_feedable {
@@ -88,10 +88,12 @@ pub(crate) use define_feedable;
 
 pub mod feeders {
     use rustc_data_structures::steal::Steal;
+    use rustc_hir::OwnerNodes;
     use rustc_middle::mir::Body;
 
     super::define_feedable! {
         MirBuiltFeeder => &'tcx Steal<Body<'tcx>>,
+        HirOwnerNode => &'tcx OwnerNodes<'tcx>,
     }
 }
 

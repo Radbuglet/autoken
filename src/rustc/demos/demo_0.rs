@@ -23,6 +23,10 @@ fn maz<T>() {
     maz::<u32>();
 }
 
+fn kaz<F: FnOnce()>(f: F) {
+    (f)();
+}
+
 fn __autoken_declare_tied_ref<T: ?Sized>() {}
 
 fn __autoken_declare_tied_mut<T: ?Sized>() {}
