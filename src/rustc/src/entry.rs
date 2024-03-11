@@ -72,7 +72,7 @@ impl Callbacks for AnalyzeMirCallbacks {
     ) -> Compilation {
         if should_run_analysis() {
             queries.global_ctxt().unwrap().enter(|tcx| {
-                AnalysisDriver::new(tcx).analyze(tcx);
+                AnalysisDriver::default().analyze(tcx);
             });
         }
 

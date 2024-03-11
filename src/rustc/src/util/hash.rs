@@ -10,6 +10,12 @@ pub type FxHashSet<T> = HashSet<T, FxHasher>;
 
 pub struct ConstSafeBuildHasherDefault<H>(PhantomData<fn(H) -> H>);
 
+impl<H> Default for ConstSafeBuildHasherDefault<H> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<H> ConstSafeBuildHasherDefault<H> {
     pub const fn new() -> Self {
         Self(PhantomData)

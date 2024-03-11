@@ -1,21 +1,28 @@
-fn main() {
-    let mut foo = Vec::<i32>::new();
-    let a = __autoken_tie_mut(&mut foo);
-    let b = __autoken_tie_mut(&mut foo);
+fn main() {}
+
+struct Foo;
+
+impl Foo {
+    fn whee(&self) {}
 }
 
-fn __autoken_tie_ref_shadow<'a, T: ?Sized>(v: &'a T, _: &'a ()) -> &'a T {
-    v
+impl Default for Foo {
+    fn default() -> Self {
+        Self
+    }
 }
 
-fn __autoken_tie_mut_shadow<'a, T: ?Sized>(v: &'a mut T, _: &'a mut ()) -> &'a mut T {
-    v
+fn waz() {
+    maz::<i32>();
+    __autoken_declare_tied_ref::<str>();
 }
 
-fn __autoken_tie_ref<T: ?Sized>(v: &T) -> &T {
-    v
+fn maz<T>() {
+    __autoken_declare_tied_mut::<str>();
+    __autoken_declare_tied_ref::<T>();
+    maz::<u32>();
 }
 
-fn __autoken_tie_mut<T: ?Sized>(v: &mut T) -> &mut T {
-    v
-}
+fn __autoken_declare_tied_ref<T: ?Sized>() {}
+
+fn __autoken_declare_tied_mut<T: ?Sized>() {}

@@ -1,32 +1,144 @@
+use std::collections::{hash_map, HashMap};
+
 use rustc_data_structures::graph::WithStartNode;
 use rustc_hir::def::DefKind;
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        AggregateKind, BorrowKind, LocalDecl, MutBorrowKind, Operand, Place, Rvalue, SourceInfo,
-        SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
+        AggregateKind, BorrowKind, LocalDecl, MutBorrowKind, Mutability, Operand, Place, Rvalue,
+        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{GenericArg, GenericArgKind, List, Ty, TyCtxt, TyKind},
+    ty::{EarlyBinder, Instance, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{
-    source_map::{dummy_spanned, Spanned},
-    Symbol,
-};
+use rustc_span::{source_map::dummy_spanned, Symbol};
 
-use crate::util::feeder::{feed, feeders::MirBuiltFeeder};
+use crate::util::{
+    feeder::{feed, feeders::MirBuiltFeeder},
+    hash::FxHashMap,
+    mir::{safeishly_grab_instance_mir, MirGrabResult},
+};
 
 // === Engine === //
 
+#[derive(Debug, Default)]
 pub struct AnalysisDriver<'tcx> {
-    tcx: TyCtxt<'tcx>,
+    func_facts: FxHashMap<Instance<'tcx>, Option<FuncFacts<'tcx>>>,
+}
+
+#[derive(Debug)]
+struct FuncFacts<'tcx> {
+    borrows: FxHashMap<Ty<'tcx>, Mutability>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self { tcx }
+    pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
+        // Get the token use sets of each function.
+        for local_def in tcx.iter_local_def_id() {
+            if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+
+            if tcx.generics_of(local_def).count() > 0 {
+                continue;
+            }
+
+            self.analyze_fn_facts(tcx, Instance::mono(tcx, local_def.to_def_id()));
+        }
+
+        // Check for undeclared unsizing.
+        // TODO
+
+        // Generate shadow functions for each visited function.
+        // TODO
+
+        // Borrow-check these shadow functions.
+        // TODO
+
+        dbg!(self);
     }
 
-    pub fn analyze(&mut self, tcx: TyCtxt<'_>) {
+    fn analyze_fn_facts(&mut self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
+        // Ensure that we don't analyze the same function circularly or redundantly.
+        if let hash_map::Entry::Vacant(entry) = self.func_facts.entry(instance) {
+            entry.insert(None);
+        } else {
+            return;
+        }
+
+        // If this function has a hardcoded fact set, use those.
+        let hardcoded_mut = match tcx.opt_item_name(instance.def_id()) {
+            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
+            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
+            _ => None,
+        };
+
+        if let Some(hardcoded_mut) = hardcoded_mut {
+            self.func_facts.insert(
+                instance,
+                Some(FuncFacts {
+                    borrows: HashMap::from_iter([(
+                        instance.args[0].as_type().unwrap(),
+                        hardcoded_mut,
+                    )]),
+                }),
+            );
+            return;
+        }
+
+        // Acquire the function body.
+        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
+            return;
+        };
+
+        // See who the function may call and where.
+        let mut borrows = FxHashMap::default();
+
+        for bb in body.basic_blocks.iter() {
+            // If the terminator is a call terminator.
+            let Some(Terminator {
+                kind: TerminatorKind::Call { func, .. },
+                ..
+            }) = &bb.terminator
+            else {
+                continue;
+            };
+
+            // Concretize the function type.
+            let func = func.ty(&body.local_decls, tcx);
+            let func = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                ParamEnv::reveal_all(),
+                EarlyBinder::bind(func),
+            );
+
+            // If the function target is well known...
+            let TyKind::FnDef(callee_id, generics) = func.kind() else {
+                continue;
+            };
+
+            // Analyze it...
+            let target_instance =
+                Instance::expect_resolve(tcx, ParamEnv::reveal_all(), *callee_id, generics);
+            self.analyze_fn_facts(tcx, target_instance);
+
+            // ...and add its borrows to the borrows set.
+            let Some(target_facts) = &self.func_facts[&target_instance] else {
+                continue;
+            };
+
+            for (borrow_key, borrow_mut) in &target_facts.borrows {
+                let curr_mut = borrows.entry(*borrow_key).or_insert(*borrow_mut);
+                if borrow_mut.is_mut() {
+                    *curr_mut = Mutability::Mut;
+                }
+            }
+        }
+
+        self.func_facts
+            .insert(instance, Some(FuncFacts { borrows }));
+    }
+
+    pub fn analyze_old(&mut self, tcx: TyCtxt<'tcx>) {
         // Find the main function
         let Some((main_fn, _)) = tcx.entry_fn(()) else {
             return;
@@ -67,8 +179,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
             span: body.span,
         };
 
-        body.basic_blocks.as_mut()[start].statements.extend([
-            Statement {
+        body.basic_blocks.as_mut()[start]
+            .statements
+            .extend([Statement {
                 source_info,
                 kind: StatementKind::Assign(Box::new((
                     Place {
@@ -77,27 +190,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     },
                     Rvalue::Aggregate(Box::new(AggregateKind::Tuple), IndexVec::new()),
                 ))),
-            },
-            Statement {
-                source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place {
-                        local: token_local_ref,
-                        projection: List::empty(),
-                    },
-                    Rvalue::Ref(
-                        tcx.lifetimes.re_erased,
-                        BorrowKind::Mut {
-                            kind: MutBorrowKind::Default,
-                        },
-                        Place {
-                            local: token_local,
-                            projection: List::empty(),
-                        },
-                    ),
-                ))),
-            },
-        ]);
+            }]);
 
         for bb in body.basic_blocks.as_mut().iter_mut() {
             let Some(Terminator {
@@ -126,6 +219,26 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     local: token_local_ref,
                     projection: List::empty(),
                 })));
+
+                bb.statements.push(Statement {
+                    source_info,
+                    kind: StatementKind::Assign(Box::new((
+                        Place {
+                            local: token_local_ref,
+                            projection: List::empty(),
+                        },
+                        Rvalue::Ref(
+                            tcx.lifetimes.re_erased,
+                            BorrowKind::Mut {
+                                kind: MutBorrowKind::Default,
+                            },
+                            Place {
+                                local: token_local,
+                                projection: List::empty(),
+                            },
+                        ),
+                    ))),
+                });
             }
         }
 
@@ -154,8 +267,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
 mod sym {
     use crate::util::mir::CachedSymbol;
 
-    pub static __autoken_permit_escape: CachedSymbol = CachedSymbol::new("__autoken_permit_escape");
+    pub static __autoken_declare_tied_ref: CachedSymbol =
+        CachedSymbol::new("__autoken_declare_tied_ref");
 
+    pub static __autoken_declare_tied_mut: CachedSymbol =
+        CachedSymbol::new("__autoken_declare_tied_mut");
+
+    // Legacy:
     pub static __autoken_tie_ref: CachedSymbol = CachedSymbol::new("__autoken_tie_ref");
 
     pub static __autoken_tie_mut: CachedSymbol = CachedSymbol::new("__autoken_tie_mut");
