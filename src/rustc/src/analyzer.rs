@@ -7,7 +7,7 @@ use rustc_middle::{
         BorrowKind, Local, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem,
         Rvalue, SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{EarlyBinder, Instance, List, ParamEnv, Ty, TyCtxt, TyKind},
+    ty::{EarlyBinder, Instance, InstanceDef, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
 use rustc_span::{source_map::dummy_spanned, Symbol, DUMMY_SP};
 
@@ -245,6 +245,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
             DefKind::Fn,
         );
 
+        //> Update the MIR's references.
+        body.source.instance = InstanceDef::Item(main_fn_shadow.def_id().to_def_id());
+
         //> Create its HIR
         let main_fn_hir_id = tcx.local_def_id_to_hir_id(main_fn);
         let main_fn_owner_nodes = tcx.hir_owner_nodes(main_fn_hir_id.owner);
@@ -327,9 +330,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         let main_fn_shadow = main_fn_shadow.def_id();
 
-        // Borrow check the shadow function
-        dbg!(tcx.fn_sig(main_fn_shadow));
+        // Borrow check the shadow function);
+        println!("=== Go! ===");
         dbg!(&tcx.mir_borrowck(main_fn_shadow));
+        println!("=== End! ===");
     }
 }
 
