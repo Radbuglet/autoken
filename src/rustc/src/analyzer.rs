@@ -1,11 +1,7 @@
 use std::collections::{hash_map, HashMap};
 
-use rustc_data_structures::sorted_map::SortedMap;
-use rustc_hir::{
-    def::DefKind, Body, HirId, Item, ItemLocalId, Node, OwnerId, OwnerNodes, ParentedNode,
-};
+use rustc_hir::{def::DefKind, HirId, ItemLocalId, Node, OwnerId, OwnerNodes, ParentedNode};
 
-use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         BorrowKind, Local, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem,
@@ -13,7 +9,7 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{source_map::dummy_spanned, symbol::Ident, Symbol};
+use rustc_span::{source_map::dummy_spanned, Symbol, DUMMY_SP};
 
 use crate::util::{
     feeder::{
@@ -178,8 +174,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         let token_local = Local::from_u32(1);
-        body.local_decls.as_mut_slice()[token_local].ty =
-            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+        let token_local_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+        body.local_decls.as_mut_slice()[token_local].ty = token_local_ty;
 
         let token_local_rb = body.local_decls.push(LocalDecl::new(
             Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
@@ -256,48 +252,65 @@ impl<'tcx> AnalysisDriver<'tcx> {
         let main_fn_shadow_owner_nodes = {
             Box::leak(Box::new(OwnerNodes {
                 opt_hash_including_bodies: None,
-                nodes: IndexVec::from_iter(main_fn_owner_nodes.nodes.iter().enumerate().map(
-                    |(i, node)| {
-                        let own_owner = OwnerId {
-                            def_id: main_fn_shadow.def_id(),
-                        };
-                        let own_hir_id = HirId {
-                            owner: own_owner,
-                            local_id: ItemLocalId::from_usize(i),
-                        };
+                nodes: {
+                    let own_owner = OwnerId {
+                        def_id: main_fn_shadow.def_id(),
+                    };
 
-                        ParentedNode {
-                            parent: node.parent,
-                            node: match &node.node {
-                                Node::Item(node) => Node::Item(tcx.arena.alloc(Item {
-                                    ident: Ident {
-                                        name: main_fn_shadow_name,
-                                        span: node.ident.span,
-                                    },
-                                    owner_id: own_owner,
-                                    // TODO: Modify these as well?
-                                    kind: node.kind,
-                                    span: node.span,
-                                    vis_span: node.vis_span,
-                                })),
-                                // TODO: Modify these as well?
-                                node => *node,
-                            },
+                    let mut nodes = main_fn_owner_nodes.nodes.clone();
+
+                    // Create a new node to hold the parameter type.
+                    let token_local_hir_ty = HirId {
+                        owner: own_owner,
+                        local_id: ItemLocalId::from_usize(nodes.len()),
+                    };
+                    let token_local_hir_ty = tcx.arena.alloc(rustc_hir::Ty {
+                        hir_id: token_local_hir_ty,
+                        // TODO: Rewrite it as a reference
+                        kind: rustc_hir::TyKind::Tup(&[]),
+                        span: DUMMY_SP,
+                    });
+                    nodes.push(ParentedNode {
+                        parent: ItemLocalId::from_u32(0),
+                        node: Node::Ty(token_local_hir_ty),
+                    });
+
+                    // Adjust the entry-point's OwnerId and function signature just enough for the
+                    // borrow-checker to pass. This is *super* unsound but this is a prototype so
+                    // it's fine.
+                    let fn_node = &mut nodes[ItemLocalId::from_u32(0)].node;
+
+                    match fn_node {
+                        Node::Item(p_item) => {
+                            let mut item = **p_item;
+
+                            // Edit 1: owner_id
+                            item.owner_id = own_owner;
+
+                            // Edit 2: signature
+                            match &mut item.kind {
+                                rustc_hir::ItemKind::Fn(sig, _, _) => {
+                                    let mut decl = *sig.decl;
+                                    let mut inputs = decl.inputs.to_vec();
+                                    inputs[0] = *token_local_hir_ty;
+                                    decl.inputs = tcx.arena.alloc_from_iter(inputs);
+                                    sig.decl = tcx.arena.alloc(decl);
+                                }
+                                _ => unreachable!(),
+                            }
+
+                            *p_item = tcx.arena.alloc(item);
                         }
-                    },
-                )),
-                bodies: SortedMap::from_iter(main_fn_owner_nodes.bodies.iter().map(
-                    |(id, body)| {
-                        (
-                            *id,
-                            &*tcx.arena.alloc(Body {
-                                // TODO: Modify these as well?
-                                params: body.params,
-                                value: body.value,
-                            }),
-                        )
-                    },
-                )),
+                        // Node::ImplItem(item) => match &mut item.kind {
+                        //     rustc_hir::ImplItemKind::Fn(_, _) => todo!(),
+                        //     _ => unreachable!(),
+                        // },
+                        _ => unreachable!(),
+                    }
+
+                    nodes
+                },
+                bodies: main_fn_owner_nodes.bodies.clone(),
             }))
         };
 
@@ -315,7 +328,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
         let main_fn_shadow = main_fn_shadow.def_id();
 
         // Borrow check the shadow function
-
+        dbg!(tcx.fn_sig(main_fn_shadow));
         dbg!(&tcx.mir_borrowck(main_fn_shadow));
     }
 }
