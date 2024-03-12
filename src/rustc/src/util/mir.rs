@@ -1,10 +1,32 @@
 use std::sync::OnceLock;
 
 use rustc_middle::{
-    mir::Body,
+    mir::{Body, Local, Operand, Place, ProjectionElem},
     ty::{InstanceDef, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Symbol;
+
+// === Misc === //
+
+pub struct CachedSymbol {
+    raw: &'static str,
+    sym: OnceLock<Symbol>,
+}
+
+impl CachedSymbol {
+    pub const fn new(raw: &'static str) -> Self {
+        Self {
+            raw,
+            sym: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Symbol {
+        *self.sym.get_or_init(|| Symbol::intern(self.raw))
+    }
+}
+
+// === `safeishly_grab_instance_mir` === //
 
 #[derive(Debug)]
 pub enum MirGrabResult<'tcx> {
@@ -100,20 +122,179 @@ pub fn get_unsized_ty<'tcx>(
     }
 }
 
-pub struct CachedSymbol {
-    raw: &'static str,
-    sym: OnceLock<Symbol>,
-}
+// === `rename_mir_locals` === //
 
-impl CachedSymbol {
-    pub const fn new(raw: &'static str) -> Self {
-        Self {
-            raw,
-            sym: OnceLock::new(),
+pub fn rename_mir_locals<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    mut renamer: impl FnMut(Local) -> Local,
+) {
+    for bb in body.basic_blocks.as_mut() {
+        for stmt in &mut bb.statements {
+            use rustc_middle::mir::StatementKind::*;
+
+            match &mut stmt.kind {
+                Assign(assign) => {
+                    use rustc_middle::mir::Rvalue::*;
+
+                    let (place, value) = &mut **assign;
+                    rename_mir_place(tcx, place, &mut renamer);
+
+                    match value {
+                        Use(operand) => {
+                            rename_mir_operand(tcx, operand, &mut renamer);
+                        }
+                        Repeat(operand, _ty_const) => {
+                            rename_mir_operand(tcx, operand, &mut renamer)
+                        }
+                        Ref(_region, _kind, place) => {
+                            rename_mir_place(tcx, place, &mut renamer);
+                        }
+                        ThreadLocalRef(_def_id) => {
+                            // (nothing to do here)
+                        }
+                        AddressOf(_mut, place) => {
+                            rename_mir_place(tcx, place, &mut renamer);
+                        }
+                        Len(place) => {
+                            rename_mir_place(tcx, place, &mut renamer);
+                        }
+                        Cast(_kind, operand, _ty) => {
+                            rename_mir_operand(tcx, operand, &mut renamer);
+                        }
+                        BinaryOp(_bin_op, sides) | CheckedBinaryOp(_bin_op, sides) => {
+                            let (lhs, rhs) = &mut **sides;
+                            rename_mir_operand(tcx, lhs, &mut renamer);
+                            rename_mir_operand(tcx, rhs, &mut renamer);
+                        }
+                        NullaryOp(_null_op, _ty) => {
+                            // (nothing to do here)
+                        }
+                        UnaryOp(_op, operand) => {
+                            rename_mir_operand(tcx, operand, &mut renamer);
+                        }
+                        Discriminant(place) => {
+                            rename_mir_place(tcx, place, &mut renamer);
+                        }
+                        Aggregate(_kind, fields) => {
+                            for field in fields {
+                                rename_mir_operand(tcx, field, &mut renamer);
+                            }
+                        }
+                        ShallowInitBox(operand, _ty) => {
+                            rename_mir_operand(tcx, operand, &mut renamer);
+                        }
+                        CopyForDeref(place) => {
+                            rename_mir_place(tcx, place, &mut renamer);
+                        }
+                    }
+                }
+                FakeRead(read) => {
+                    let (_cause, place) = &mut **read;
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                SetDiscriminant {
+                    place,
+                    variant_index: _,
+                } => {
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                Deinit(place) => {
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                StorageLive(local) => {
+                    *local = renamer(*local);
+                }
+                StorageDead(local) => {
+                    *local = renamer(*local);
+                }
+                Retag(_kind, place) => {
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                PlaceMention(place) => {
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                AscribeUserType(place_ish, _ty) => {
+                    let (place, _ty_proj) = &mut **place_ish;
+                    rename_mir_place(tcx, place, &mut renamer);
+                }
+                Coverage(_coverage) => {
+                    // (nothing to do here)
+                }
+                Intrinsic(intrinsic) => {
+                    use rustc_middle::mir::NonDivergingIntrinsic::*;
+
+                    match &mut **intrinsic {
+                        Assume(operand) => rename_mir_operand(tcx, operand, &mut renamer),
+                        CopyNonOverlapping(cno) => {
+                            let rustc_middle::mir::CopyNonOverlapping { src, dst, count } = cno;
+                            rename_mir_operand(tcx, src, &mut renamer);
+                            rename_mir_operand(tcx, dst, &mut renamer);
+                            rename_mir_operand(tcx, count, &mut renamer);
+                        }
+                    }
+                }
+                ConstEvalCounter => {
+                    // (nothing to do here)
+                }
+                Nop => {
+                    // (nothing to do here)
+                }
+            }
+        }
+
+        match &mut bb.terminator {
+            Some(_) => todo!(),
+            None => todo!(),
         }
     }
+}
 
-    pub fn get(&self) -> Symbol {
-        *self.sym.get_or_init(|| Symbol::intern(self.raw))
+fn rename_mir_place<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    place: &mut Place<'tcx>,
+    mut renamer: impl FnMut(Local) -> Local,
+) {
+    // Rename place origin
+    place.local = renamer(place.local);
+
+    // Rename place projections
+    let mut rename_proj = |mut part| {
+        if let ProjectionElem::Index(target) = &mut part {
+            *target = renamer(*target);
+        }
+
+        part
+    };
+    let did_rename_projections = place
+        .projection
+        .iter()
+        .any(|proj| proj != rename_proj(proj));
+
+    if did_rename_projections {
+        place.projection = tcx.mk_place_elems(
+            place
+                .projection
+                .iter()
+                .map(rename_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+    }
+}
+
+fn rename_mir_operand<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    operand: &mut Operand<'tcx>,
+    renamer: impl FnMut(Local) -> Local,
+) {
+    match operand {
+        Operand::Copy(place) => {
+            rename_mir_place(tcx, place, renamer);
+        }
+        Operand::Move(place) => {
+            rename_mir_place(tcx, place, renamer);
+        }
+        Operand::Constant(_const) => todo!(),
     }
 }
