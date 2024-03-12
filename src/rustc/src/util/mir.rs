@@ -6,14 +6,6 @@ use rustc_middle::{
 };
 use rustc_span::Symbol;
 
-pub fn s_pluralize(v: i32) -> &'static str {
-    if v == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 #[derive(Debug)]
 pub enum MirGrabResult<'tcx> {
     Found(&'tcx Body<'tcx>),
