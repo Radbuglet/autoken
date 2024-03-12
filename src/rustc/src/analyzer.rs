@@ -6,8 +6,8 @@ use rustc_hir::{
 
 use rustc_middle::{
     mir::{
-        BorrowKind, Local, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem,
-        Rvalue, SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
+        BorrowKind, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue,
+        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
     },
     ty::{EarlyBinder, Instance, InstanceDef, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
@@ -19,7 +19,7 @@ use crate::util::{
         feeders::{HirOwnerNode, MirBuiltFeeder},
     },
     hash::FxHashMap,
-    mir::{safeishly_grab_instance_mir, MirGrabResult},
+    mir::{push_mir_arguments, safeishly_grab_instance_mir, MirGrabResult},
 };
 
 // === Engine === //
@@ -170,14 +170,16 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Create the shadow function's MIR.
         let mut body = body.borrow().clone();
+        dbg!(&body);
+
         let source_info = SourceInfo {
             scope: SourceScope::from_u32(0),
             span: body.span,
         };
 
-        let token_local = Local::from_u32(1);
         let token_local_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
-        body.local_decls.as_mut_slice()[token_local].ty = token_local_ty;
+        let token_local =
+            push_mir_arguments(tcx, &mut body, &[LocalDecl::new(token_local_ty, DUMMY_SP)]);
 
         let token_local_rb = body.local_decls.push(LocalDecl::new(
             Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
@@ -233,6 +235,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 });
             }
         }
+
+        dbg!(&body);
 
         // Create the shadow function's DefId.
 
@@ -335,7 +339,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                 rustc_hir::ItemKind::Fn(sig, _, _) => {
                                     let mut decl = *sig.decl;
                                     let mut inputs = decl.inputs.to_vec();
-                                    inputs[0] = *token_local_hir_ty;
+                                    inputs.push(*token_local_hir_ty);
                                     decl.inputs = tcx.arena.alloc_from_iter(inputs);
                                     sig.decl = tcx.arena.alloc(decl);
                                 }

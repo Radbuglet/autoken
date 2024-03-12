@@ -7,7 +7,7 @@ fn main() {
     let _ = a;
 }
 
-fn whee(hehe: (), v: &mut u32) {
+fn whee(v: &mut u32) {
     let foo = __autoken_tie_mut(v);
     let bar = __autoken_tie_mut(v);
     // let _ = foo;
