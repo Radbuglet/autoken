@@ -3,12 +3,16 @@ use std::collections::{hash_map, HashMap};
 use rustc_data_structures::{steal::Steal, sync::RwLock};
 use rustc_hir::{
     def::DefKind,
-    def_id::{DefIndex, LocalDefId},
+    def_id::{DefId, DefIndex, LocalDefId},
 };
 
 use rustc_middle::{
-    mir::{Body, LocalDecl, Mutability},
-    ty::{Instance, Ty, TyCtxt},
+    mir::{
+        interpret::Scalar, BasicBlock, Body, BorrowKind, CastKind, Const, ConstOperand, ConstValue,
+        LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue, SourceInfo,
+        SourceScope, Statement, StatementKind,
+    },
+    ty::{Instance, List, ParamEnv, Ty, TyCtxt, ValTree},
 };
 use rustc_span::{Symbol, DUMMY_SP};
 
@@ -35,7 +39,7 @@ pub struct AnalysisDriver<'tcx> {
 
 #[derive(Debug)]
 struct FuncFacts<'tcx> {
-    borrows: FxHashMap<Ty<'tcx>, Mutability>,
+    borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<u32>)>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -57,13 +61,14 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             // HACK: `mir_built` can call `layout_of`, which can call `eval_to_const_value_raw` and
             //  now all bets are off about getting the MIR. We're just praying this MIR isn't actually
-            //  load-bearing but there's no proof that that's actually the case.
+            //  load-bearing but there's no proof that this is actually the case.
             let body = unsafe {
                 // Safety: there is none.
                 std::mem::transmute::<&'tcx Steal<Body<'tcx>>, &RwLock<Option<Body<'tcx>>>>(body)
             };
 
             if let Some(borrow) = &*body.read() {
+                // dbg!(local_def, borrow);
                 self.local_mirs.insert(local_def, borrow.clone());
             }
         }
@@ -111,19 +116,138 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             {
                 // Create a local for every token.
-                let token_ref_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+                let token_ref_not_ty =
+                    Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+
+                let token_ref_mut_ty =
+                    Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+
+                let dangling_addr_local_ty = Ty::new_mut_ptr(tcx, tcx.types.unit);
+                let dangling_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(dangling_addr_local_ty, DUMMY_SP));
 
                 let token_locals = facts
                     .borrows
-                    .keys()
-                    .map(|key| {
+                    .iter()
+                    .map(|(key, (mutability, _))| {
                         (
                             *key,
-                            body.local_decls
-                                .push(LocalDecl::new(token_ref_ty, DUMMY_SP)),
+                            body.local_decls.push(LocalDecl::new(
+                                match mutability {
+                                    Mutability::Not => token_ref_not_ty,
+                                    Mutability::Mut => token_ref_mut_ty,
+                                },
+                                DUMMY_SP,
+                            )),
                         )
                     })
                     .collect::<FxHashMap<_, _>>();
+
+                // Initialize the tokens and ascribe them their types.
+                let source_info = SourceInfo {
+                    span: DUMMY_SP,
+                    // FIXME: This probably isn't a good idea.
+                    scope: SourceScope::from_u32(0),
+                };
+                let mut start_stmts = Vec::new();
+                start_stmts.extend([Statement {
+                    source_info,
+                    kind: StatementKind::Assign(Box::new((
+                        Place {
+                            local: dangling_addr_local,
+                            projection: List::empty(),
+                        },
+                        Rvalue::Cast(
+                            CastKind::PointerFromExposedAddress,
+                            Operand::Constant(Box::new(ConstOperand {
+                                span: DUMMY_SP,
+                                user_ty: None,
+                                const_: Const::Val(
+                                    ConstValue::Scalar(Scalar::from_target_usize(
+                                        1,
+                                        &tcx.data_layout,
+                                    )),
+                                    tcx.types.usize,
+                                ),
+                            })),
+                            dangling_addr_local_ty,
+                        ),
+                    ))),
+                }]);
+
+                for (key, &local) in &token_locals {
+                    let (mutability, lt_id) = &facts.borrows[key];
+                    let borrow_kind = match mutability {
+                        Mutability::Not => BorrowKind::Shared,
+                        Mutability::Mut => BorrowKind::Mut {
+                            kind: MutBorrowKind::Default,
+                        },
+                    };
+
+                    if let Some(lt_id) = lt_id {
+                        // TODO: Ascribe region
+                        start_stmts.push(Statement {
+                            source_info,
+                            kind: StatementKind::Assign(Box::new((
+                                Place {
+                                    local,
+                                    projection: List::empty(),
+                                },
+                                Rvalue::Ref(
+                                    tcx.lifetimes.re_erased,
+                                    borrow_kind,
+                                    Place {
+                                        local: dangling_addr_local,
+                                        projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
+                                    },
+                                ),
+                            ))),
+                        });
+                    } else {
+                        let unit_holder = body
+                            .local_decls
+                            .push(LocalDecl::new(tcx.types.unit, DUMMY_SP));
+
+                        start_stmts.extend([
+                            Statement {
+                                source_info,
+                                kind: StatementKind::Assign(Box::new((
+                                    Place {
+                                        local: unit_holder,
+                                        projection: List::empty(),
+                                    },
+                                    Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
+                                        span: DUMMY_SP,
+                                        user_ty: None,
+                                        const_: Const::Val(ConstValue::ZeroSized, tcx.types.unit),
+                                    }))),
+                                ))),
+                            },
+                            Statement {
+                                source_info,
+                                kind: StatementKind::Assign(Box::new((
+                                    Place {
+                                        local,
+                                        projection: List::empty(),
+                                    },
+                                    Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        borrow_kind,
+                                        Place {
+                                            local: unit_holder,
+                                            projection: List::empty(),
+                                        },
+                                    ),
+                                ))),
+                            },
+                        ]);
+                    }
+                }
+
+                body.basic_blocks.as_mut()[BasicBlock::from_u32(0)]
+                    .statements
+                    .splice(0..0, start_stmts);
 
                 // For every function call...
                 for bb in body.basic_blocks.as_mut() {
@@ -191,15 +315,14 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         // If this function has a hardcoded fact set, use those.
-        let hardcoded_mut = match tcx.opt_item_name(instance.def_id()) {
-            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
-            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
-            _ => None,
-        };
+        let hardcoded_mut = Self::is_special_func(tcx, instance.def_id());
 
         if let Some(hardcoded_mut) = hardcoded_mut {
             entry.insert(Some(FuncFacts {
-                borrows: HashMap::from_iter([(instance.args[0].as_type().unwrap(), hardcoded_mut)]),
+                borrows: HashMap::from_iter([(
+                    instance.args[1].as_type().unwrap(),
+                    (hardcoded_mut, None),
+                )]),
             }));
             return;
         }
@@ -234,16 +357,43 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            for (borrow_key, borrow_mut) in &target_facts.borrows {
-                let curr_mut = borrows.entry(*borrow_key).or_insert(*borrow_mut);
+            let lt_idx =
+                Self::is_special_func(tcx, target_instance.def_id()).map(|_| match target_instance
+                    .args[0]
+                    .as_const()
+                    .unwrap()
+                    .eval(tcx, ParamEnv::reveal_all(), None)
+                    .unwrap()
+                {
+                    ValTree::Leaf(scalar) => scalar.try_to_u32().unwrap(),
+                    _ => unreachable!(),
+                });
+
+            for (borrow_key, (borrow_mut, _)) in &target_facts.borrows {
+                let (curr_mut, curr_idx) = borrows
+                    .entry(*borrow_key)
+                    .or_insert((Mutability::Not, None));
+
                 if borrow_mut.is_mut() {
                     *curr_mut = Mutability::Mut;
+                }
+
+                if let Some(lt_idx) = lt_idx.filter(|idx| *idx != u32::MAX) {
+                    *curr_idx = Some(lt_idx);
                 }
             }
         }
 
         self.func_facts
             .insert(instance, Some(FuncFacts { borrows }));
+    }
+
+    fn is_special_func(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Mutability> {
+        match tcx.opt_item_name(def_id) {
+            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
+            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
+            _ => None,
+        }
     }
 }
 
