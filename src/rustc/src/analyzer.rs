@@ -4,15 +4,20 @@ use rustc_data_structures::{steal::Steal, sync::RwLock};
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
+    HirId, ItemLocalId, OwnerId,
 };
 
 use rustc_middle::{
     mir::{
         interpret::Scalar, BasicBlock, Body, BorrowKind, CastKind, Const, ConstOperand, ConstValue,
         LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue, SourceInfo,
-        SourceScope, Statement, StatementKind,
+        SourceScope, Statement, StatementKind, UserTypeProjection,
     },
-    ty::{Instance, List, ParamEnv, Ty, TyCtxt, ValTree},
+    ty::{
+        BoundRegionKind, BoundVariableKind, CanonicalUserType, CanonicalUserTypeAnnotation,
+        Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree,
+        Variance,
+    },
 };
 use rustc_span::{Symbol, DUMMY_SP};
 
@@ -68,7 +73,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             };
 
             if let Some(borrow) = &*body.read() {
-                // dbg!(local_def, borrow);
+                dbg!(local_def, borrow);
                 self.local_mirs.insert(local_def, borrow.clone());
             }
         }
@@ -186,24 +191,78 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     };
 
                     if let Some(lt_id) = lt_id {
-                        // TODO: Ascribe region
-                        start_stmts.push(Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    tcx.lifetimes.re_erased,
-                                    borrow_kind,
-                                    Place {
-                                        local: dangling_addr_local,
-                                        projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                                    },
-                                ),
-                            ))),
+                        let late_vars = tcx.late_bound_vars(HirId {
+                            owner: OwnerId { def_id: orig_id },
+                            local_id: ItemLocalId::from_u32(0),
                         });
+                        let BoundVariableKind::Region(BoundRegionKind::BrNamed(did, name)) =
+                            late_vars[*lt_id as usize]
+                        else {
+                            unreachable!();
+                        };
+
+                        let annotation =
+                            body.user_type_annotations
+                                .push(CanonicalUserTypeAnnotation {
+                                    user_ty: Box::new(CanonicalUserType {
+                                        value: UserType::Ty(Ty::new_ref(
+                                            tcx,
+                                            Region::new_late_param(
+                                                tcx,
+                                                orig_id.to_def_id(),
+                                                BoundRegionKind::BrNamed(did, name),
+                                            ),
+                                            TypeAndMut {
+                                                mutbl: *mutability,
+                                                ty: tcx.types.unit,
+                                            },
+                                        )),
+                                        max_universe: UniverseIndex::ROOT,
+                                        variables: List::empty(),
+                                    }),
+                                    span: DUMMY_SP,
+                                    inferred_ty: match mutability {
+                                        Mutability::Not => token_ref_not_ty,
+                                        Mutability::Mut => token_ref_mut_ty,
+                                    },
+                                });
+
+                        start_stmts.extend([
+                            Statement {
+                                source_info,
+                                kind: StatementKind::Assign(Box::new((
+                                    Place {
+                                        local,
+                                        projection: List::empty(),
+                                    },
+                                    Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        borrow_kind,
+                                        Place {
+                                            local: dangling_addr_local,
+                                            projection: tcx
+                                                .mk_place_elems(&[ProjectionElem::Deref]),
+                                        },
+                                    ),
+                                ))),
+                            },
+                            Statement {
+                                source_info,
+                                kind: StatementKind::AscribeUserType(
+                                    Box::new((
+                                        Place {
+                                            local,
+                                            projection: List::empty(),
+                                        },
+                                        UserTypeProjection {
+                                            base: annotation,
+                                            projs: Vec::new(),
+                                        },
+                                    )),
+                                    Variance::Invariant,
+                                ),
+                            },
+                        ]);
                     } else {
                         let unit_holder = body
                             .local_decls
@@ -304,6 +363,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Finally, borrow check everything in a single go to avoid issues with stolen values.
         for shadow in shadows {
+            dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
             let _ = tcx.mir_borrowck(shadow.def_id());
         }
     }
