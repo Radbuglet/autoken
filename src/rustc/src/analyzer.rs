@@ -1,25 +1,23 @@
 use std::collections::{hash_map, HashMap};
 
 use rustc_hir::{
-    def::DefKind, HirId, ItemLocalId, Lifetime, MutTy, Node, OwnerId, OwnerNodes, ParentedNode,
+    def::DefKind,
+    def_id::{DefIndex, LocalDefId},
 };
 
 use rustc_middle::{
-    mir::{
-        BorrowKind, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue,
-        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
-    },
-    ty::{EarlyBinder, Instance, InstanceDef, List, ParamEnv, Ty, TyCtxt, TyKind},
+    mir::{Mutability, Terminator, TerminatorKind},
+    ty::{EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{source_map::dummy_spanned, symbol::Ident, Symbol, DUMMY_SP};
+use rustc_span::Symbol;
 
-use crate::util::{
-    feeder::{
-        feed,
-        feeders::{HirOwnerNode, MirBuiltFeeder},
+use crate::{
+    analyzer::sym::unnamed,
+    util::{
+        feeder::{feed, feeders::MirBuiltFeeder},
+        hash::FxHashMap,
+        mir::{safeishly_grab_instance_mir, MirGrabResult},
     },
-    hash::FxHashMap,
-    mir::{push_mir_arguments, safeishly_grab_instance_mir, MirGrabResult},
 };
 
 // === Engine === //
@@ -27,6 +25,7 @@ use crate::util::{
 #[derive(Debug, Default)]
 pub struct AnalysisDriver<'tcx> {
     func_facts: FxHashMap<Instance<'tcx>, Option<FuncFacts<'tcx>>>,
+    id_gen: u64,
 }
 
 #[derive(Debug)]
@@ -37,7 +36,15 @@ struct FuncFacts<'tcx> {
 impl<'tcx> AnalysisDriver<'tcx> {
     pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
         // Get the token use sets of each function.
-        for local_def in tcx.iter_local_def_id() {
+        assert!(!tcx.untracked().definitions.is_frozen());
+
+        // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
+        let id_count = tcx.untracked().definitions.read().def_index_count();
+        for i in 0..id_count {
+            let local_def = LocalDefId {
+                local_def_index: DefIndex::from_usize(i),
+            };
+
             if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
                 continue;
             }
@@ -52,22 +59,44 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Check for undeclared unsizing.
         // TODO
 
-        // Generate shadow functions for each visited function.
-        // TODO
+        // Generate shadow functions for each locally-visited function.
+        assert!(!tcx.untracked().definitions.is_frozen());
 
-        // Borrow-check these shadow functions.
-        // TODO
+        for (instance, facts) in &mut self.func_facts {
+            let facts = facts.as_mut().unwrap();
+            let Some(def_id) = instance.def_id().as_local() else {
+                continue;
+            };
 
-        dbg!(self);
+            // Modify body
+            let mut body = tcx.mir_built(def_id).borrow().clone();
+            // TODO
+
+            // Feed the query system the shadow function's properties.
+            let body_def = tcx.at(body.span).create_def(
+                tcx.local_parent(def_id),
+                Symbol::intern(&format!(
+                    "{}_autoken_shadow_{}",
+                    tcx.opt_item_name(def_id.to_def_id())
+                        .unwrap_or_else(|| unnamed.get()),
+                    self.id_gen,
+                )),
+                DefKind::Fn,
+            );
+            self.id_gen += 1;
+            body_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(def_id)));
+            feed::<MirBuiltFeeder>(tcx, body_def.def_id(), tcx.alloc_steal_mir(body));
+
+            // ...and borrow-check it!
+            let _ = tcx.mir_borrowck(body_def.def_id());
+        }
     }
 
     fn analyze_fn_facts(&mut self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
         // Ensure that we don't analyze the same function circularly or redundantly.
-        if let hash_map::Entry::Vacant(entry) = self.func_facts.entry(instance) {
-            entry.insert(None);
-        } else {
+        let hash_map::Entry::Vacant(entry) = self.func_facts.entry(instance) else {
             return;
-        }
+        };
 
         // If this function has a hardcoded fact set, use those.
         let hardcoded_mut = match tcx.opt_item_name(instance.def_id()) {
@@ -77,22 +106,25 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         if let Some(hardcoded_mut) = hardcoded_mut {
-            self.func_facts.insert(
-                instance,
-                Some(FuncFacts {
-                    borrows: HashMap::from_iter([(
-                        instance.args[0].as_type().unwrap(),
-                        hardcoded_mut,
-                    )]),
-                }),
-            );
+            entry.insert(Some(FuncFacts {
+                borrows: HashMap::from_iter([(instance.args[0].as_type().unwrap(), hardcoded_mut)]),
+            }));
             return;
         }
 
         // Acquire the function body.
-        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-            return;
+        let body_steal;
+        let body = match safeishly_grab_instance_mir(tcx, instance.def) {
+            MirGrabResult::FoundSteal(body) => {
+                body_steal = body.borrow();
+                &*body_steal
+            }
+            MirGrabResult::FoundRef(body) => body,
+            _ => return,
         };
+
+        // This is a real function so let's add it to the fact map.
+        entry.insert(None);
 
         // See who the function may call and where.
         let mut borrows = FxHashMap::default();
@@ -126,7 +158,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             self.analyze_fn_facts(tcx, target_instance);
 
             // ...and add its borrows to the borrows set.
-            let Some(target_facts) = &self.func_facts[&target_instance] else {
+            let Some(Some(target_facts)) = &self.func_facts.get(&target_instance) else {
                 continue;
             };
 
@@ -141,244 +173,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
         self.func_facts
             .insert(instance, Some(FuncFacts { borrows }));
     }
-
-    pub fn analyze_old(&mut self, tcx: TyCtxt<'tcx>) {
-        // Find the main function
-        let main_fn = {
-            let mut fn_id = None;
-            for &item in tcx.hir().root_module().item_ids {
-                if tcx.hir().name(item.hir_id()) == Symbol::intern("whee") {
-                    fn_id = Some(item.owner_id.def_id);
-                }
-            }
-            fn_id.expect("missing `whee` in crate root")
-        };
-
-        // Find helper functions
-        let tie_mut_shadow_fn = {
-            let mut fn_id = None;
-            for &item in tcx.hir().root_module().item_ids {
-                if tcx.hir().name(item.hir_id()) == sym::__autoken_tie_mut_shadow.get() {
-                    fn_id = Some(item.owner_id.def_id);
-                }
-            }
-            fn_id.expect("missing `__autoken_tie_mut_shadow` in crate root")
-        };
-
-        // Get the MIR for the function.
-        let body = tcx.mir_built(main_fn);
-
-        // Create the shadow function's MIR.
-        let mut body = body.borrow().clone();
-        dbg!(&body);
-
-        let source_info = SourceInfo {
-            scope: SourceScope::from_u32(0),
-            span: body.span,
-        };
-
-        let token_local_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
-        let token_local =
-            push_mir_arguments(tcx, &mut body, &[LocalDecl::new(token_local_ty, DUMMY_SP)]);
-
-        let token_local_rb = body.local_decls.push(LocalDecl::new(
-            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit),
-            source_info.span,
-        ));
-
-        for bb in body.basic_blocks.as_mut().iter_mut() {
-            let Some(Terminator {
-                kind: TerminatorKind::Call { func, args, .. },
-                ..
-            }) = &mut bb.terminator
-            else {
-                continue;
-            };
-
-            let func_ty = func.ty(&body.local_decls, tcx);
-            let TyKind::FnDef(callee_id, generics) = func_ty.kind() else {
-                continue;
-            };
-            let callee_id = *callee_id;
-
-            if tcx.item_name(callee_id) == sym::__autoken_tie_mut.get() {
-                *func = Operand::function_handle(
-                    tcx,
-                    tie_mut_shadow_fn.to_def_id(),
-                    *generics,
-                    func.span(&body.local_decls),
-                );
-
-                args.push(dummy_spanned(Operand::Move(Place {
-                    local: token_local_rb,
-                    projection: List::empty(),
-                })));
-
-                bb.statements.push(Statement {
-                    source_info,
-                    kind: StatementKind::Assign(Box::new((
-                        Place {
-                            local: token_local_rb,
-                            projection: List::empty(),
-                        },
-                        Rvalue::Ref(
-                            tcx.lifetimes.re_erased,
-                            BorrowKind::Mut {
-                                kind: MutBorrowKind::Default,
-                            },
-                            Place {
-                                local: token_local,
-                                projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                            },
-                        ),
-                    ))),
-                });
-            }
-        }
-
-        dbg!(&body);
-
-        // Create the shadow function's DefId.
-
-        //> Reserve its DefId.
-        let main_fn_shadow_name = Symbol::intern(&format!(
-            "{}_autoken_shadow",
-            tcx.item_name(main_fn.to_def_id()),
-        ));
-        let main_fn_shadow = tcx.at(body.span).create_def(
-            tcx.local_parent(main_fn),
-            main_fn_shadow_name,
-            DefKind::Fn,
-        );
-
-        //> Update the MIR's references.
-        body.source.instance = InstanceDef::Item(main_fn_shadow.def_id().to_def_id());
-
-        //> Create its HIR
-        let main_fn_hir_id = tcx.local_def_id_to_hir_id(main_fn);
-        let main_fn_owner_nodes = tcx.hir_owner_nodes(main_fn_hir_id.owner);
-
-        let main_fn_shadow_owner_nodes = {
-            Box::leak(Box::new(OwnerNodes {
-                opt_hash_including_bodies: None,
-                nodes: {
-                    let own_owner = OwnerId {
-                        def_id: main_fn_shadow.def_id(),
-                    };
-
-                    let mut nodes = main_fn_owner_nodes.nodes.clone();
-
-                    // Create a new node to hold the parameter type.
-
-                    //> Unit
-                    let unit_ty = HirId {
-                        owner: own_owner,
-                        local_id: ItemLocalId::from_usize(nodes.len()),
-                    };
-                    let unit_ty_data = tcx.arena.alloc(rustc_hir::Ty {
-                        hir_id: unit_ty,
-                        kind: rustc_hir::TyKind::Tup(&[]),
-                        span: DUMMY_SP,
-                    });
-                    nodes.push(ParentedNode {
-                        parent: ItemLocalId::from_u32(0),
-                        node: Node::Ty(unit_ty_data),
-                    });
-
-                    //> Lifetime
-                    let token_local_lt = HirId {
-                        owner: own_owner,
-                        local_id: ItemLocalId::from_usize(nodes.len()),
-                    };
-                    let token_local_lt_data = tcx.arena.alloc(Lifetime {
-                        hir_id: token_local_lt,
-                        ident: Ident::new(Symbol::intern("hehe_i_hah_the"), DUMMY_SP),
-                        res: rustc_hir::LifetimeName::Static,
-                    });
-                    nodes.push(ParentedNode {
-                        parent: ItemLocalId::from_u32(0),
-                        node: Node::Lifetime(token_local_lt_data),
-                    });
-
-                    //> Full type
-                    let token_local_hir_ty = HirId {
-                        owner: own_owner,
-                        local_id: ItemLocalId::from_usize(nodes.len()),
-                    };
-                    let token_local_hir_ty = tcx.arena.alloc(rustc_hir::Ty {
-                        hir_id: token_local_hir_ty,
-                        // TODO: Rewrite it as a reference
-                        kind: rustc_hir::TyKind::Ref(
-                            token_local_lt_data,
-                            MutTy {
-                                mutbl: Mutability::Mut,
-                                ty: unit_ty_data,
-                            },
-                        ),
-                        span: DUMMY_SP,
-                    });
-                    nodes.push(ParentedNode {
-                        parent: ItemLocalId::from_u32(0),
-                        node: Node::Ty(token_local_hir_ty),
-                    });
-
-                    // Adjust the entry-point's OwnerId and function signature just enough for the
-                    // borrow-checker to pass. This is *super* unsound but this is a prototype so
-                    // it's fine.
-                    let fn_node = &mut nodes[ItemLocalId::from_u32(0)].node;
-
-                    match fn_node {
-                        Node::Item(p_item) => {
-                            let mut item = **p_item;
-
-                            // Edit 1: owner_id
-                            item.owner_id = own_owner;
-
-                            // Edit 2: signature
-                            match &mut item.kind {
-                                rustc_hir::ItemKind::Fn(sig, _, _) => {
-                                    let mut decl = *sig.decl;
-                                    let mut inputs = decl.inputs.to_vec();
-                                    inputs.push(*token_local_hir_ty);
-                                    decl.inputs = tcx.arena.alloc_from_iter(inputs);
-                                    sig.decl = tcx.arena.alloc(decl);
-                                }
-                                _ => unreachable!(),
-                            }
-
-                            *p_item = tcx.arena.alloc(item);
-                        }
-                        // Node::ImplItem(item) => match &mut item.kind {
-                        //     rustc_hir::ImplItemKind::Fn(_, _) => todo!(),
-                        //     _ => unreachable!(),
-                        // },
-                        _ => unreachable!(),
-                    }
-
-                    nodes
-                },
-                bodies: main_fn_owner_nodes.bodies.clone(),
-            }))
-        };
-
-        //> Feed the query system the shadow function's properties.
-        main_fn_shadow.opt_local_def_id_to_hir_id(Some(HirId {
-            local_id: main_fn_hir_id.local_id,
-            owner: OwnerId {
-                def_id: main_fn_shadow.def_id(),
-            },
-        }));
-
-        feed::<MirBuiltFeeder>(tcx, main_fn_shadow.def_id(), tcx.alloc_steal_mir(body));
-        feed::<HirOwnerNode>(tcx, main_fn_shadow.def_id(), main_fn_shadow_owner_nodes);
-
-        let main_fn_shadow = main_fn_shadow.def_id();
-
-        // Borrow check the shadow function);
-        println!("=== Go! ===");
-        dbg!(&tcx.mir_borrowck(main_fn_shadow));
-        println!("=== End! ===");
-    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -391,14 +185,5 @@ mod sym {
     pub static __autoken_declare_tied_mut: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_mut");
 
-    // Legacy:
-    pub static __autoken_tie_ref: CachedSymbol = CachedSymbol::new("__autoken_tie_ref");
-
-    pub static __autoken_tie_mut: CachedSymbol = CachedSymbol::new("__autoken_tie_mut");
-
-    pub static __autoken_tie_ref_shadow: CachedSymbol =
-        CachedSymbol::new("__autoken_tie_ref_shadow");
-
-    pub static __autoken_tie_mut_shadow: CachedSymbol =
-        CachedSymbol::new("__autoken_tie_mut_shadow");
+    pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }
