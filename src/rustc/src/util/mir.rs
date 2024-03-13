@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
+use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::Body,
     ty::{InstanceDef, Ty, TyCtxt, TyKind, TypeAndMut},
@@ -49,6 +50,13 @@ pub fn safeishly_grab_instance_mir<'tcx>(
                 if let Some(item) = item.as_local() {
                     // We use `mir_built` on local items because `optimized_mir` would otherwise
                     // lock the definition table if the query resolved properly.
+
+                    // Unfortunately, there are some exceptions as to which functions can have their
+                    // MIR built. We filter those out here.
+                    if matches!(tcx.def_kind(item), DefKind::Ctor(_, _)) {
+                        return MirGrabResult::BottomsOut;
+                    }
+
                     MirGrabResult::FoundSteal(tcx.mir_built(item))
                 } else {
                     // We use `optimized_mir` on external items rather than `mir_built` because

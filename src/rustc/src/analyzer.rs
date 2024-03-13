@@ -62,33 +62,49 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Generate shadow functions for each locally-visited function.
         assert!(!tcx.untracked().definitions.is_frozen());
 
+        let mut shadows = Vec::new();
+
         for (instance, facts) in &mut self.func_facts {
             let facts = facts.as_mut().unwrap();
-            let Some(def_id) = instance.def_id().as_local() else {
+            let Some(orig_id) = instance.def_id().as_local() else {
                 continue;
             };
 
             // Modify body
-            let mut body = tcx.mir_built(def_id).borrow().clone();
+            let body = tcx.mir_built(orig_id);
+            dbg!(orig_id);
+            let mut body = body.borrow().clone();
             // TODO
 
             // Feed the query system the shadow function's properties.
-            let body_def = tcx.at(body.span).create_def(
-                tcx.local_parent(def_id),
+            let shadow_kind = tcx.def_kind(orig_id);
+            let shadow_def = tcx.at(body.span).create_def(
+                tcx.local_parent(orig_id),
                 Symbol::intern(&format!(
                     "{}_autoken_shadow_{}",
-                    tcx.opt_item_name(def_id.to_def_id())
+                    tcx.opt_item_name(orig_id.to_def_id())
                         .unwrap_or_else(|| unnamed.get()),
                     self.id_gen,
                 )),
-                DefKind::Fn,
+                shadow_kind,
             );
             self.id_gen += 1;
-            body_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(def_id)));
-            feed::<MirBuiltFeeder>(tcx, body_def.def_id(), tcx.alloc_steal_mir(body));
 
-            // ...and borrow-check it!
-            let _ = tcx.mir_borrowck(body_def.def_id());
+            feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
+            shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_id)));
+            shadow_def.visibility(tcx.visibility(orig_id));
+
+            if shadow_kind == DefKind::AssocFn {
+                shadow_def.associated_item(tcx.associated_item(orig_id));
+            }
+
+            // ...and queue it up for borrow checking!
+            shadows.push(shadow_def);
+        }
+
+        // Finally, borrow check everything in a single go to avoid issues with stolen values.
+        for shadow in shadows {
+            let _ = tcx.mir_borrowck(shadow.def_id());
         }
     }
 
