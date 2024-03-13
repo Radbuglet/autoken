@@ -1,12 +1,13 @@
 use std::collections::{hash_map, HashMap};
 
+use rustc_data_structures::{steal::Steal, sync::RwLock};
 use rustc_hir::{
     def::DefKind,
     def_id::{DefIndex, LocalDefId},
 };
 
 use rustc_middle::{
-    mir::{Mutability, Terminator, TerminatorKind},
+    mir::{Body, Mutability, Terminator, TerminatorKind},
     ty::{EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
@@ -16,7 +17,7 @@ use crate::{
     util::{
         feeder::{feed, feeders::MirBuiltFeeder},
         hash::FxHashMap,
-        mir::{safeishly_grab_instance_mir, MirGrabResult},
+        mir::{safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult},
     },
 };
 
@@ -25,6 +26,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct AnalysisDriver<'tcx> {
     func_facts: FxHashMap<Instance<'tcx>, Option<FuncFacts<'tcx>>>,
+    local_mirs: FxHashMap<LocalDefId, Body<'tcx>>,
     id_gen: u64,
 }
 
@@ -35,20 +37,48 @@ struct FuncFacts<'tcx> {
 
 impl<'tcx> AnalysisDriver<'tcx> {
     pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
-        // Get the token use sets of each function.
-        assert!(!tcx.untracked().definitions.is_frozen());
-
-        // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
         let id_count = tcx.untracked().definitions.read().def_index_count();
+
+        // Fetch the MIR for each local definition in case it gets stolen by `safeishly_grab_instance_mir`
+        // and `Instance::instantiate_mir_and_normalize_erasing_regions`.
+        //
+        // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
         for i in 0..id_count {
             let local_def = LocalDefId {
                 local_def_index: DefIndex::from_usize(i),
             };
 
+            let Some(body) = safeishly_grab_def_id_mir(tcx, local_def) else {
+                continue;
+            };
+
+            // HACK: `mir_built` can call `layout_of`, which can call `eval_to_const_value_raw` and
+            //  now all bets are off about getting the MIR. We're just praying this MIR isn't actually
+            //  load-bearing but there's no proof that that's actually the case.
+            let body = unsafe {
+                // Safety: there is none.
+                std::mem::transmute::<&'tcx Steal<Body<'tcx>>, &RwLock<Option<Body<'tcx>>>>(body)
+            };
+
+            if let Some(borrow) = &*body.read() {
+                self.local_mirs.insert(local_def, borrow.clone());
+            }
+        }
+
+        // Get the token use sets of each function.
+        assert!(!tcx.untracked().definitions.is_frozen());
+
+        for i in 0..id_count {
+            let local_def = LocalDefId {
+                local_def_index: DefIndex::from_usize(i),
+            };
+
+            // Ensure that we're analyzing a function...
             if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
                 continue;
             }
 
+            // ...which can be properly monomorphized.
             if tcx.generics_of(local_def).count() > 0 {
                 continue;
             }
@@ -71,10 +101,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
             };
 
             // Modify body
-            let body = tcx.mir_built(orig_id);
-            dbg!(orig_id);
-            let mut body = body.borrow().clone();
-            // TODO
+            let Some(mut body) = self.local_mirs.get(&orig_id).cloned() else {
+                // HACK: See above comment.
+                continue;
+            };
 
             // Feed the query system the shadow function's properties.
             let shadow_kind = tcx.def_kind(orig_id);
@@ -129,14 +159,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
 
         // Acquire the function body.
-        let body_steal;
-        let body = match safeishly_grab_instance_mir(tcx, instance.def) {
-            MirGrabResult::FoundSteal(body) => {
-                body_steal = body.borrow();
-                &*body_steal
-            }
-            MirGrabResult::FoundRef(body) => body,
-            _ => return,
+        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
+            return;
         };
 
         // This is a real function so let's add it to the fact map.

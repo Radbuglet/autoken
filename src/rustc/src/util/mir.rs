@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
-use rustc_hir::def::DefKind;
+use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
 use rustc_middle::{
     mir::Body,
     ty::{InstanceDef, Ty, TyCtxt, TyKind, TypeAndMut},
@@ -28,12 +28,52 @@ impl CachedSymbol {
     }
 }
 
+// === `safeishly_grab_def_id_mir` === //
+
+pub fn safeishly_grab_def_id_mir(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
+    // Copied from `rustc_hir_typecheck::primary_body_of`
+    match tcx.hir_node_by_def_id(id) {
+        Node::Item(item) => match item.kind {
+            ItemKind::Const(_, _, _) | ItemKind::Static(_, _, _) => {
+                // (fallthrough)
+            }
+            ItemKind::Fn(_, _, _) => {
+                // (fallthrough)
+            }
+            _ => return None,
+        },
+        Node::TraitItem(item) => match item.kind {
+            TraitItemKind::Const(_, Some(_)) => {
+                // (fallthrough)
+            }
+            TraitItemKind::Fn(_, TraitFn::Provided(_)) => {
+                // (fallthrough)
+            }
+            _ => return None,
+        },
+        Node::ImplItem(item) => match item.kind {
+            ImplItemKind::Const(_, _) => {
+                // (fallthrough)
+            }
+            ImplItemKind::Fn(_, _) => {
+                // (fallthrough)
+            }
+            _ => return None,
+        },
+        Node::AnonConst(_) => {
+            // (fallthrough)
+        }
+        _ => return None,
+    }
+
+    Some(tcx.mir_built(id))
+}
+
 // === `safeishly_grab_instance_mir` === //
 
 #[derive(Debug)]
 pub enum MirGrabResult<'tcx> {
-    FoundSteal(&'tcx Steal<Body<'tcx>>),
-    FoundRef(&'tcx Body<'tcx>),
+    Found(&'tcx Body<'tcx>),
     Dynamic,
     BottomsOut,
 }
@@ -47,25 +87,7 @@ pub fn safeishly_grab_instance_mir<'tcx>(
         InstanceDef::Item(item) => {
             // However, foreign items and lang-items don't have MIR
             if !tcx.is_foreign_item(item) {
-                if let Some(item) = item.as_local() {
-                    // We use `mir_built` on local items because `optimized_mir` would otherwise
-                    // lock the definition table if the query resolved properly.
-
-                    // Unfortunately, there are some exceptions as to which functions can have their
-                    // MIR built. We filter those out here.
-                    if matches!(tcx.def_kind(item), DefKind::Ctor(_, _)) {
-                        return MirGrabResult::BottomsOut;
-                    }
-
-                    MirGrabResult::FoundSteal(tcx.mir_built(item))
-                } else {
-                    // We use `optimized_mir` on external items rather than `mir_built` because
-                    // `mir_built` only works on local items whereas `optimized_mir` can fetch the
-                    // value from an external crate rlib. Additionally, because this is a disk-access,
-                    // the call doesn't actually run the logic to freeze the definition table so we're
-                    // fine!
-                    MirGrabResult::FoundRef(tcx.optimized_mir(item))
-                }
+                MirGrabResult::Found(tcx.instance_mir(instance))
             } else {
                 MirGrabResult::BottomsOut
             }
@@ -73,7 +95,7 @@ pub fn safeishly_grab_instance_mir<'tcx>(
 
         // This is a shim around `FnDef` (or maybe an `FnPtr`?) for `FnTrait::call_x`. We generate
         // the shim MIR for it and let the regular instance body processing handle it.
-        InstanceDef::FnPtrShim(_, _) => MirGrabResult::FoundRef(tcx.mir_shims(instance)),
+        InstanceDef::FnPtrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
 
         // All the remaining things here require shims. We referenced...
         //
@@ -86,7 +108,7 @@ pub fn safeishly_grab_instance_mir<'tcx>(
         | InstanceDef::DropGlue(_, _)
         | InstanceDef::ClosureOnceShim { .. }
         | InstanceDef::CloneShim(_, _)
-        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::FoundRef(tcx.mir_shims(instance)),
+        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
 
         // These are never supported and will never return to the user.
         InstanceDef::Intrinsic(_) => MirGrabResult::BottomsOut,
