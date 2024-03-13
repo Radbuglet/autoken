@@ -2,9 +2,10 @@ use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
 use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
+use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::Body,
-    ty::{InstanceDef, Ty, TyCtxt, TyKind, TypeAndMut},
+    mir::{Body, Local, LocalDecl, Terminator, TerminatorKind},
+    ty::{EarlyBinder, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Symbol;
 
@@ -26,6 +27,37 @@ impl CachedSymbol {
     pub fn get(&self) -> Symbol {
         *self.sym.get_or_init(|| Symbol::intern(self.raw))
     }
+}
+
+// === get_callee_from_terminator === //
+
+pub fn get_static_callee_from_terminator<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: &Instance<'tcx>,
+    caller_local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
+    terminator: &Terminator<'tcx>,
+) -> Option<Instance<'tcx>> {
+    let TerminatorKind::Call { func: callee, .. } = &terminator.kind else {
+        return None;
+    };
+
+    let callee = callee.ty(caller_local_decls, tcx);
+    let callee = caller.instantiate_mir_and_normalize_erasing_regions(
+        tcx,
+        ParamEnv::reveal_all(),
+        EarlyBinder::bind(callee),
+    );
+
+    let TyKind::FnDef(callee_id, generics) = callee.kind() else {
+        return None;
+    };
+
+    Some(Instance::expect_resolve(
+        tcx,
+        ParamEnv::reveal_all(),
+        *callee_id,
+        generics,
+    ))
 }
 
 // === `safeishly_grab_def_id_mir` === //

@@ -7,17 +7,20 @@ use rustc_hir::{
 };
 
 use rustc_middle::{
-    mir::{Body, Mutability, Terminator, TerminatorKind},
-    ty::{EarlyBinder, Instance, ParamEnv, Ty, TyCtxt, TyKind},
+    mir::{Body, LocalDecl, Mutability},
+    ty::{Instance, Ty, TyCtxt},
 };
-use rustc_span::Symbol;
+use rustc_span::{Symbol, DUMMY_SP};
 
 use crate::{
     analyzer::sym::unnamed,
     util::{
         feeder::{feed, feeders::MirBuiltFeeder},
         hash::FxHashMap,
-        mir::{safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult},
+        mir::{
+            get_static_callee_from_terminator, safeishly_grab_def_id_mir,
+            safeishly_grab_instance_mir, MirGrabResult,
+        },
     },
 };
 
@@ -94,8 +97,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         let mut shadows = Vec::new();
 
-        for (instance, facts) in &mut self.func_facts {
-            let facts = facts.as_mut().unwrap();
+        for (instance, facts) in &self.func_facts {
+            let facts = facts.as_ref().unwrap();
             let Some(orig_id) = instance.def_id().as_local() else {
                 continue;
             };
@@ -105,6 +108,49 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 // HACK: See above comment.
                 continue;
             };
+
+            {
+                // Create a local for every token.
+                let token_ref_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+
+                let token_locals = facts
+                    .borrows
+                    .keys()
+                    .map(|key| {
+                        (
+                            *key,
+                            body.local_decls
+                                .push(LocalDecl::new(token_ref_ty, DUMMY_SP)),
+                        )
+                    })
+                    .collect::<FxHashMap<_, _>>();
+
+                // For every function call...
+                for bb in body.basic_blocks.as_mut() {
+                    // If it has a concrete callee...
+                    let Some(terminator) = &bb.terminator else {
+                        continue;
+                    };
+
+                    let Some(target_instance) = get_static_callee_from_terminator(
+                        tcx,
+                        instance,
+                        &body.local_decls,
+                        terminator,
+                    ) else {
+                        continue;
+                    };
+
+                    // Determine what it borrows
+                    let Some(callee_borrows) = &self.func_facts.get(&target_instance) else {
+                        // This could happen if the optimized MIR reveals that a given function is
+                        // unreachable.
+                        continue;
+                    };
+
+                    // TODO: Add borrow commands to the MIR here.
+                }
+            }
 
             // Feed the query system the shadow function's properties.
             let shadow_kind = tcx.def_kind(orig_id);
@@ -171,30 +217,16 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         for bb in body.basic_blocks.iter() {
             // If the terminator is a call terminator.
-            let Some(Terminator {
-                kind: TerminatorKind::Call { func, .. },
-                ..
-            }) = &bb.terminator
+            let Some(terminator) = &bb.terminator else {
+                continue;
+            };
+            let Some(target_instance) =
+                get_static_callee_from_terminator(tcx, &instance, &body.local_decls, terminator)
             else {
                 continue;
             };
 
-            // Concretize the function type.
-            let func = func.ty(&body.local_decls, tcx);
-            let func = instance.instantiate_mir_and_normalize_erasing_regions(
-                tcx,
-                ParamEnv::reveal_all(),
-                EarlyBinder::bind(func),
-            );
-
-            // If the function target is well known...
-            let TyKind::FnDef(callee_id, generics) = func.kind() else {
-                continue;
-            };
-
-            // Analyze it...
-            let target_instance =
-                Instance::expect_resolve(tcx, ParamEnv::reveal_all(), *callee_id, generics);
+            // Recurse into its callee.
             self.analyze_fn_facts(tcx, target_instance);
 
             // ...and add its borrows to the borrows set.
