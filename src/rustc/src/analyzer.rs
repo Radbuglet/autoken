@@ -11,7 +11,7 @@ use rustc_middle::{
     mir::{
         interpret::Scalar, BasicBlock, Body, BorrowKind, CastKind, Const, ConstOperand, ConstValue,
         LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue, SourceInfo,
-        SourceScope, Statement, StatementKind, UserTypeProjection,
+        SourceScope, Statement, StatementKind, Terminator, TerminatorKind, UserTypeProjection,
     },
     ty::{
         BoundRegionKind, BoundVariableKind, CanonicalUserType, CanonicalUserTypeAnnotation,
@@ -121,16 +121,25 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             {
                 // Create a local for every token.
-                let token_ref_not_ty =
+                let token_ref_imm_ty =
                     Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
 
                 let token_ref_mut_ty =
                     Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
 
                 let dangling_addr_local_ty = Ty::new_mut_ptr(tcx, tcx.types.unit);
+
                 let dangling_addr_local = body
                     .local_decls
                     .push(LocalDecl::new(dangling_addr_local_ty, DUMMY_SP));
+
+                let dummy_imm_token_holder = body
+                    .local_decls
+                    .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP));
+
+                let dummy_mut_token_holder = body
+                    .local_decls
+                    .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP));
 
                 let token_locals = facts
                     .borrows
@@ -140,7 +149,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             *key,
                             body.local_decls.push(LocalDecl::new(
                                 match mutability {
-                                    Mutability::Not => token_ref_not_ty,
+                                    Mutability::Not => token_ref_imm_ty,
                                     Mutability::Mut => token_ref_mut_ty,
                                 },
                                 DUMMY_SP,
@@ -222,7 +231,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     }),
                                     span: DUMMY_SP,
                                     inferred_ty: match mutability {
-                                        Mutability::Not => token_ref_not_ty,
+                                        Mutability::Not => token_ref_imm_ty,
                                         Mutability::Mut => token_ref_mut_ty,
                                     },
                                 });
@@ -304,23 +313,34 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     }
                 }
 
-                body.basic_blocks.as_mut()[BasicBlock::from_u32(0)]
+                let bbs = body.basic_blocks.as_mut();
+                bbs[BasicBlock::from_u32(0)]
                     .statements
                     .splice(0..0, start_stmts);
 
                 // For every function call...
-                for bb in body.basic_blocks.as_mut() {
+                for bb_idx in 0..bbs.len() {
+                    let bb = &mut bbs[BasicBlock::from_usize(bb_idx)];
+
                     // If it has a concrete callee...
-                    let Some(terminator) = &bb.terminator else {
+                    let Some(Terminator {
+                        kind:
+                            TerminatorKind::Call {
+                                func: callee,
+                                destination,
+                                // TODO: Handle divergent functions as well.
+                                target,
+                                ..
+                            },
+                        ..
+                    }) = &bb.terminator
+                    else {
                         continue;
                     };
 
-                    let Some(target_instance) = get_static_callee_from_terminator(
-                        tcx,
-                        instance,
-                        &body.local_decls,
-                        terminator,
-                    ) else {
+                    let Some(target_instance) =
+                        get_static_callee_from_terminator(tcx, instance, &body.local_decls, callee)
+                    else {
                         continue;
                     };
 
@@ -331,7 +351,46 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         continue;
                     };
 
-                    // TODO: Add borrow commands to the MIR here.
+                    let callee_borrows = callee_borrows.as_ref().unwrap();
+
+                    // Add borrow directives before the function.
+                    for (ty, (mutability, _)) in &callee_borrows.borrows {
+                        bb.statements.push(Statement {
+                            source_info,
+                            kind: StatementKind::Assign(Box::new((
+                                Place {
+                                    local: match mutability {
+                                        Mutability::Not => dummy_imm_token_holder,
+                                        Mutability::Mut => dummy_mut_token_holder,
+                                    },
+                                    projection: List::empty(),
+                                },
+                                Rvalue::Ref(
+                                    tcx.lifetimes.re_erased,
+                                    match mutability {
+                                        Mutability::Not => BorrowKind::Shared,
+                                        Mutability::Mut => BorrowKind::Mut {
+                                            kind: MutBorrowKind::Default,
+                                        },
+                                    },
+                                    Place {
+                                        local: token_locals[ty],
+                                        projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
+                                    },
+                                ),
+                            ))),
+                        });
+                    }
+
+                    // Add ascriptions to the return type after.
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    let target = *target;
+                    let destination = *destination;
+
+                    let bb = &mut bbs[target];
+                    // TODO
                 }
             }
 
@@ -400,11 +459,16 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         for bb in body.basic_blocks.iter() {
             // If the terminator is a call terminator.
-            let Some(terminator) = &bb.terminator else {
+            let Some(Terminator {
+                kind: TerminatorKind::Call { func: callee, .. },
+                ..
+            }) = &bb.terminator
+            else {
                 continue;
             };
+
             let Some(target_instance) =
-                get_static_callee_from_terminator(tcx, &instance, &body.local_decls, terminator)
+                get_static_callee_from_terminator(tcx, &instance, &body.local_decls, callee)
             else {
                 continue;
             };

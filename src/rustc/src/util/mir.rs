@@ -4,7 +4,7 @@ use rustc_data_structures::steal::Steal;
 use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::{Body, Local, LocalDecl, Terminator, TerminatorKind},
+    mir::{Body, Local, LocalDecl, Operand},
     ty::{EarlyBinder, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Symbol;
@@ -35,12 +35,8 @@ pub fn get_static_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
     caller: &Instance<'tcx>,
     caller_local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-    terminator: &Terminator<'tcx>,
+    callee: &Operand<'tcx>,
 ) -> Option<Instance<'tcx>> {
-    let TerminatorKind::Call { func: callee, .. } = &terminator.kind else {
-        return None;
-    };
-
     let callee = callee.ty(caller_local_decls, tcx);
     let callee = caller.instantiate_mir_and_normalize_erasing_regions(
         tcx,
