@@ -1,14 +1,14 @@
 fn main() {
-    woo();
+    // woo();
 }
 
 fn woo<'a>() {
-    whee::<f32>();
+    whee();
 }
 
-fn whee<'a, T>() -> &'a T {
-    __autoken_declare_tied_ref::<0, u32>();
-    loop {}
+fn whee<'a>() -> &'a f32 {
+    __autoken_declare_tied_ref::<0, f32>();
+    &4.2
 }
 
 fn __autoken_declare_tied_ref<const LT_ID: u32, T: ?Sized>() {}
