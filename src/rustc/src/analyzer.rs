@@ -4,7 +4,6 @@ use rustc_data_structures::{steal::Steal, sync::RwLock};
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
-    HirId, ItemLocalId, OwnerId,
 };
 
 use rustc_middle::{
@@ -14,9 +13,9 @@ use rustc_middle::{
         SourceScope, Statement, StatementKind, Terminator, TerminatorKind, UserTypeProjection,
     },
     ty::{
-        BoundRegionKind, BoundVariableKind, CanonicalUserType, CanonicalUserTypeAnnotation,
-        Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree,
-        Variance,
+        CanonicalUserType, CanonicalUserTypeAnnotation, EarlyParamRegion, GenericParamDef,
+        GenericParamDefKind, Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut,
+        UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -73,7 +72,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             };
 
             if let Some(borrow) = &*body.read() {
-                dbg!(local_def, borrow);
+                // dbg!(local_def, borrow);
                 self.local_mirs.insert(local_def, borrow.clone());
             }
         }
@@ -200,12 +199,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     };
 
                     if let Some(lt_id) = lt_id {
-                        let late_vars = tcx.late_bound_vars(HirId {
-                            owner: OwnerId { def_id: orig_id },
-                            local_id: ItemLocalId::from_u32(0),
-                        });
-                        let BoundVariableKind::Region(BoundRegionKind::BrNamed(did, name)) =
-                            late_vars[*lt_id as usize]
+                        let GenericParamDef {
+                            kind: GenericParamDefKind::Lifetime,
+                            def_id: para_def_id,
+                            index: para_idx,
+                            name: para_name,
+                            ..
+                        } = tcx.generics_of(orig_id).params[*lt_id as usize]
                         else {
                             unreachable!();
                         };
@@ -216,10 +216,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     user_ty: Box::new(CanonicalUserType {
                                         value: UserType::Ty(Ty::new_ref(
                                             tcx,
-                                            Region::new_late_param(
+                                            Region::new_early_param(
                                                 tcx,
-                                                orig_id.to_def_id(),
-                                                BoundRegionKind::BrNamed(did, name),
+                                                EarlyParamRegion {
+                                                    def_id: para_def_id,
+                                                    index: para_idx,
+                                                    name: para_name,
+                                                },
                                             ),
                                             TypeAndMut {
                                                 mutbl: *mutability,
@@ -328,7 +331,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             TerminatorKind::Call {
                                 func: callee,
                                 destination,
-                                // TODO: Handle divergent functions as well.
                                 target,
                                 ..
                             },
@@ -390,7 +392,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     let destination = *destination;
 
                     let bb = &mut bbs[target];
-                    // TODO
+
+                    // TODO: Use the fn_sig's instantiate method to figure out what the return type
+                    //  should be for the instance.
                 }
             }
 
@@ -422,7 +426,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Finally, borrow check everything in a single go to avoid issues with stolen values.
         for shadow in shadows {
-            dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
+            // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
             let _ = tcx.mir_borrowck(shadow.def_id());
         }
     }
