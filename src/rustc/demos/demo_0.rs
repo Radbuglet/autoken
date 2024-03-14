@@ -1,15 +1,16 @@
 fn main() {
+    let hehe = whee::<u32>();
     woo();
 }
 
 fn woo<'a>() {
-    let a = whee();
-    let b = whee();
-    // let _ = a;
+    let a = whee::<u32>();
+    let b = whee::<f32>();
+    let _ = a;
 }
 
-fn whee<'a>() -> &'a f64 {
-    __autoken_declare_tied_mut::<0, f64>();
+fn whee<'a, T>() -> &'a f64 {
+    __autoken_declare_tied_mut::<0, T>();
     &4.2
 }
 

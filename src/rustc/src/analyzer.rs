@@ -142,14 +142,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     .local_decls
                     .push(LocalDecl::new(dangling_addr_local_ty, DUMMY_SP));
 
-                let dummy_imm_token_holder = body
-                    .local_decls
-                    .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP));
-
-                let dummy_mut_token_holder = body
-                    .local_decls
-                    .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP));
-
                 let token_locals = facts
                     .borrows
                     .iter()
@@ -367,14 +359,20 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                     // Add borrow directives before the function.
                     for (ty, (mutability, _)) in &callee_borrows.borrows {
+                        let dummy_token_holder = match mutability {
+                            Mutability::Not => body
+                                .local_decls
+                                .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP)),
+                            Mutability::Mut => body
+                                .local_decls
+                                .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
+                        };
+
                         bb.statements.push(Statement {
                             source_info,
                             kind: StatementKind::Assign(Box::new((
                                 Place {
-                                    local: match mutability {
-                                        Mutability::Not => dummy_imm_token_holder,
-                                        Mutability::Mut => dummy_mut_token_holder,
-                                    },
+                                    local: dummy_token_holder,
                                     projection: List::empty(),
                                 },
                                 Rvalue::Ref(
@@ -501,15 +499,21 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                         body.local_decls[destination.local].mutability = Mutability::Mut;
 
+                        let dummy_token_holder = match mutability {
+                            Mutability::Not => body
+                                .local_decls
+                                .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP)),
+                            Mutability::Mut => body
+                                .local_decls
+                                .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
+                        };
+
                         prepend_statements.extend([
                             Statement {
                                 source_info,
                                 kind: StatementKind::Assign(Box::new((
                                     Place {
-                                        local: match mutability {
-                                            Mutability::Not => dummy_imm_token_holder,
-                                            Mutability::Mut => dummy_mut_token_holder,
-                                        },
+                                        local: dummy_token_holder,
                                         projection: List::empty(),
                                     },
                                     Rvalue::Ref(
@@ -539,10 +543,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                         Box::new(AggregateKind::Tuple),
                                         IndexVec::from_iter([
                                             Operand::Move(Place {
-                                                local: match mutability {
-                                                    Mutability::Not => dummy_imm_token_holder,
-                                                    Mutability::Mut => dummy_mut_token_holder,
-                                                },
+                                                local: dummy_token_holder,
                                                 projection: List::empty(),
                                             }),
                                             Operand::Move(destination),
