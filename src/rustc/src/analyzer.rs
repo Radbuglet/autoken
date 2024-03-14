@@ -16,12 +16,13 @@ use rustc_middle::{
     },
     ty::{
         BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, DebruijnIndex, EarlyParamRegion, GenericParamDef,
-        GenericParamDefKind, Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut,
-        UniverseIndex, UserType, ValTree, Variance,
+        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
+        EarlyParamRegion, GenericParamDef, GenericParamDefKind, Instance, List, ParamEnv, Region,
+        Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
+use rustc_target::abi::FieldIdx;
 
 use crate::{
     analyzer::sym::unnamed,
@@ -432,15 +433,17 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                         new_args[*lt_idx as usize] = token_bind_region.into();
 
+                        // FIXME: This isn't computed properly.
+                        let fn_result = Ty::new_imm_ref(tcx, token_bind_region, tcx.types.f64);
+                        /*tcx
+                        .fn_sig(target_instance.def_id())
+                        .instantiate(tcx, &new_args)
+                        .output()
+                        .skip_binder();*/
+
                         let fn_result_inferred = tcx
                             .fn_sig(target_instance.def_id())
                             .instantiate(tcx, target_instance.args)
-                            .output()
-                            .skip_binder();
-
-                        let fn_result = tcx
-                            .fn_sig(target_instance.def_id())
-                            .instantiate(tcx, &new_args)
                             .output()
                             .skip_binder();
 
@@ -460,6 +463,21 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             ],
                         );
 
+                        let tuple_binder_inferred = Ty::new_tup(
+                            tcx,
+                            &[
+                                Ty::new_ref(
+                                    tcx,
+                                    tcx.lifetimes.re_erased,
+                                    TypeAndMut {
+                                        mutbl: *mutability,
+                                        ty: tcx.types.unit,
+                                    },
+                                ),
+                                fn_result_inferred,
+                            ],
+                        );
+
                         // Emit a type ascription statement
                         let annotation =
                             body.user_type_annotations
@@ -467,15 +485,21 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     user_ty: Box::new(Canonical {
                                         value: UserType::Ty(tuple_binder),
                                         max_universe: UniverseIndex::ROOT,
-                                        variables: List::empty(),
+                                        variables: tcx.mk_canonical_var_infos(&[
+                                            CanonicalVarInfo {
+                                                kind: CanonicalVarKind::Region(UniverseIndex::ROOT),
+                                            },
+                                        ]),
                                     }),
                                     span: DUMMY_SP,
-                                    inferred_ty: fn_result_inferred,
+                                    inferred_ty: tuple_binder_inferred,
                                 });
 
                         let binder_local = body
                             .local_decls
-                            .push(LocalDecl::new(tuple_binder, DUMMY_SP));
+                            .push(LocalDecl::new(tuple_binder_inferred, DUMMY_SP));
+
+                        body.local_decls[destination.local].mutability = Mutability::Mut;
 
                         prepend_statements.extend([
                             Statement {
@@ -548,7 +572,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     destination,
                                     Rvalue::Use(Operand::Move(Place {
                                         local: binder_local,
-                                        projection: List::empty(),
+                                        projection: tcx.mk_place_elems(&[ProjectionElem::Field(
+                                            FieldIdx::from_u32(1),
+                                            fn_result_inferred,
+                                        )]),
                                     })),
                                 ))),
                             },
@@ -587,7 +614,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Finally, borrow check everything in a single go to avoid issues with stolen values.
         for shadow in shadows {
-            dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
+            // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
             let _ = tcx.mir_borrowck(shadow.def_id());
         }
     }
