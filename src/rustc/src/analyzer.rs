@@ -17,8 +17,8 @@ use rustc_middle::{
     ty::{
         BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        EarlyParamRegion, GenericParamDef, GenericParamDefKind, Instance, List, ParamEnv, Region,
-        Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree, Variance,
+        EarlyParamRegion, GenericArgs, GenericParamDef, GenericParamDefKind, Instance, List,
+        ParamEnv, Region, Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -94,18 +94,32 @@ impl<'tcx> AnalysisDriver<'tcx> {
             }
 
             // ...which can be properly monomorphized.
-            if tcx
-                .generics_of(local_def)
-                .params
-                .iter()
-                .filter(|v| !matches!(v.kind, GenericParamDefKind::Lifetime))
-                .count()
-                > 0
-            {
-                continue;
-            }
+            let mut args_wf = true;
+            let args = 
+                // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
+                // over the generic arguments of the parent.
+                GenericArgs::for_item(tcx, local_def.to_def_id(), |param, _| match param.kind {
+                    // We can handle these
+                    GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+                    GenericParamDefKind::Const {
+                        is_host_effect: true,
+                        ..
+                    } => tcx.consts.true_.into(),
 
-            self.analyze_fn_facts(tcx, Instance::mono(tcx, local_def.to_def_id()));
+                    // We can't handle these; return a dummy value and set the `args_wf` flag.
+                    GenericParamDefKind::Type { .. } => {
+                        args_wf = false;
+                        tcx.types.unit.into()
+                    }
+                    GenericParamDefKind::Const { .. } => {
+                        args_wf = false;
+                        tcx.consts.true_.into()
+                    }
+                });
+
+            if args_wf {
+                self.analyze_fn_facts(tcx, Instance::new(local_def.to_def_id(), args));
+            }
         }
 
         // Check for undeclared unsizing.
