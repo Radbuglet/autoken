@@ -16,9 +16,8 @@ use rustc_middle::{
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        EarlyBinder, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region,
-        RegionKind, Ty, TyCtxt, TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree,
-        Variance,
+        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, RegionKind, Ty, TyCtxt,
+        TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -392,6 +391,11 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     };
                     let target = *target;
                     let destination = *destination;
+                    let callee_sig_generic = callee
+                        .ty(&body.local_decls, tcx)
+                        .fn_sig(tcx)
+                        .skip_binder()
+                        .output();
 
                     let bb = &mut bbs[target];
 
@@ -408,10 +412,12 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         };
 
                         // Compute the type as which the function result is going to be bound.
-                        let callee_sig = tcx.fn_sig(target_instance.def_id());
                         let mapped_region = find_region_with_name(
                             tcx,
-                            callee_sig.skip_binder().skip_binder().output(),
+                            tcx.fn_sig(target_instance.def_id())
+                                .skip_binder()
+                                .skip_binder()
+                                .output(),
                             *lt_id,
                         )
                         .unwrap();
@@ -419,8 +425,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         let mut var_assignments = FxHashMap::default();
                         var_assignments.insert(mapped_region, BoundVar::from_usize(0));
 
-                        let fn_result = callee_sig.skip_binder().skip_binder().output().fold_with(
-                            &mut RegionFolder::new(tcx, &mut |region, index| {
+                        let fn_result = callee_sig_generic.fold_with(&mut RegionFolder::new(
+                            tcx,
+                            &mut |region, index| {
                                 match region.kind() {
                                     // Mapped regions
                                     RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
@@ -455,14 +462,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     RegionKind::ReErased => unreachable!(),
                                     RegionKind::ReError(_) => unreachable!(),
                                 }
-                            }),
-                        );
+                            },
+                        ));
 
-                        let fn_result =
-                            EarlyBinder::bind(fn_result).instantiate(tcx, target_instance.args);
-
-                        // FIXME: Handle patterns
-                        let fn_result_inferred = body.local_decls[destination.local].ty;
+                        let fn_result_inferred = destination.ty(&body.local_decls, tcx).ty;
 
                         // Create a tuple binder
                         let tuple_binder = Ty::new_tup(
@@ -503,8 +506,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         );
 
                         // Emit a type ascription statement
-                        // FIXME: The function and its types are still concrete but we're resolving
-                        // using knowledge of the monomorphized types.
                         let annotation =
                             body.user_type_annotations
                                 .push(CanonicalUserTypeAnnotation {
