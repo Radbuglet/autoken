@@ -13,7 +13,11 @@ use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
     analyzer::AnalysisDriver,
-    util::feeder::{feeders::MirBuiltFeeder, once_val, read_feed},
+    util::feeder::{
+        feed,
+        feeders::{MirBuiltFeeder, MirBuiltStasher},
+        once_val, read_feed,
+    },
 };
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
@@ -60,7 +64,19 @@ impl Callbacks for AnalyzeMirCallbacks {
                 }
 
                 query.mir_built = |tcx, id| {
-                    read_feed::<MirBuiltFeeder>(tcx, id).unwrap_or_else(|| mir_built.get()(tcx, id))
+                    if let Some(fed) = read_feed::<MirBuiltFeeder>(tcx, id) {
+                        fed
+                    } else {
+                        let built = mir_built.get()(tcx, id);
+                        if read_feed::<MirBuiltStasher>(tcx, id).is_none() {
+                            feed::<MirBuiltStasher>(
+                                tcx,
+                                id,
+                                tcx.arena.alloc(built.borrow().clone()),
+                            );
+                        }
+                        built
+                    }
                 };
             });
         }

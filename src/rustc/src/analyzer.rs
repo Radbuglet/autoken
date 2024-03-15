@@ -1,6 +1,5 @@
 use std::collections::{hash_map, HashMap};
 
-use rustc_data_structures::{steal::Steal, sync::RwLock};
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
@@ -9,7 +8,7 @@ use rustc_hir::{
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        interpret::Scalar, AggregateKind, BasicBlock, Body, BorrowKind, CastKind, Const,
+        interpret::Scalar, AggregateKind, BasicBlock, BorrowKind, CastKind, Const,
         ConstOperand, ConstValue, LocalDecl, MutBorrowKind, Mutability, Operand, Place,
         ProjectionElem, Rvalue, SourceInfo, SourceScope, Statement, StatementKind, Terminator,
         TerminatorKind, UserTypeProjection,
@@ -27,11 +26,10 @@ use rustc_target::abi::FieldIdx;
 use crate::{
     analyzer::sym::unnamed,
     util::{
-        feeder::{feed, feeders::MirBuiltFeeder},
+        feeder::{feed, feeders::{MirBuiltFeeder, MirBuiltStasher}, read_feed},
         hash::FxHashMap,
         mir::{
-            get_static_callee_from_terminator, safeishly_grab_def_id_mir,
-            safeishly_grab_instance_mir, MirGrabResult,
+            get_static_callee_from_terminator, safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult
         },
     },
 };
@@ -41,7 +39,6 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct AnalysisDriver<'tcx> {
     func_facts: FxHashMap<Instance<'tcx>, Option<FuncFacts<'tcx>>>,
-    local_mirs: FxHashMap<LocalDefId, Body<'tcx>>,
     id_gen: u64,
 }
 
@@ -54,8 +51,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
     pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
         let id_count = tcx.untracked().definitions.read().def_index_count();
 
-        // Fetch the MIR for each local definition in case it gets stolen by `safeishly_grab_instance_mir`
-        // and `Instance::instantiate_mir_and_normalize_erasing_regions`.
+        // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
         //
         // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
         for i in 0..id_count {
@@ -63,20 +59,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 local_def_index: DefIndex::from_usize(i),
             };
 
-            let Some(body) = safeishly_grab_def_id_mir(tcx, local_def) else {
-                continue;
-            };
-
-            // HACK: `mir_built` can call `layout_of`, which can call `eval_to_const_value_raw` and
-            //  now all bets are off about getting the MIR. We're just praying this MIR isn't actually
-            //  load-bearing but there's no proof that this is actually the case.
-            let body = unsafe {
-                // Safety: there is none.
-                std::mem::transmute::<&'tcx Steal<Body<'tcx>>, &RwLock<Option<Body<'tcx>>>>(body)
-            };
-
-            if let Some(borrow) = &*body.read() {
-                self.local_mirs.insert(local_def, borrow.clone());
+            if safeishly_grab_def_id_mir(tcx, local_def).is_some() {
+                assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
             }
         }
 
@@ -137,10 +121,11 @@ impl<'tcx> AnalysisDriver<'tcx> {
             };
 
             // Modify body
-            let Some(mut body) = self.local_mirs.get(&orig_id).cloned() else {
-                // HACK: See above comment.
+            let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_id).cloned() else {
+                // Some `DefIds` with facts are just shims—not functions with actual MIR.
                 continue;
             };
+
 
             {
                 // Create a local for every token.

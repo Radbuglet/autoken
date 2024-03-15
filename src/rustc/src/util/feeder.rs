@@ -92,6 +92,7 @@ pub mod feeders {
 
     super::define_feedable! {
         MirBuiltFeeder => &'tcx Steal<Body<'tcx>>,
+        MirBuiltStasher => &'tcx Body<'tcx>,
     }
 }
 
