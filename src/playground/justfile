@@ -1,0 +1,3 @@
+check:
+    cargo clean
+    cargo run -Z bindeps --manifest-path ../cargo/Cargo.toml -- check --old-artifacts=delete
