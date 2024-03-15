@@ -16,8 +16,9 @@ use rustc_middle::{
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, RegionKind, Ty, TyCtxt,
-        TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
+        EarlyBinder, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region,
+        RegionKind, Ty, TyCtxt, TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree,
+        Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -418,10 +419,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         let mut var_assignments = FxHashMap::default();
                         var_assignments.insert(mapped_region, BoundVar::from_usize(0));
 
-                        let fn_result = callee_sig
-                            .skip_binder()
-                            .skip_binder()
-                            .fold_with(&mut RegionFolder::new(tcx, &mut |region, index| {
+                        let fn_result = callee_sig.skip_binder().skip_binder().output().fold_with(
+                            &mut RegionFolder::new(tcx, &mut |region, index| {
                                 match region.kind() {
                                     // Mapped regions
                                     RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
@@ -456,13 +455,14 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     RegionKind::ReErased => unreachable!(),
                                     RegionKind::ReError(_) => unreachable!(),
                                 }
-                            }))
-                            .output();
+                            }),
+                        );
 
-                        let fn_result_inferred = callee_sig
-                            .instantiate(tcx, target_instance.args)
-                            .output()
-                            .skip_binder();
+                        let fn_result =
+                            EarlyBinder::bind(fn_result).instantiate(tcx, target_instance.args);
+
+                        // FIXME: Handle patterns
+                        let fn_result_inferred = body.local_decls[destination.local].ty;
 
                         // Create a tuple binder
                         let tuple_binder = Ty::new_tup(
@@ -503,6 +503,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         );
 
                         // Emit a type ascription statement
+                        // FIXME: The function and its types are still concrete but we're resolving
+                        // using knowledge of the monomorphized types.
                         let annotation =
                             body.user_type_annotations
                                 .push(CanonicalUserTypeAnnotation {
