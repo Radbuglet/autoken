@@ -16,8 +16,8 @@ use rustc_middle::{
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut,
-        TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
+        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, RegionKind, Ty, TyCtxt,
+        TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -49,7 +49,7 @@ pub struct AnalysisDriver<'tcx> {
 
 #[derive(Debug)]
 struct FuncFacts<'tcx> {
-    borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<u32>)>,
+    borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -208,7 +208,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         let found_region = find_region_with_name(
                             tcx,
                             tcx.fn_sig(orig_id).skip_binder().skip_binder().output(),
-                            Symbol::intern(&format!("'autoken_{lt_id}")),
+                            *lt_id,
                         )
                         .unwrap();
 
@@ -401,25 +401,65 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                     let mut prepend_statements = Vec::new();
 
-                    for (ty, (mutability, lt_idx)) in &target_facts.borrows {
-                        let Some(lt_idx) = lt_idx else {
+                    for (ty, (mutability, lt_id)) in &target_facts.borrows {
+                        let Some(lt_id) = lt_id else {
                             continue;
                         };
 
                         // Compute the type as which the function result is going to be bound.
-                        // TODO: Actually implement this
-                        let token_bind_region = Region::new_bound(
+                        let callee_sig = tcx.fn_sig(target_instance.def_id());
+                        let mapped_region = find_region_with_name(
                             tcx,
-                            DebruijnIndex::from_u32(0),
-                            BoundRegion {
-                                kind: BoundRegionKind::BrAnon,
-                                var: BoundVar::from_u32(0),
-                            },
-                        );
-                        let fn_result = Ty::new_imm_ref(tcx, token_bind_region, tcx.types.f64);
+                            callee_sig.skip_binder().skip_binder().output(),
+                            *lt_id,
+                        )
+                        .unwrap();
 
-                        let fn_result_inferred = tcx
-                            .fn_sig(target_instance.def_id())
+                        let mut var_assignments = FxHashMap::default();
+                        var_assignments.insert(mapped_region, BoundVar::from_usize(0));
+
+                        let fn_result = callee_sig
+                            .skip_binder()
+                            .skip_binder()
+                            .fold_with(&mut RegionFolder::new(tcx, &mut |region, index| {
+                                match region.kind() {
+                                    // Mapped regions
+                                    RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
+                                        if index == DebruijnIndex::from_u32(0) {
+                                            let var_assignments_count =
+                                                var_assignments.len() as u32;
+                                            let bound_var =
+                                                *var_assignments.entry(region).or_insert_with(
+                                                    || BoundVar::from_u32(var_assignments_count),
+                                                );
+
+                                            Region::new_bound(
+                                                tcx,
+                                                DebruijnIndex::from_u32(0),
+                                                BoundRegion {
+                                                    kind: BoundRegionKind::BrAnon,
+                                                    var: bound_var,
+                                                },
+                                            )
+                                        } else {
+                                            region
+                                        }
+                                    }
+
+                                    // Unaffected regions
+                                    RegionKind::ReBound(_, _) => region,
+                                    RegionKind::ReStatic => region,
+
+                                    // Non-applicable regions
+                                    RegionKind::ReVar(_) => unreachable!(),
+                                    RegionKind::RePlaceholder(_) => unreachable!(),
+                                    RegionKind::ReErased => unreachable!(),
+                                    RegionKind::ReError(_) => unreachable!(),
+                                }
+                            }))
+                            .output();
+
+                        let fn_result_inferred = callee_sig
                             .instantiate(tcx, target_instance.args)
                             .output()
                             .skip_binder();
@@ -430,7 +470,14 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             &[
                                 Ty::new_ref(
                                     tcx,
-                                    token_bind_region,
+                                    Region::new_bound(
+                                        tcx,
+                                        DebruijnIndex::from_u32(0),
+                                        BoundRegion {
+                                            kind: BoundRegionKind::BrAnon,
+                                            var: BoundVar::from_u32(0),
+                                        },
+                                    ),
                                     TypeAndMut {
                                         mutbl: *mutability,
                                         ty: tcx.types.unit,
@@ -462,11 +509,16 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     user_ty: Box::new(Canonical {
                                         value: UserType::Ty(tuple_binder),
                                         max_universe: UniverseIndex::ROOT,
-                                        variables: tcx.mk_canonical_var_infos(&[
-                                            CanonicalVarInfo {
-                                                kind: CanonicalVarKind::Region(UniverseIndex::ROOT),
-                                            },
-                                        ]),
+                                        variables: tcx.mk_canonical_var_infos(
+                                            &var_assignments
+                                                .iter()
+                                                .map(|_| CanonicalVarInfo {
+                                                    kind: CanonicalVarKind::Region(
+                                                        UniverseIndex::ROOT,
+                                                    ),
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        ),
                                     }),
                                     span: DUMMY_SP,
                                     inferred_ty: tuple_binder_inferred,
@@ -653,7 +705,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            let lt_idx =
+            let lt_id =
                 Self::is_special_func(tcx, target_instance.def_id()).map(|_| match target_instance
                     .args[0]
                     .as_const()
@@ -674,8 +726,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     *curr_mut = Mutability::Mut;
                 }
 
-                if let Some(lt_idx) = lt_idx.filter(|idx| *idx != u32::MAX) {
-                    *curr_idx = Some(lt_idx);
+                if let Some(lt_id) = lt_id.filter(|idx| *idx != u32::MAX) {
+                    *curr_idx = Some(Symbol::intern(&format!("'autoken_{lt_id}")));
                 }
             }
         }
