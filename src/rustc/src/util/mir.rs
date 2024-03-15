@@ -5,7 +5,10 @@ use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, Trait
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{Body, Local, LocalDecl, Operand},
-    ty::{EarlyBinder, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{
+        fold::RegionFolder, EarlyBinder, Instance, InstanceDef, ParamEnv, Region, Ty, TyCtxt,
+        TyKind, TypeAndMut, TypeFoldable,
+    },
 };
 use rustc_span::Symbol;
 
@@ -29,7 +32,35 @@ impl CachedSymbol {
     }
 }
 
-// === get_callee_from_terminator === //
+// === `find_region_with_name` === //
+
+pub fn find_region_with_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    name: Symbol,
+) -> Result<Region<'tcx>, Vec<Symbol>> {
+    let mut found_region = None;
+
+    let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
+        if found_region.is_none() && region.get_name() == Some(name) {
+            found_region = Some(region);
+        }
+        region
+    }));
+
+    found_region.ok_or_else(|| {
+        let mut found = Vec::new();
+        let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
+            if let Some(name) = region.get_name() {
+                found.push(name);
+            }
+            region
+        }));
+        found
+    })
+}
+
+// === `get_callee_from_terminator` === //
 
 pub fn get_static_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,

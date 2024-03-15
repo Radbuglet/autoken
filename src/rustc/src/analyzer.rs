@@ -8,16 +8,16 @@ use rustc_hir::{
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        interpret::Scalar, AggregateKind, BasicBlock, BorrowKind, CastKind, Const,
-        ConstOperand, ConstValue, LocalDecl, MutBorrowKind, Mutability, Operand, Place,
-        ProjectionElem, Rvalue, SourceInfo, SourceScope, Statement, StatementKind, Terminator,
-        TerminatorKind, UserTypeProjection,
+        interpret::Scalar, AggregateKind, BasicBlock, BorrowKind, CastKind, Const, ConstOperand,
+        ConstValue, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue,
+        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
+        UserTypeProjection,
     },
     ty::{
-        BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
+        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        EarlyParamRegion, GenericArgs, GenericParamDef, GenericParamDefKind, Instance, List,
-        ParamEnv, Region, Ty, TyCtxt, TypeAndMut, UniverseIndex, UserType, ValTree, Variance,
+        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, Ty, TyCtxt, TypeAndMut,
+        TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -26,10 +26,15 @@ use rustc_target::abi::FieldIdx;
 use crate::{
     analyzer::sym::unnamed,
     util::{
-        feeder::{feed, feeders::{MirBuiltFeeder, MirBuiltStasher}, read_feed},
+        feeder::{
+            feed,
+            feeders::{MirBuiltFeeder, MirBuiltStasher},
+            read_feed,
+        },
         hash::FxHashMap,
         mir::{
-            get_static_callee_from_terminator, safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult
+            find_region_with_name, get_static_callee_from_terminator, safeishly_grab_def_id_mir,
+            safeishly_grab_instance_mir, MirGrabResult,
         },
     },
 };
@@ -79,7 +84,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             // ...which can be properly monomorphized.
             let mut args_wf = true;
-            let args = 
+            let args =
                 // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
                 // over the generic arguments of the parent.
                 GenericArgs::for_item(tcx, local_def.to_def_id(), |param, _| match param.kind {
@@ -125,7 +130,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 // Some `DefIds` with facts are just shims—not functions with actual MIR.
                 continue;
             };
-
 
             {
                 // Create a local for every token.
@@ -200,16 +204,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     };
 
                     if let Some(lt_id) = lt_id {
-                        let GenericParamDef {
-                            kind: GenericParamDefKind::Lifetime,
-                            def_id: para_def_id,
-                            index: para_idx,
-                            name: para_name,
-                            ..
-                        } = tcx.generics_of(orig_id).params[*lt_id as usize]
-                        else {
-                            unreachable!();
-                        };
+                        // Find the lifetime
+                        let found_region = find_region_with_name(
+                            tcx,
+                            tcx.fn_sig(orig_id).skip_binder().skip_binder().output(),
+                            Symbol::intern(&format!("'autoken_{lt_id}")),
+                        )
+                        .unwrap();
 
                         let annotation =
                             body.user_type_annotations
@@ -217,14 +218,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     user_ty: Box::new(CanonicalUserType {
                                         value: UserType::Ty(Ty::new_ref(
                                             tcx,
-                                            Region::new_early_param(
-                                                tcx,
-                                                EarlyParamRegion {
-                                                    def_id: para_def_id,
-                                                    index: para_idx,
-                                                    name: para_name,
-                                                },
-                                            ),
+                                            found_region,
                                             TypeAndMut {
                                                 mutbl: *mutability,
                                                 ty: tcx.types.unit,
@@ -413,6 +407,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         };
 
                         // Compute the type as which the function result is going to be bound.
+                        // TODO: Actually implement this
                         let token_bind_region = Region::new_bound(
                             tcx,
                             DebruijnIndex::from_u32(0),
@@ -421,22 +416,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                 var: BoundVar::from_u32(0),
                             },
                         );
-                        let mut new_args = target_instance.args.to_vec();
-                        for arg in &mut new_args {
-                            if arg.as_region().is_some() {
-                                *arg = tcx.lifetimes.re_erased.into();
-                            }
-                        }
-
-                        new_args[*lt_idx as usize] = token_bind_region.into();
-
-                        // FIXME: This isn't computed properly.
                         let fn_result = Ty::new_imm_ref(tcx, token_bind_region, tcx.types.f64);
-                        /*tcx
-                        .fn_sig(target_instance.def_id())
-                        .instantiate(tcx, &new_args)
-                        .output()
-                        .skip_binder();*/
 
                         let fn_result_inferred = tcx
                             .fn_sig(target_instance.def_id())
