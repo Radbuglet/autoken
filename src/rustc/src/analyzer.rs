@@ -391,6 +391,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     };
                     let target = *target;
                     let destination = *destination;
+
+                    // FIXME: This is occasionally ReErased.
                     let callee_sig_generic = callee
                         .ty(&body.local_decls, tcx)
                         .fn_sig(tcx)
@@ -654,6 +656,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
     }
 
+    // FIXME: Ensure that facts collected after a self-recursive function was analyzed are also
+    //  propagated to it.
     fn analyze_fn_facts(&mut self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
         // Ensure that we don't analyze the same function circularly or redundantly.
         let hash_map::Entry::Vacant(entry) = self.func_facts.entry(instance) else {
