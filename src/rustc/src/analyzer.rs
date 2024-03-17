@@ -17,7 +17,7 @@ use rustc_middle::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
         GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, RegionKind, Ty, TyCtxt,
-        TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
+        TyKind, TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -36,6 +36,7 @@ use crate::{
             find_region_with_name, get_static_callee_from_terminator, safeishly_grab_def_id_mir,
             safeishly_grab_instance_mir, MirGrabResult,
         },
+        ty::instantiate_ignoring_regions,
     },
 };
 
@@ -341,6 +342,26 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         continue;
                     };
 
+                    let target_fn_ty_totally_generic = tcx
+                        .type_of(target_instance.def_id())
+                        .skip_binder()
+                        // FIXME: This might be a closure.
+                        .fn_sig(tcx)
+                        .skip_binder();
+
+                    let target_fn_out_ty_semi_generic_intact_regions = {
+                        let callee = callee.ty(&body.local_decls, tcx);
+                        let TyKind::FnDef(_callee_id, generics) = callee.kind() else {
+                            unreachable!();
+                        };
+
+                        instantiate_ignoring_regions(
+                            tcx,
+                            target_fn_ty_totally_generic.output(),
+                            generics,
+                        )
+                    };
+
                     // Determine what it borrows
                     let Some(callee_borrows) = &self.func_facts.get(&target_instance) else {
                         // This could happen if the optimized MIR reveals that a given function is
@@ -392,13 +413,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     let target = *target;
                     let destination = *destination;
 
-                    // FIXME: This is occasionally ReErased.
-                    let callee_sig_generic = callee
-                        .ty(&body.local_decls, tcx)
-                        .fn_sig(tcx)
-                        .skip_binder()
-                        .output();
-
                     let bb = &mut bbs[target];
 
                     let Some(target_facts) = &self.func_facts.get(&target_instance) else {
@@ -416,10 +430,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         // Compute the type as which the function result is going to be bound.
                         let mapped_region = find_region_with_name(
                             tcx,
-                            tcx.fn_sig(target_instance.def_id())
-                                .skip_binder()
-                                .skip_binder()
-                                .output(),
+                            target_fn_ty_totally_generic.output(),
                             *lt_id,
                         )
                         .unwrap();
@@ -427,9 +438,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         let mut var_assignments = FxHashMap::default();
                         var_assignments.insert(mapped_region, BoundVar::from_usize(0));
 
-                        let fn_result = callee_sig_generic.fold_with(&mut RegionFolder::new(
-                            tcx,
-                            &mut |region, index| {
+                        let fn_result = target_fn_out_ty_semi_generic_intact_regions.fold_with(
+                            &mut RegionFolder::new(tcx, &mut |region, index| {
                                 match region.kind() {
                                     // Mapped regions
                                     RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
@@ -464,8 +474,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     RegionKind::ReErased => unreachable!(),
                                     RegionKind::ReError(_) => unreachable!(),
                                 }
-                            },
-                        ));
+                            }),
+                        );
 
                         let fn_result_inferred = destination.ty(&body.local_decls, tcx).ty;
 
