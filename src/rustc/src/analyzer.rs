@@ -336,34 +336,25 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         continue;
                     };
 
-                    let Some(target_instance) =
+                    let Some(target_instance_mono) =
                         get_static_callee_from_terminator(tcx, instance, &body.local_decls, callee)
                     else {
                         continue;
                     };
 
-                    let target_fn_ty_totally_generic = tcx
-                        .type_of(target_instance.def_id())
-                        .skip_binder()
-                        // FIXME: This might be a closure.
-                        .fn_sig(tcx)
-                        .skip_binder();
-
-                    let target_fn_out_ty_semi_generic_intact_regions = {
+                    // N.B. the DefId of `target_instance_no_mono` need not match its monomorphized
+                    // version.
+                    let target_instance_no_mono = {
                         let callee = callee.ty(&body.local_decls, tcx);
-                        let TyKind::FnDef(_callee_id, generics) = callee.kind() else {
+                        let TyKind::FnDef(callee_id, generics) = callee.kind() else {
                             unreachable!();
                         };
 
-                        instantiate_ignoring_regions(
-                            tcx,
-                            target_fn_ty_totally_generic.output(),
-                            generics,
-                        )
+                        Instance::new(*callee_id, generics)
                     };
 
                     // Determine what it borrows
-                    let Some(callee_borrows) = &self.func_facts.get(&target_instance) else {
+                    let Some(callee_borrows) = &self.func_facts.get(&target_instance_mono) else {
                         // This could happen if the optimized MIR reveals that a given function is
                         // unreachable.
                         continue;
@@ -415,7 +406,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                     let bb = &mut bbs[target];
 
-                    let Some(target_facts) = &self.func_facts.get(&target_instance) else {
+                    let Some(target_facts) = &self.func_facts.get(&target_instance_mono) else {
                         continue;
                     };
                     let target_facts = target_facts.as_ref().unwrap();
@@ -430,13 +421,33 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         // Compute the type as which the function result is going to be bound.
                         let mapped_region = find_region_with_name(
                             tcx,
-                            target_fn_ty_totally_generic.output(),
+                            // N.B. we need to use the monomorphized ID since the non-monomorphized
+                            //  ID could just be the parent trait function def, which won't have the
+                            //  user's regions.
+                            tcx.type_of(target_instance_mono.def_id())
+                                .skip_binder()
+                                // FIXME: This might be a closure.
+                                .fn_sig(tcx)
+                                .skip_binder()
+                                .output(),
                             *lt_id,
                         )
                         .unwrap();
 
                         let mut var_assignments = FxHashMap::default();
                         var_assignments.insert(mapped_region, BoundVar::from_usize(0));
+
+                        let target_fn_out_ty_semi_generic_intact_regions =
+                            instantiate_ignoring_regions(
+                                tcx,
+                                tcx.type_of(target_instance_no_mono.def_id())
+                                    .skip_binder()
+                                    // FIXME: This might be a closure.
+                                    .fn_sig(tcx)
+                                    .skip_binder()
+                                    .output(),
+                                target_instance_no_mono.args,
+                            );
 
                         let fn_result = target_fn_out_ty_semi_generic_intact_regions.fold_with(
                             &mut RegionFolder::new(tcx, &mut |region, index| {
