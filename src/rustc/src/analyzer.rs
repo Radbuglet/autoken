@@ -16,8 +16,8 @@ use rustc_middle::{
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Region, RegionKind, Ty, TyCtxt,
-        TyKind, TypeAndMut, TypeFoldable, UniverseIndex, UserType, ValTree, Variance,
+        GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
+        TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -733,20 +733,23 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            let lt_id =
-                Self::is_special_func(tcx, target_instance.def_id()).map(|_| match target_instance
-                    .args[0]
-                    .as_const()
-                    .unwrap()
-                    .eval(tcx, ParamEnv::reveal_all(), None)
-                    .unwrap()
-                {
-                    ValTree::Leaf(scalar) => scalar.try_to_u32().unwrap(),
-                    _ => unreachable!(),
-                });
+            let lt_id = Self::is_special_func(tcx, target_instance.def_id()).map(|_| {
+                let param = target_instance.args[0].as_type().unwrap();
+                if param.is_unit() {
+                    return None;
+                }
+
+                let first_field = param.ty_adt_def().unwrap().all_fields().next().unwrap();
+                let first_field = tcx.type_of(first_field.did).skip_binder();
+                let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind() else {
+                    unreachable!();
+                };
+
+                Some(first_field.get_name().unwrap())
+            });
 
             for (borrow_key, (borrow_mut, _)) in &target_facts.borrows {
-                let (curr_mut, curr_idx) = borrows
+                let (curr_mut, curr_lt) = borrows
                     .entry(*borrow_key)
                     .or_insert((Mutability::Not, None));
 
@@ -754,8 +757,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     *curr_mut = Mutability::Mut;
                 }
 
-                if let Some(lt_id) = lt_id.filter(|idx| *idx != u32::MAX) {
-                    *curr_idx = Some(Symbol::intern(&format!("'autoken_{lt_id}")));
+                if let Some(Some(lt_id)) = lt_id {
+                    *curr_lt = Some(lt_id);
                 }
             }
         }

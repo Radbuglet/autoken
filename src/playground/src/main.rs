@@ -4,7 +4,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use util::obj::{DynObj, Obj, __autoken_declare_tied_ref};
+use util::obj::{DynObj, Obj};
 
 pub mod util;
 
@@ -41,7 +41,7 @@ impl<T> Component<T> {
     }
 
     pub fn render<'autoken_0>(mut self: Obj<Self>) -> &'autoken_0 T {
-        __autoken_declare_tied_ref::<0, Self>();
+        autoken::tie!('autoken_0 => ref Self);
 
         if self.cache.is_none() {
             let rendered = (self.renderer.clone())(self);
