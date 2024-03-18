@@ -1,52 +1,67 @@
 #![feature(arbitrary_self_types)]
+#![feature(ptr_metadata)]
+#![feature(unsize)]
+
+use std::{collections::HashSet, sync::Arc};
+
+use util::obj::{DynObj, Obj, __autoken_declare_tied_ref};
 
 pub mod util;
 
-use util::obj::Obj;
-
 fn main() {
-    let a = Obj::new(LinkedList::new(1));
-    let b = Obj::new(LinkedList::new(2));
-    let c = Obj::new(LinkedList::new(3));
-
-    a.insert_right(b);
-    b.insert_right(c);
-    a.iter_right(|val| {
-        *val += 1;
-        dbg!(*val);
-    });
+    let comp2 = Obj::new(Component::new(|_| 2));
+    let comp = Obj::new(Component::new(|_| {
+        eprintln!("Computed!");
+        3
+    }));
+    dbg!(comp.render());
+    dbg!(comp.render());
+    comp.mark_dep(comp2);
+    comp2.mark_dirty();
+    dbg!(comp.render());
 }
 
-pub struct LinkedList<T: 'static> {
-    prev: Option<Obj<Self>>,
-    next: Option<Obj<Self>>,
-    value: T,
+pub trait AnyComponent {
+    fn mark_dirty(&self);
 }
 
-impl<T: 'static> LinkedList<T> {
-    pub fn new(value: T) -> Self {
+pub struct Component<T: 'static> {
+    dependents: HashSet<DynObj<dyn AnyComponent>>,
+    cache: Option<T>,
+    renderer: Arc<dyn Send + Sync + Fn(Obj<Self>) -> T>,
+}
+
+impl<T> Component<T> {
+    pub fn new(renderer: impl 'static + Send + Sync + Fn(Obj<Self>) -> T) -> Self {
         Self {
-            prev: None,
-            next: None,
-            value,
+            dependents: HashSet::default(),
+            cache: None,
+            renderer: Arc::new(renderer),
         }
     }
 
-    pub fn insert_right(mut self: Obj<Self>, mut node: Obj<Self>) {
-        if let Some(mut next) = node.next {
-            next.prev = Some(node);
+    pub fn render<'autoken_0>(mut self: Obj<Self>) -> &'autoken_0 T {
+        __autoken_declare_tied_ref::<0, Self>();
+
+        if self.cache.is_none() {
+            let rendered = (self.renderer.clone())(self);
+            self.cache = Some(rendered);
         }
-        node.next = self.next;
-        node.prev = Some(self);
-        self.next = Some(node);
+
+        Obj::get(self).cache.as_ref().unwrap()
     }
 
-    pub fn iter_right(mut self: Obj<Self>, mut f: impl FnMut(&mut T)) {
-        f(&mut self.value);
+    pub fn mark_dep<V>(self: Obj<Self>, mut other: Obj<Component<V>>) {
+        other.dependents.insert(DynObj::new(self));
+    }
+}
 
-        while let Some(next) = self.next {
-            self = next;
-            f(&mut self.value);
+impl<T> AnyComponent for Obj<Component<T>> {
+    fn mark_dirty(&self) {
+        let mut me = *self;
+        me.cache = None;
+        for dep in std::mem::take(&mut me.dependents) {
+            dep.mark_dirty();
         }
     }
 }

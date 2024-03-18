@@ -165,7 +165,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 // Initialize the tokens and ascribe them their types.
                 let source_info = SourceInfo {
-                    span: DUMMY_SP,
+                    span: body.span,
                     // FIXME: This probably isn't a good idea.
                     scope: SourceScope::from_u32(0),
                 };
