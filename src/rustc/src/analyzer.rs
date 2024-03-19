@@ -14,14 +14,18 @@ use rustc_middle::{
         UserTypeProjection,
     },
     ty::{
-        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
+        adjustment::PointerCoercion,
+        fold::{FnMutDelegate, RegionFolder},
+        BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
-        TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
+        EarlyBinder, GenericArg, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv,
+        Region, RegionKind, Ty, TyCtxt, TyKind, TypeAndMut, TypeFoldable, UniverseIndex, UserType,
+        Variance, VtblEntry,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
+use rustc_trait_selection::traits::supertraits;
 
 use crate::{
     analyzer::sym::unnamed,
@@ -33,8 +37,8 @@ use crate::{
         },
         hash::FxHashMap,
         mir::{
-            find_region_with_name, get_static_callee_from_terminator, safeishly_grab_def_id_mir,
-            safeishly_grab_instance_mir, MirGrabResult,
+            find_region_with_name, get_static_callee_from_terminator, get_unsized_ty,
+            safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
         ty::instantiate_ignoring_regions,
     },
@@ -113,7 +117,125 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
 
         // Check for undeclared unsizing.
-        // TODO
+        for instance in self.func_facts.keys().copied() {
+            let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
+                return;
+            };
+
+            for bb in body.basic_blocks.iter() {
+                for stmt in bb.statements.iter() {
+                    let StatementKind::Assign(stmt) = &stmt.kind else {
+                        continue;
+                    };
+                    let (_place, rvalue) = &**stmt;
+
+                    let Rvalue::Cast(CastKind::PointerCoercion(kind), from_op, to_ty) = rvalue
+                    else {
+                        continue;
+                    };
+
+                    let from_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(from_op.ty(&body.local_decls, tcx)),
+                    );
+
+                    let to_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(*to_ty),
+                    );
+
+                    match kind {
+                        PointerCoercion::ReifyFnPointer => {
+                            let TyKind::FnDef(def, generics) = from_ty.kind() else {
+                                unreachable!()
+                            };
+
+                            let instance = Instance::expect_resolve(
+                                tcx,
+                                ParamEnv::reveal_all(),
+                                *def,
+                                generics,
+                            );
+
+                            self.ensure_erasure_is_valid(tcx, instance);
+                        }
+                        PointerCoercion::ClosureFnPointer(_) => {
+                            let TyKind::Closure(def, generics) = from_ty.kind() else {
+                                unreachable!()
+                            };
+
+                            let instance = Instance::expect_resolve(
+                                tcx,
+                                ParamEnv::reveal_all(),
+                                *def,
+                                generics,
+                            );
+
+                            self.ensure_erasure_is_valid(tcx, instance);
+                        }
+                        PointerCoercion::Unsize => {
+                            // Finds the type the coercion actually changed.
+                            let (from_ty, to_ty) = get_unsized_ty(tcx, from_ty, to_ty);
+
+                            // Ensures that we're analyzing a dynamic type unsizing coercion.
+                            let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
+                                continue;
+                            };
+
+                            // Extract the principal non-auto-type from the dynamic type.
+                            let Some(binder) = binders.principal() else {
+                                continue;
+                            };
+
+                            // Do some magic with binders... I guess.
+                            let base_binder = tcx.erase_regions(binder.with_self_ty(tcx, to_ty));
+
+                            for binder in supertraits(tcx, base_binder) {
+                                let trait_id = tcx.replace_bound_vars_uncached(
+                                    binder,
+                                    FnMutDelegate {
+                                        regions: &mut |_re| tcx.lifetimes.re_erased,
+                                        types: &mut |_| unreachable!(),
+                                        consts: &mut |_, _| unreachable!(),
+                                    },
+                                );
+
+                                // Get the actual methods which make up the trait's vtable since those are
+                                // the things we can actually call.
+                                let vtable_entries = tcx.vtable_entries(binder);
+
+                                for vtable_entry in vtable_entries {
+                                    let VtblEntry::Method(vtbl_method) = vtable_entry else {
+                                        continue;
+                                    };
+
+                                    // Now, get the concrete implementation of this method.
+                                    let concrete = Instance::expect_resolve(
+                                        tcx,
+                                        ParamEnv::reveal_all(),
+                                        vtbl_method.def_id(),
+                                        tcx.mk_args(
+                                            [GenericArg::from(from_ty)]
+                                                .into_iter()
+                                                .chain(trait_id.args.iter().skip(1))
+                                                .collect::<Vec<_>>()
+                                                .as_slice(),
+                                        ),
+                                    );
+
+                                    // Add it to the set and recurse into it to ensure its latent dynamic
+                                    // coercions are also captured.
+                                    self.ensure_erasure_is_valid(tcx, concrete);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // Generate shadow functions for each locally-visited function.
         assert!(!tcx.untracked().definitions.is_frozen());
@@ -674,6 +796,21 @@ impl<'tcx> AnalysisDriver<'tcx> {
         for shadow in shadows {
             // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
             let _ = tcx.mir_borrowck(shadow.def_id());
+        }
+    }
+
+    fn ensure_erasure_is_valid(&self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
+        let Some(facts) = self.func_facts.get(&instance) else {
+            return;
+        };
+
+        let facts = facts.as_ref().unwrap();
+
+        if !facts.borrows.is_empty() {
+            tcx.sess.dcx().span_err(
+                tcx.def_span(instance.def_id()),
+                "Cannot unsize this function as it accesses global tokens.",
+            );
         }
     }
 
