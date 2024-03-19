@@ -15,14 +15,14 @@ pub struct Obj<T: 'static> {
 }
 
 impl<T> Obj<T> {
-    pub fn get<'autoken_0>(self) -> &'autoken_0 T {
+    pub fn get<'autoken_0>(me: Self) -> &'autoken_0 T {
         autoken::tie!('autoken_0 => ref T);
-        unsafe { &*self.value.get() }
+        unsafe { &*me.value.get() }
     }
 
-    pub fn get_mut<'autoken_0>(self) -> &'autoken_0 mut T {
+    pub fn get_mut<'autoken_0>(me: Self) -> &'autoken_0 mut T {
         autoken::tie!('autoken_0 => mut T);
-        unsafe { &mut *self.value.get() }
+        unsafe { &mut *me.value.get() }
     }
 }
 

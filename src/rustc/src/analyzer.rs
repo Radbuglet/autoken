@@ -14,18 +14,14 @@ use rustc_middle::{
         UserTypeProjection,
     },
     ty::{
-        adjustment::PointerCoercion,
-        fold::{FnMutDelegate, RegionFolder},
-        BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
+        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
         CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        EarlyBinder, GenericArg, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv,
-        Region, RegionKind, Ty, TyCtxt, TyKind, TypeAndMut, TypeFoldable, UniverseIndex, UserType,
-        Variance, VtblEntry,
+        GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
+        TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
-use rustc_trait_selection::traits::supertraits;
 
 use crate::{
     analyzer::sym::unnamed,
@@ -37,7 +33,7 @@ use crate::{
         },
         hash::FxHashMap,
         mir::{
-            find_region_with_name, get_static_callee_from_terminator, get_unsized_ty,
+            find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
         ty::instantiate_ignoring_regions,
@@ -122,119 +118,16 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 return;
             };
 
-            for bb in body.basic_blocks.iter() {
-                for stmt in bb.statements.iter() {
-                    let StatementKind::Assign(stmt) = &stmt.kind else {
-                        continue;
-                    };
-                    let (_place, rvalue) = &**stmt;
+            for_each_unsized_func(tcx, instance, body, |instance| {
+                let facts = self.func_facts[&instance].as_ref().unwrap();
 
-                    let Rvalue::Cast(CastKind::PointerCoercion(kind), from_op, to_ty) = rvalue
-                    else {
-                        continue;
-                    };
-
-                    let from_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        EarlyBinder::bind(from_op.ty(&body.local_decls, tcx)),
+                if !facts.borrows.is_empty() {
+                    tcx.sess.dcx().span_err(
+                        tcx.def_span(instance.def_id()),
+                        "Cannot unsize this function as it accesses global tokens.",
                     );
-
-                    let to_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        EarlyBinder::bind(*to_ty),
-                    );
-
-                    match kind {
-                        PointerCoercion::ReifyFnPointer => {
-                            let TyKind::FnDef(def, generics) = from_ty.kind() else {
-                                unreachable!()
-                            };
-
-                            let instance = Instance::expect_resolve(
-                                tcx,
-                                ParamEnv::reveal_all(),
-                                *def,
-                                generics,
-                            );
-
-                            self.ensure_erasure_is_valid(tcx, instance);
-                        }
-                        PointerCoercion::ClosureFnPointer(_) => {
-                            let TyKind::Closure(def, generics) = from_ty.kind() else {
-                                unreachable!()
-                            };
-
-                            let instance = Instance::expect_resolve(
-                                tcx,
-                                ParamEnv::reveal_all(),
-                                *def,
-                                generics,
-                            );
-
-                            self.ensure_erasure_is_valid(tcx, instance);
-                        }
-                        PointerCoercion::Unsize => {
-                            // Finds the type the coercion actually changed.
-                            let (from_ty, to_ty) = get_unsized_ty(tcx, from_ty, to_ty);
-
-                            // Ensures that we're analyzing a dynamic type unsizing coercion.
-                            let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
-                                continue;
-                            };
-
-                            // Extract the principal non-auto-type from the dynamic type.
-                            let Some(binder) = binders.principal() else {
-                                continue;
-                            };
-
-                            // Do some magic with binders... I guess.
-                            let base_binder = tcx.erase_regions(binder.with_self_ty(tcx, to_ty));
-
-                            for binder in supertraits(tcx, base_binder) {
-                                let trait_id = tcx.replace_bound_vars_uncached(
-                                    binder,
-                                    FnMutDelegate {
-                                        regions: &mut |_re| tcx.lifetimes.re_erased,
-                                        types: &mut |_| unreachable!(),
-                                        consts: &mut |_, _| unreachable!(),
-                                    },
-                                );
-
-                                // Get the actual methods which make up the trait's vtable since those are
-                                // the things we can actually call.
-                                let vtable_entries = tcx.vtable_entries(binder);
-
-                                for vtable_entry in vtable_entries {
-                                    let VtblEntry::Method(vtbl_method) = vtable_entry else {
-                                        continue;
-                                    };
-
-                                    // Now, get the concrete implementation of this method.
-                                    let concrete = Instance::expect_resolve(
-                                        tcx,
-                                        ParamEnv::reveal_all(),
-                                        vtbl_method.def_id(),
-                                        tcx.mk_args(
-                                            [GenericArg::from(from_ty)]
-                                                .into_iter()
-                                                .chain(trait_id.args.iter().skip(1))
-                                                .collect::<Vec<_>>()
-                                                .as_slice(),
-                                        ),
-                                    );
-
-                                    // Add it to the set and recurse into it to ensure its latent dynamic
-                                    // coercions are also captured.
-                                    self.ensure_erasure_is_valid(tcx, concrete);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
                 }
-            }
+            });
         }
 
         // Generate shadow functions for each locally-visited function.
@@ -799,21 +692,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
     }
 
-    fn ensure_erasure_is_valid(&self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
-        let Some(facts) = self.func_facts.get(&instance) else {
-            return;
-        };
-
-        let facts = facts.as_ref().unwrap();
-
-        if !facts.borrows.is_empty() {
-            tcx.sess.dcx().span_err(
-                tcx.def_span(instance.def_id()),
-                "Cannot unsize this function as it accesses global tokens.",
-            );
-        }
-    }
-
     // FIXME: Ensure that facts collected after a self-recursive function was analyzed are also
     //  propagated to it.
     fn analyze_fn_facts(&mut self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
@@ -842,6 +720,12 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // This is a real function so let's add it to the fact map.
         entry.insert(None);
+
+        // Ensure that we analyze the facts of each unsized function since unsize-checking depends
+        // on this information being available.
+        for_each_unsized_func(tcx, instance, body, |instance| {
+            self.analyze_fn_facts(tcx, instance)
+        });
 
         // See who the function may call and where.
         let mut borrows = FxHashMap::default();

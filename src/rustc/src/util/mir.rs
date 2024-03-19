@@ -4,13 +4,16 @@ use rustc_data_structures::steal::Steal;
 use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::{Body, Local, LocalDecl, Operand},
+    mir::{Body, CastKind, Local, LocalDecl, Operand, Rvalue, StatementKind},
     ty::{
-        fold::RegionFolder, EarlyBinder, Instance, InstanceDef, ParamEnv, Region, Ty, TyCtxt,
-        TyKind, TypeAndMut, TypeFoldable,
+        adjustment::PointerCoercion,
+        fold::{FnMutDelegate, RegionFolder},
+        EarlyBinder, GenericArg, Instance, InstanceDef, ParamEnv, Region, Ty, TyCtxt, TyKind,
+        TypeAndMut, TypeFoldable, VtblEntry,
     },
 };
 use rustc_span::Symbol;
+use rustc_trait_selection::traits::supertraits;
 
 // === Misc === //
 
@@ -221,5 +224,116 @@ pub fn get_unsized_ty<'tcx>(
 
         // Identity unsizing
         _ => (from_ty, to_ty),
+    }
+}
+
+pub fn for_each_unsized_func<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    body: &Body<'tcx>,
+    mut f: impl FnMut(Instance<'tcx>),
+) {
+    for bb in body.basic_blocks.iter() {
+        for stmt in bb.statements.iter() {
+            let StatementKind::Assign(stmt) = &stmt.kind else {
+                continue;
+            };
+            let (_place, rvalue) = &**stmt;
+
+            let Rvalue::Cast(CastKind::PointerCoercion(kind), from_op, to_ty) = rvalue else {
+                continue;
+            };
+
+            let from_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                ParamEnv::reveal_all(),
+                EarlyBinder::bind(from_op.ty(&body.local_decls, tcx)),
+            );
+
+            let to_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                ParamEnv::reveal_all(),
+                EarlyBinder::bind(*to_ty),
+            );
+
+            match kind {
+                PointerCoercion::ReifyFnPointer => {
+                    let TyKind::FnDef(def, generics) = from_ty.kind() else {
+                        unreachable!()
+                    };
+
+                    f(Instance::expect_resolve(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        *def,
+                        generics,
+                    ));
+                }
+                PointerCoercion::ClosureFnPointer(_) => {
+                    let TyKind::Closure(def, generics) = from_ty.kind() else {
+                        unreachable!()
+                    };
+
+                    f(Instance::expect_resolve(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        *def,
+                        generics,
+                    ));
+                }
+                PointerCoercion::Unsize => {
+                    // Finds the type the coercion actually changed.
+                    let (from_ty, to_ty) = get_unsized_ty(tcx, from_ty, to_ty);
+
+                    // Ensures that we're analyzing a dynamic type unsizing coercion.
+                    let TyKind::Dynamic(binders, ..) = to_ty.kind() else {
+                        continue;
+                    };
+
+                    // Extract the principal non-auto-type from the dynamic type.
+                    let Some(binder) = binders.principal() else {
+                        continue;
+                    };
+
+                    // Do some magic with binders... I guess.
+                    let base_binder = tcx.erase_regions(binder.with_self_ty(tcx, to_ty));
+
+                    for binder in supertraits(tcx, base_binder) {
+                        let trait_id = tcx.replace_bound_vars_uncached(
+                            binder,
+                            FnMutDelegate {
+                                regions: &mut |_re| tcx.lifetimes.re_erased,
+                                types: &mut |_| unreachable!(),
+                                consts: &mut |_, _| unreachable!(),
+                            },
+                        );
+
+                        // Get the actual methods which make up the trait's vtable since those are
+                        // the things we can actually call.
+                        let vtable_entries = tcx.vtable_entries(binder);
+
+                        for vtable_entry in vtable_entries {
+                            let VtblEntry::Method(vtbl_method) = vtable_entry else {
+                                continue;
+                            };
+
+                            f(Instance::expect_resolve(
+                                tcx,
+                                ParamEnv::reveal_all(),
+                                vtbl_method.def_id(),
+                                tcx.mk_args(
+                                    [GenericArg::from(from_ty)]
+                                        .into_iter()
+                                        .chain(trait_id.args.iter().skip(1))
+                                        .collect::<Vec<_>>()
+                                        .as_slice(),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }

@@ -10,10 +10,12 @@ pub mod util;
 
 fn main() {
     let comp2 = Obj::new(Component::new(|_| 2));
-    let comp = Obj::new(Component::new(|_| {
+    let comp = Obj::new(Component::new(move |_| {
+        comp2.render();
         eprintln!("Computed!");
         3
     }));
+
     dbg!(comp.render());
     dbg!(comp.render());
     comp.mark_dep(comp2);
@@ -28,11 +30,11 @@ pub trait AnyComponent {
 pub struct Component<T: 'static> {
     dependents: HashSet<DynObj<dyn AnyComponent>>,
     cache: Option<T>,
-    renderer: Arc<dyn Send + Sync + Fn(Obj<Self>) -> T>,
+    renderer: Arc<dyn Fn(Obj<Self>) -> T>,
 }
 
 impl<T> Component<T> {
-    pub fn new(renderer: impl 'static + Send + Sync + Fn(Obj<Self>) -> T) -> Self {
+    pub fn new(renderer: impl 'static + Fn(Obj<Self>) -> T) -> Self {
         Self {
             dependents: HashSet::default(),
             cache: None,
