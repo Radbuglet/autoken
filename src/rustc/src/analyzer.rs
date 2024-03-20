@@ -15,7 +15,7 @@ use rustc_middle::{
     },
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
+        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, FnSig,
         GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
         TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
@@ -31,12 +31,15 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
-        hash::FxHashMap,
+        hash::{FxHashMap, FxHashSet},
         mir::{
             find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
-        ty::instantiate_ignoring_regions,
+        ty::{
+            enumerate_named_types, get_fn_sig_maybe_closure, get_instance_sig_maybe_closure,
+            instantiate_ignoring_regions,
+        },
     },
 };
 
@@ -123,9 +126,12 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     return;
                 };
 
+                let instance_sig = get_instance_sig_maybe_closure(tcx, instance);
+                let exemptions = Self::parse_sig_borrowing_except(instance_sig.skip_binder());
+
                 let facts = facts.as_ref().unwrap();
 
-                if !facts.borrows.is_empty() {
+                if !facts.borrows.is_empty() && exemptions.is_none() {
                     tcx.sess.dcx().span_err(
                         tcx.def_span(instance.def_id()),
                         "Cannot unsize this function as it accesses global tokens.",
@@ -227,7 +233,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         // Find the lifetime
                         let found_region = find_region_with_name(
                             tcx,
-                            tcx.fn_sig(orig_id).skip_binder().skip_binder().output(),
+                            get_fn_sig_maybe_closure(tcx, orig_id.to_def_id())
+                                .skip_binder()
+                                .skip_binder()
+                                .output(),
                             *lt_id,
                         )
                         .unwrap();
@@ -443,10 +452,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             // N.B. we need to use the monomorphized ID since the non-monomorphized
                             //  ID could just be the parent trait function def, which won't have the
                             //  user's regions.
-                            tcx.type_of(target_instance_mono.def_id())
+                            get_fn_sig_maybe_closure(tcx, target_instance_mono.def_id())
                                 .skip_binder()
-                                // FIXME: This might be a closure.
-                                .fn_sig(tcx)
                                 .skip_binder()
                                 .output(),
                             *lt_id,
@@ -459,10 +466,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         let target_fn_out_ty_semi_generic_intact_regions =
                             instantiate_ignoring_regions(
                                 tcx,
-                                tcx.type_of(target_instance_no_mono.def_id())
+                                get_fn_sig_maybe_closure(tcx, target_instance_no_mono.def_id())
                                     .skip_binder()
-                                    // FIXME: This might be a closure.
-                                    .fn_sig(tcx)
                                     .skip_binder()
                                     .output(),
                                 target_instance_no_mono.args,
@@ -792,12 +797,49 @@ impl<'tcx> AnalysisDriver<'tcx> {
             .insert(instance, Some(FuncFacts { borrows }));
     }
 
-    fn is_special_func(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Mutability> {
+    fn is_special_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Mutability> {
         match tcx.opt_item_name(def_id) {
             v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
             v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
             _ => None,
         }
+    }
+
+    fn is_borrowing_except_marker(ty: Ty<'tcx>) -> Option<&'tcx List<Ty<'tcx>>> {
+        let TyKind::Adt(def, generics) = ty.kind() else {
+            return None;
+        };
+
+        let field = def.all_fields().next()?;
+
+        if field.name != sym::__autoken_borrows_all_except_field_indicator.get() {
+            return None;
+        }
+
+        Some(generics[0].as_type().unwrap().tuple_fields())
+    }
+
+    fn parse_sig_borrowing_except(sig: FnSig<'tcx>) -> Option<FxHashSet<Ty<'tcx>>> {
+        let mut exceptions = FxHashSet::default();
+        let mut had_exception = false;
+
+        for input in sig.inputs() {
+            enumerate_named_types(*input, |ty| {
+                let Some(ty_exceptions) = Self::is_borrowing_except_marker(ty) else {
+                    return;
+                };
+
+                had_exception |= true;
+
+                for exception in ty_exceptions {
+                    if Self::is_borrowing_except_marker(exception).is_none() {
+                        exceptions.insert(exception);
+                    }
+                }
+            });
+        }
+
+        had_exception.then_some(exceptions)
     }
 }
 
@@ -810,6 +852,9 @@ mod sym {
 
     pub static __autoken_declare_tied_mut: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_mut");
+
+    pub static __autoken_borrows_all_except_field_indicator: CachedSymbol =
+        CachedSymbol::new("__autoken_borrows_all_except_field_indicator");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }

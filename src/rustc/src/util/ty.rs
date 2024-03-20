@@ -1,12 +1,62 @@
 // Adapted from rustc_middle/src/ty/generic_args.rs
 
+use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
     ty::{
-        self, GenericArg, GenericArgKind, ParamConst, Ty, TyCtxt, TypeFoldable, TypeFolder,
-        TypeSuperFoldable, TypeVisitableExt,
+        self, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, Instance, ParamConst, Ty,
+        TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
+        TypeVisitable, TypeVisitableExt, TypeVisitor,
     },
 };
+
+pub fn enumerate_named_types<'tcx>(ty: Ty<'tcx>, f: impl FnMut(Ty<'tcx>)) {
+    struct MyVisitor<F>(F);
+
+    impl<'tcx, F> TypeVisitor<TyCtxt<'tcx>> for MyVisitor<F>
+    where
+        F: FnMut(Ty<'tcx>),
+    {
+        type Result = ();
+
+        fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
+            self.0(t);
+            t.super_visit_with(self)
+        }
+    }
+
+    ty.visit_with(&mut MyVisitor(f))
+}
+
+pub fn get_instance_sig_maybe_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Binder<'tcx, FnSig<'tcx>> {
+    get_fn_sig_maybe_closure(tcx, instance.def_id()).instantiate(tcx, instance.args)
+}
+
+pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {
+    match tcx.type_of(def_id).skip_binder().kind() {
+        TyKind::Closure(_, args) => {
+            let sig = args.as_closure().sig();
+
+            EarlyBinder::bind(sig.map_bound(|sig| {
+                let inputs = sig.inputs();
+                assert_eq!(inputs.len(), 1);
+                let inputs = &inputs[0].tuple_fields();
+
+                FnSig {
+                    inputs_and_output: tcx
+                        .mk_type_list_from_iter(inputs.iter().chain([sig.output()])),
+                    c_variadic: sig.c_variadic,
+                    unsafety: sig.unsafety,
+                    abi: sig.abi,
+                }
+            }))
+        }
+        _ => tcx.fn_sig(def_id),
+    }
+}
 
 pub fn instantiate_ignoring_regions<'tcx>(
     tcx: TyCtxt<'tcx>,
