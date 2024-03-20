@@ -54,6 +54,7 @@ pub struct AnalysisDriver<'tcx> {
 #[derive(Debug)]
 struct FuncFacts<'tcx> {
     borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
+    borrows_all_except: Option<FxHashSet<Ty<'tcx>>>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -118,7 +119,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Check for undeclared unsizing.
         for instance in self.func_facts.keys().copied() {
             let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-                return;
+                continue;
             };
 
             for_each_unsized_func(tcx, instance, body, |instance| {
@@ -131,10 +132,37 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 let facts = facts.as_ref().unwrap();
 
-                if !facts.borrows.is_empty() && exemptions.is_none() {
+                if let Some(exemptions) = exemptions {
+                    if facts.borrows.values().any(|v| v.1.is_some()) {
+                        tcx.sess.dcx().span_err(
+                            tcx.def_span(instance.def_id()),
+                            "output of an unsized function cannot be tied to a lifetime",
+                        );
+                    }
+
+                    for exemption in &exemptions {
+                        if facts.borrows.contains_key(exemption) {
+                            tcx.sess.dcx().span_err(
+                                tcx.def_span(instance.def_id()),
+                                format!("the exemption signature promises not to borrow {exemption:?} but borrows it anyways"),
+                            );
+                        }
+
+                        if facts
+                            .borrows_all_except
+                            .as_ref()
+                            .is_some_and(|v| !v.contains(exemption))
+                        {
+                            tcx.sess.dcx().span_err(
+                                tcx.def_span(instance.def_id()),
+                                format!("this function calls another dynamic function which does not promise not to borrow {exemption:?}"),
+                            );
+                        }
+                    }
+                } else if !facts.borrows.is_empty() {
                     tcx.sess.dcx().span_err(
                         tcx.def_span(instance.def_id()),
-                        "Cannot unsize this function as it accesses global tokens.",
+                        "cannot unsize this function as it accesses global tokens",
                     );
                 }
             });
@@ -173,17 +201,12 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 let token_locals = facts
                     .borrows
-                    .iter()
-                    .map(|(key, (mutability, _))| {
+                    .keys()
+                    .map(|key| {
                         (
                             *key,
-                            body.local_decls.push(LocalDecl::new(
-                                match mutability {
-                                    Mutability::Not => token_ref_imm_ty,
-                                    Mutability::Mut => token_ref_mut_ty,
-                                },
-                                DUMMY_SP,
-                            )),
+                            body.local_decls
+                                .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
                         )
                     })
                     .collect::<FxHashMap<_, _>>();
@@ -194,6 +217,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     // FIXME: This probably isn't a good idea.
                     scope: SourceScope::from_u32(0),
                 };
+
                 let mut start_stmts = Vec::new();
                 start_stmts.extend([Statement {
                     source_info,
@@ -221,13 +245,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 }]);
 
                 for (key, &local) in &token_locals {
-                    let (mutability, lt_id) = &facts.borrows[key];
-                    let borrow_kind = match mutability {
-                        Mutability::Not => BorrowKind::Shared,
-                        Mutability::Mut => BorrowKind::Mut {
-                            kind: MutBorrowKind::Default,
-                        },
-                    };
+                    let (_, lt_id) = &facts.borrows[key];
 
                     if let Some(lt_id) = lt_id {
                         // Find the lifetime
@@ -249,7 +267,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                             tcx,
                                             found_region,
                                             TypeAndMut {
-                                                mutbl: *mutability,
+                                                mutbl: Mutability::Mut,
                                                 ty: tcx.types.unit,
                                             },
                                         )),
@@ -257,10 +275,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                         variables: List::empty(),
                                     }),
                                     span: DUMMY_SP,
-                                    inferred_ty: match mutability {
-                                        Mutability::Not => token_ref_imm_ty,
-                                        Mutability::Mut => token_ref_mut_ty,
-                                    },
+                                    inferred_ty: token_ref_mut_ty,
                                 });
 
                         start_stmts.extend([
@@ -273,7 +288,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     },
                                     Rvalue::Ref(
                                         tcx.lifetimes.re_erased,
-                                        borrow_kind,
+                                        BorrowKind::Mut {
+                                            kind: MutBorrowKind::Default,
+                                        },
                                         Place {
                                             local: dangling_addr_local,
                                             projection: tcx
@@ -328,7 +345,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     },
                                     Rvalue::Ref(
                                         tcx.lifetimes.re_erased,
-                                        borrow_kind,
+                                        BorrowKind::Mut {
+                                            kind: MutBorrowKind::Default,
+                                        },
                                         Place {
                                             local: unit_holder,
                                             projection: List::empty(),
@@ -364,6 +383,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         continue;
                     };
 
+                    // FIXME: Here too!
                     let Some(target_instance_mono) =
                         get_static_callee_from_terminator(tcx, instance, &body.local_decls, callee)
                     else {
@@ -391,7 +411,18 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     let callee_borrows = callee_borrows.as_ref().unwrap();
 
                     // Add borrow directives before the function.
-                    for (ty, (mutability, _)) in &callee_borrows.borrows {
+                    let ensure_not_borrowed = callee_borrows
+                        .borrows
+                        .iter()
+                        .map(|(ty, (mutbl, _))| (*ty, *mutbl))
+                        .chain(callee_borrows.borrows_all_except.iter().flat_map(|set| {
+                            token_locals
+                                .keys()
+                                .filter(|ty| !set.contains(ty))
+                                .map(|ty| (*ty, Mutability::Mut))
+                        }));
+
+                    for (ty, mutability) in ensure_not_borrowed {
                         let dummy_token_holder = match mutability {
                             Mutability::Not => body
                                 .local_decls
@@ -417,7 +448,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                         },
                                     },
                                     Place {
-                                        local: token_locals[ty],
+                                        local: token_locals[&ty],
                                         projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
                                     },
                                 ),
@@ -718,13 +749,24 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     instance.args[1].as_type().unwrap(),
                     (hardcoded_mut, None),
                 )]),
+                borrows_all_except: None,
             }));
             return;
         }
 
         // Acquire the function body.
-        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-            return;
+        let body = match safeishly_grab_instance_mir(tcx, instance.def) {
+            MirGrabResult::Found(body) => body,
+            MirGrabResult::Dynamic => {
+                entry.insert(Some(FuncFacts {
+                    borrows: FxHashMap::default(),
+                    borrows_all_except: Self::parse_sig_borrowing_except(
+                        get_instance_sig_maybe_closure(tcx, instance).skip_binder(),
+                    ),
+                }));
+                return;
+            }
+            MirGrabResult::BottomsOut => return,
         };
 
         // This is a real function so let's add it to the fact map.
@@ -738,6 +780,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // See who the function may call and where.
         let mut borrows = FxHashMap::default();
+        let mut borrows_all_except = None::<FxHashSet<_>>;
 
         for bb in body.basic_blocks.iter() {
             // If the terminator is a call terminator.
@@ -752,6 +795,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let Some(target_instance) =
                 get_static_callee_from_terminator(tcx, &instance, &body.local_decls, callee)
             else {
+                // FIXME: Handle these as well.
                 continue;
             };
 
@@ -762,6 +806,12 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let Some(Some(target_facts)) = &self.func_facts.get(&target_instance) else {
                 continue;
             };
+
+            if let Some(target_borrows_all_except) = &target_facts.borrows_all_except {
+                borrows_all_except
+                    .get_or_insert_with(FxHashSet::default)
+                    .extend(target_borrows_all_except.iter().copied());
+            }
 
             let lt_id = Self::is_special_func(tcx, target_instance.def_id()).map(|_| {
                 let param = target_instance.args[0].as_type().unwrap();
@@ -793,8 +843,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
             }
         }
 
-        self.func_facts
-            .insert(instance, Some(FuncFacts { borrows }));
+        self.func_facts.insert(
+            instance,
+            Some(FuncFacts {
+                borrows,
+                borrows_all_except,
+            }),
+        );
     }
 
     fn is_special_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Mutability> {

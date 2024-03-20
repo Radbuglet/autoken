@@ -21,12 +21,16 @@ fn main() {
     dbg!(comp.render());
     dbg!(comp.render());
     comp.mark_dep(comp2);
+
+    let demo = &*Obj::new(3u32);
     comp2.mark_dirty(BorrowsAllExcept::new());
+    let _ = demo;
+
     dbg!(comp.render());
 }
 
 pub trait AnyComponent {
-    fn mark_dirty(&self, _: BorrowsAllExcept);
+    fn mark_dirty(&self, _: BorrowsAllExcept<(u32,)>);
 }
 
 pub struct Component<T: 'static> {
@@ -44,8 +48,8 @@ impl<T> Component<T> {
         }
     }
 
-    pub fn render<'autoken_0>(mut self: Obj<Self>) -> &'autoken_0 T {
-        autoken::tie!('autoken_0 => ref Self);
+    pub fn render<'a>(mut self: Obj<Self>) -> &'a T {
+        autoken::tie!('a => ref Self);
 
         if self.cache.is_none() {
             let rendered = (self.renderer.clone())(BorrowsAllExcept::new(), self);
@@ -61,7 +65,7 @@ impl<T> Component<T> {
 }
 
 impl<T> AnyComponent for Obj<Component<T>> {
-    fn mark_dirty(&self, _: BorrowsAllExcept) {
+    fn mark_dirty(&self, _: BorrowsAllExcept<(u32,)>) {
         let mut me = *self;
         me.cache = None;
         for dep in std::mem::take(&mut me.dependents) {
