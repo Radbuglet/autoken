@@ -119,7 +119,11 @@ impl<'tcx> AnalysisDriver<'tcx> {
             };
 
             for_each_unsized_func(tcx, instance, body, |instance| {
-                let facts = self.func_facts[&instance].as_ref().unwrap();
+                let Some(facts) = self.func_facts.get(&instance) else {
+                    return;
+                };
+
+                let facts = facts.as_ref().unwrap();
 
                 if !facts.borrows.is_empty() {
                     tcx.sess.dcx().span_err(
@@ -724,7 +728,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Ensure that we analyze the facts of each unsized function since unsize-checking depends
         // on this information being available.
         for_each_unsized_func(tcx, instance, body, |instance| {
-            self.analyze_fn_facts(tcx, instance)
+            self.analyze_fn_facts(tcx, instance);
         });
 
         // See who the function may call and where.

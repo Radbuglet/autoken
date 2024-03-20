@@ -67,3 +67,17 @@ impl<T> AnyComponent for Obj<Component<T>> {
         }
     }
 }
+
+pub mod wgpu_bug_repro {
+    pub struct Error {}
+
+    pub trait UncapturedErrorHandler: Fn(Error) + Send + 'static {}
+
+    impl<T> UncapturedErrorHandler for T where T: Fn(Error) + Send + 'static {}
+
+    fn default_error_handler(err: Error) {}
+
+    pub fn demo() {
+        let foo: Box<dyn UncapturedErrorHandler> = Box::new(default_error_handler);
+    }
+}

@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
+use rustc_hash::FxHashMap;
 use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
@@ -298,8 +299,10 @@ pub fn for_each_unsized_func<'tcx>(
                     // Do some magic with binders... I guess.
                     let base_binder = tcx.erase_regions(binder.with_self_ty(tcx, to_ty));
 
+                    let mut super_trait_def_id_to_trait_ref = FxHashMap::default();
+
                     for binder in supertraits(tcx, base_binder) {
-                        let trait_id = tcx.replace_bound_vars_uncached(
+                        let trait_ref = tcx.replace_bound_vars_uncached(
                             binder,
                             FnMutDelegate {
                                 regions: &mut |_re| tcx.lifetimes.re_erased,
@@ -308,28 +311,33 @@ pub fn for_each_unsized_func<'tcx>(
                             },
                         );
 
-                        // Get the actual methods which make up the trait's vtable since those are
-                        // the things we can actually call.
-                        let vtable_entries = tcx.vtable_entries(binder);
+                        super_trait_def_id_to_trait_ref.insert(trait_ref.def_id, trait_ref);
+                    }
 
-                        for vtable_entry in vtable_entries {
-                            let VtblEntry::Method(vtbl_method) = vtable_entry else {
-                                continue;
-                            };
+                    // Get the actual methods which make up the trait's vtable since those are
+                    // the things we can actually call.
+                    let vtable_entries = tcx.vtable_entries(base_binder);
 
-                            f(Instance::expect_resolve(
-                                tcx,
-                                ParamEnv::reveal_all(),
-                                vtbl_method.def_id(),
-                                tcx.mk_args(
-                                    [GenericArg::from(from_ty)]
-                                        .into_iter()
-                                        .chain(trait_id.args.iter().skip(1))
-                                        .collect::<Vec<_>>()
-                                        .as_slice(),
-                                ),
-                            ));
-                        }
+                    for vtable_entry in vtable_entries {
+                        let VtblEntry::Method(vtbl_method) = vtable_entry else {
+                            continue;
+                        };
+
+                        let method_trait = tcx.trait_of_item(vtbl_method.def_id()).unwrap();
+                        let method_trait = &super_trait_def_id_to_trait_ref[&method_trait];
+
+                        f(Instance::expect_resolve(
+                            tcx,
+                            ParamEnv::reveal_all(),
+                            vtbl_method.def_id(),
+                            tcx.mk_args(
+                                [GenericArg::from(from_ty)]
+                                    .into_iter()
+                                    .chain(method_trait.args.iter().skip(1))
+                                    .collect::<Vec<_>>()
+                                    .as_slice(),
+                            ),
+                        ));
                     }
                 }
                 _ => {}
