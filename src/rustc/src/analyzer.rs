@@ -159,7 +159,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             );
                         }
                     }
-                } else if !facts.borrows.is_empty() {
+                } else if !facts.borrows.is_empty() || facts.borrows_all_except.is_some() {
                     tcx.sess.dcx().span_err(
                         tcx.def_span(instance.def_id()),
                         "cannot unsize this function as it accesses global tokens",
