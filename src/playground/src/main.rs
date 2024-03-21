@@ -23,7 +23,7 @@ fn main() {
     comp.mark_dep(comp2);
 
     let demo = &*Obj::new(3u32);
-    comp2.mark_dirty(BorrowsAllExcept::new());
+    comp2.mark_dirty([]);
     let _ = demo;
 
     dbg!(comp.render());
@@ -52,7 +52,7 @@ impl<T> Component<T> {
         autoken::tie!('a => ref Self);
 
         if self.cache.is_none() {
-            let rendered = (self.renderer.clone())(BorrowsAllExcept::new(), self);
+            let rendered = (self.renderer.clone())([], self);
             self.cache = Some(rendered);
         }
 
@@ -69,7 +69,7 @@ impl<T> AnyComponent for Obj<Component<T>> {
         let mut me = *self;
         me.cache = None;
         for dep in std::mem::take(&mut me.dependents) {
-            dep.mark_dirty(BorrowsAllExcept::new());
+            dep.mark_dirty([]);
         }
     }
 }
