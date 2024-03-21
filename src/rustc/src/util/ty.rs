@@ -4,9 +4,9 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
     ty::{
-        self, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, Instance, ParamConst, Ty,
-        TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
-        TypeVisitable, TypeVisitableExt, TypeVisitor,
+        self, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamConst, Ty, TyCtxt,
+        TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+        TypeVisitableExt, TypeVisitor,
     },
 };
 
@@ -26,13 +26,6 @@ pub fn enumerate_named_types<'tcx>(ty: Ty<'tcx>, f: impl FnMut(Ty<'tcx>)) {
     }
 
     ty.visit_with(&mut MyVisitor(f))
-}
-
-pub fn get_instance_sig_maybe_closure<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-) -> Binder<'tcx, FnSig<'tcx>> {
-    get_fn_sig_maybe_closure(tcx, instance.def_id()).instantiate(tcx, instance.args)
 }
 
 pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {

@@ -4,15 +4,13 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use autoken::BorrowsAllExcept;
-
 use util::obj::{DynObj, Obj};
 
 pub mod util;
 
 fn main() {
-    let comp2 = Obj::new(Component::new(|_, _| 2));
-    let comp = Obj::new(Component::new(move |_, _| {
+    let comp2 = Obj::new(Component::new(|_| 2));
+    let comp = Obj::new(Component::new(move |_| {
         comp2.render();
         eprintln!("Computed!");
         3
@@ -23,24 +21,24 @@ fn main() {
     comp.mark_dep(comp2);
 
     let demo = &*Obj::new(3u32);
-    comp2.mark_dirty([]);
+    comp2.mark_dirty();
     let _ = demo;
 
     dbg!(comp.render());
 }
 
 pub trait AnyComponent {
-    fn mark_dirty(&self, _: BorrowsAllExcept<(u32,)>);
+    fn mark_dirty(&self);
 }
 
 pub struct Component<T: 'static> {
     dependents: HashSet<DynObj<dyn AnyComponent>>,
     cache: Option<T>,
-    renderer: Arc<dyn Fn(BorrowsAllExcept, Obj<Self>) -> T>,
+    renderer: Arc<dyn Fn(Obj<Self>) -> T>,
 }
 
 impl<T> Component<T> {
-    pub fn new(renderer: impl 'static + Fn(BorrowsAllExcept, Obj<Self>) -> T) -> Self {
+    pub fn new(renderer: impl 'static + Fn(Obj<Self>) -> T) -> Self {
         Self {
             dependents: HashSet::default(),
             cache: None,
@@ -52,7 +50,7 @@ impl<T> Component<T> {
         autoken::tie!('a => ref Self);
 
         if self.cache.is_none() {
-            let rendered = (self.renderer.clone())([], self);
+            let rendered = (self.renderer.clone())(self);
             self.cache = Some(rendered);
         }
 
@@ -65,11 +63,11 @@ impl<T> Component<T> {
 }
 
 impl<T> AnyComponent for Obj<Component<T>> {
-    fn mark_dirty(&self, _: BorrowsAllExcept<(u32,)>) {
+    fn mark_dirty(&self) {
         let mut me = *self;
         me.cache = None;
         for dep in std::mem::take(&mut me.dependents) {
-            dep.mark_dirty([]);
+            dep.mark_dirty();
         }
     }
 }

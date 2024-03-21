@@ -15,7 +15,7 @@ use rustc_middle::{
     },
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, FnSig,
+        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
         GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
         TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
@@ -36,10 +36,7 @@ use crate::{
             find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
-        ty::{
-            enumerate_named_types, get_fn_sig_maybe_closure, get_instance_sig_maybe_closure,
-            instantiate_ignoring_regions,
-        },
+        ty::{get_fn_sig_maybe_closure, instantiate_ignoring_regions},
     },
 };
 
@@ -127,39 +124,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     return;
                 };
 
-                let instance_sig = get_instance_sig_maybe_closure(tcx, instance);
-                let exemptions = Self::parse_sig_borrowing_except(instance_sig.skip_binder());
-
                 let facts = facts.as_ref().unwrap();
 
-                if let Some(exemptions) = exemptions {
-                    if facts.borrows.values().any(|v| v.1.is_some()) {
-                        tcx.sess.dcx().span_err(
-                            tcx.def_span(instance.def_id()),
-                            "output of an unsized function cannot be tied to a lifetime",
-                        );
-                    }
-
-                    for exemption in &exemptions {
-                        if facts.borrows.contains_key(exemption) {
-                            tcx.sess.dcx().span_err(
-                                tcx.def_span(instance.def_id()),
-                                format!("the exemption signature promises not to borrow {exemption:?} but borrows it anyways"),
-                            );
-                        }
-
-                        if facts
-                            .borrows_all_except
-                            .as_ref()
-                            .is_some_and(|v| !v.contains(exemption))
-                        {
-                            tcx.sess.dcx().span_err(
-                                tcx.def_span(instance.def_id()),
-                                format!("this function calls another dynamic function which does not promise not to borrow {exemption:?}"),
-                            );
-                        }
-                    }
-                } else if !facts.borrows.is_empty() || facts.borrows_all_except.is_some() {
+                if !facts.borrows.is_empty() || facts.borrows_all_except.is_some() {
                     tcx.sess.dcx().span_err(
                         tcx.def_span(instance.def_id()),
                         "cannot unsize this function as it accesses global tokens",
@@ -742,18 +709,8 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
 
         // Acquire the function body.
-        let body = match safeishly_grab_instance_mir(tcx, instance.def) {
-            MirGrabResult::Found(body) => body,
-            MirGrabResult::Dynamic => {
-                entry.insert(Some(FuncFacts {
-                    borrows: FxHashMap::default(),
-                    borrows_all_except: Self::parse_sig_borrowing_except(
-                        get_instance_sig_maybe_closure(tcx, instance).skip_binder(),
-                    ),
-                }));
-                return;
-            }
-            MirGrabResult::BottomsOut => return,
+        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
+            return;
         };
 
         // This is a real function so let's add it to the fact map.
@@ -846,43 +803,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
             _ => None,
         }
     }
-
-    fn is_borrowing_except_marker(ty: Ty<'tcx>) -> Option<&'tcx List<Ty<'tcx>>> {
-        let TyKind::Adt(def, generics) = ty.kind() else {
-            return None;
-        };
-
-        let field = def.all_fields().next()?;
-
-        if field.name != sym::__autoken_borrows_all_except_field_indicator.get() {
-            return None;
-        }
-
-        Some(generics[0].as_type().unwrap().tuple_fields())
-    }
-
-    fn parse_sig_borrowing_except(sig: FnSig<'tcx>) -> Option<FxHashSet<Ty<'tcx>>> {
-        let mut exceptions = FxHashSet::default();
-        let mut had_exception = false;
-
-        for input in sig.inputs() {
-            enumerate_named_types(*input, |ty| {
-                let Some(ty_exceptions) = Self::is_borrowing_except_marker(ty) else {
-                    return;
-                };
-
-                had_exception |= true;
-
-                for exception in ty_exceptions {
-                    if Self::is_borrowing_except_marker(exception).is_none() {
-                        exceptions.insert(exception);
-                    }
-                }
-            });
-        }
-
-        had_exception.then_some(exceptions)
-    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -894,9 +814,6 @@ mod sym {
 
     pub static __autoken_declare_tied_mut: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_mut");
-
-    pub static __autoken_borrows_all_except_field_indicator: CachedSymbol =
-        CachedSymbol::new("__autoken_borrows_all_except_field_indicator");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }

@@ -1,18 +1,6 @@
 #![no_std]
 #![feature(tuple_trait)]
 
-// === BorrowsAllExcept === //
-
-pub type BorrowsAllExcept<T = ()> = [borrows_all_except::BorrowsAllExcept<T>; 0];
-
-mod borrows_all_except {
-    use core::marker::{PhantomData, Tuple};
-
-    pub struct BorrowsAllExcept<T: Tuple> {
-        __autoken_borrows_all_except_field_indicator: PhantomData<fn() -> T>,
-    }
-}
-
 // === Tie === //
 
 #[doc(hidden)]
