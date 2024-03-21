@@ -4,6 +4,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use autoken::{borrows_all, BorrowsAllExcept};
 use util::obj::{DynObj, Obj};
 
 pub mod util;
@@ -20,21 +21,19 @@ fn main() {
     dbg!(comp.render());
     comp.mark_dep(comp2);
 
-    let demo = &*Obj::new(3u32);
-    comp2.mark_dirty();
-    let _ = demo;
+    comp2.mark_dirty(&mut borrows_all());
 
     dbg!(comp.render());
 }
 
 pub trait AnyComponent {
-    fn mark_dirty(&self);
+    fn mark_dirty(&self, token: &mut BorrowsAllExcept<'_>);
 }
 
 pub struct Component<T: 'static> {
     dependents: HashSet<DynObj<dyn AnyComponent>>,
     cache: Option<T>,
-    renderer: Arc<dyn Fn(Obj<Self>) -> T>,
+    renderer: Arc<dyn Fn(&mut BorrowsAllExcept, Obj<Self>) -> T>,
 }
 
 impl<T> Component<T> {
@@ -42,7 +41,7 @@ impl<T> Component<T> {
         Self {
             dependents: HashSet::default(),
             cache: None,
-            renderer: Arc::new(renderer),
+            renderer: Arc::new(move |token, obj| token.absorb(|| renderer(obj))),
         }
     }
 
@@ -50,7 +49,7 @@ impl<T> Component<T> {
         autoken::tie!('a => ref Self);
 
         if self.cache.is_none() {
-            let rendered = (self.renderer.clone())(self);
+            let rendered = (self.renderer.clone())(&mut borrows_all(), self);
             self.cache = Some(rendered);
         }
 
@@ -63,12 +62,14 @@ impl<T> Component<T> {
 }
 
 impl<T> AnyComponent for Obj<Component<T>> {
-    fn mark_dirty(&self) {
-        let mut me = *self;
-        me.cache = None;
-        for dep in std::mem::take(&mut me.dependents) {
-            dep.mark_dirty();
-        }
+    fn mark_dirty(&self, token: &mut BorrowsAllExcept<'_>) {
+        token.absorb(|| {
+            let mut me = *self;
+            me.cache = None;
+            for dep in std::mem::take(&mut me.dependents) {
+                dep.mark_dirty(&mut BorrowsAllExcept::acquire());
+            }
+        });
     }
 }
 

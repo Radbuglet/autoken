@@ -1,9 +1,43 @@
 #![no_std]
 #![feature(tuple_trait)]
 
-// === Tie === //
+use core::marker::{PhantomData, Tuple};
 
-use core::marker::Tuple;
+// === Absorb === //
+
+pub unsafe fn absorb_borrows_except<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+    #[doc(hidden)]
+    #[allow(clippy::extra_unused_type_parameters)]
+    pub fn __autoken_absorb_borrows_except<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    __autoken_absorb_borrows_except::<T, R>(f)
+}
+
+pub fn borrows_all<'a, T: Tuple>() -> BorrowsAllExcept<'a, T> {
+    tie!('a => except T);
+
+    BorrowsAllExcept::acquire()
+}
+
+pub struct BorrowsAllExcept<'a, T: Tuple = ()> {
+    _ty: PhantomData<fn() -> &'a T>,
+}
+
+impl<'a, T: Tuple> BorrowsAllExcept<'a, T> {
+    pub fn acquire() -> Self {
+        tie!('a => except T);
+
+        Self { _ty: PhantomData }
+    }
+
+    pub fn absorb<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        unsafe { absorb_borrows_except::<T, R>(f) }
+    }
+}
+
+// === Tie === //
 
 #[doc(hidden)]
 pub fn __autoken_declare_tied_ref<I, T: ?Sized>() {}

@@ -163,6 +163,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 .local_decls
                 .push(LocalDecl::new(dangling_addr_local_ty, DUMMY_SP));
 
+            // FIXME: Ensure that functions with `borrows_all_except` have a "borrows all" token.
             let token_locals = facts
                 .borrows
                 .keys()
@@ -702,7 +703,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         // If this function has a hardcoded fact set, use those.
-        match Self::is_special_func(tcx, instance.def_id()) {
+        match Self::is_tie_func(tcx, instance.def_id()) {
             Some(SpecialFunc::Single(mutability)) => {
                 entry.insert(Some(FuncFacts {
                     borrows: HashMap::from_iter([(
@@ -781,7 +782,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     .extend(target_borrows_all_except.iter().copied());
             }
 
-            let lt_id = Self::is_special_func(tcx, target_instance.def_id()).map(|_| {
+            let lt_id = Self::is_tie_func(tcx, target_instance.def_id()).map(|_| {
                 let param = target_instance.args[0].as_type().unwrap();
                 if param.is_unit() {
                     return None;
@@ -810,7 +811,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 }
             }
 
-            if let Some((exceptions, tied)) = &target_facts.borrows_all_except {
+            if let Some((exceptions, _)) = &target_facts.borrows_all_except {
                 let ties = if let Some((borrows_all_except, tied)) = &mut borrows_all_except {
                     borrows_all_except.retain(|t| exceptions.contains(t));
                     tied
@@ -820,8 +821,38 @@ impl<'tcx> AnalysisDriver<'tcx> {
                         .1
                 };
 
-                ties.extend(tied.iter().copied());
+                if let Some(Some(lt_id)) = lt_id {
+                    ties.push(lt_id);
+                }
             }
+        }
+
+        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_borrows_except.get())
+        {
+            let remove_all_except = instance.args[0]
+                .as_type()
+                .unwrap()
+                .tuple_fields()
+                .iter()
+                .collect::<FxHashSet<_>>();
+
+            borrows.retain(|k, _| remove_all_except.contains(k));
+
+            if let Some((borrows_all_except, ties)) = borrows_all_except.take() {
+                for removal_all_exception in &remove_all_except {
+                    if !borrows_all_except.contains(removal_all_exception) {
+                        if ties.is_empty() {
+                            borrows.insert(*removal_all_exception, (Mutability::Mut, None));
+                        } else {
+                            for tie in &ties {
+                                borrows
+                                    .insert(*removal_all_exception, (Mutability::Mut, Some(*tie)));
+                            }
+                        }
+                    }
+                }
+            }
+            borrows_all_except = None;
         }
 
         self.func_facts.insert(
@@ -833,7 +864,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
         );
     }
 
-    fn is_special_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<SpecialFunc> {
+    fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<SpecialFunc> {
         match tcx.opt_item_name(def_id) {
             v if v == Some(sym::__autoken_declare_tied_ref.get()) => {
                 Some(SpecialFunc::Single(Mutability::Not))
@@ -866,6 +897,9 @@ mod sym {
 
     pub static __autoken_declare_tied_all_except: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_all_except");
+
+    pub static __autoken_absorb_borrows_except: CachedSymbol =
+        CachedSymbol::new("__autoken_absorb_borrows_except");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }
