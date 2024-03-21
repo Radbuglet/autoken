@@ -16,6 +16,14 @@ impl<H> Default for ConstSafeBuildHasherDefault<H> {
     }
 }
 
+impl<H> Copy for ConstSafeBuildHasherDefault<H> {}
+
+impl<H> Clone for ConstSafeBuildHasherDefault<H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 impl<H> ConstSafeBuildHasherDefault<H> {
     pub const fn new() -> Self {
         Self(PhantomData)

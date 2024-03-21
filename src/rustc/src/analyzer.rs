@@ -51,7 +51,7 @@ pub struct AnalysisDriver<'tcx> {
 #[derive(Debug)]
 struct FuncFacts<'tcx> {
     borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
-    borrows_all_except: Option<FxHashSet<Ty<'tcx>>>,
+    borrows_all_except: Option<(FxHashSet<Ty<'tcx>>, Vec<Symbol>)>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -370,19 +370,31 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 let callee_borrows = callee_borrows.as_ref().unwrap();
 
-                // Add borrow directives before the function.
-                let ensure_not_borrowed = callee_borrows
-                    .borrows
-                    .iter()
-                    .map(|(ty, (mutbl, _))| (*ty, *mutbl))
-                    .chain(callee_borrows.borrows_all_except.iter().flat_map(|set| {
-                        token_locals
-                            .keys()
-                            .filter(|ty| !set.contains(ty))
-                            .map(|ty| (*ty, Mutability::Mut))
-                    }));
+                // Determine the set of tokens borrowed by this function.
+                let mut ensure_not_borrowed = Vec::new();
 
-                for (ty, mutability) in ensure_not_borrowed {
+                for (ty, (mutbl, tie)) in &callee_borrows.borrows {
+                    ensure_not_borrowed.push((*ty, *mutbl, *tie));
+                }
+
+                if let Some((exceptions, ties)) = &callee_borrows.borrows_all_except {
+                    for local in token_locals.keys() {
+                        if exceptions.contains(local) {
+                            continue;
+                        }
+
+                        if ties.is_empty() {
+                            ensure_not_borrowed.push((*local, Mutability::Mut, None));
+                        } else {
+                            for tie in ties {
+                                ensure_not_borrowed.push((*local, Mutability::Mut, Some(*tie)));
+                            }
+                        }
+                    }
+                }
+
+                // Add borrow directives before the function.
+                for (ty, mutability, _tied) in ensure_not_borrowed.iter().copied() {
                     let dummy_token_holder = match mutability {
                         Mutability::Not => body
                             .local_decls
@@ -425,14 +437,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 let bb = &mut bbs[target];
 
-                let Some(target_facts) = &self.func_facts.get(&target_instance_mono) else {
-                    continue;
-                };
-                let target_facts = target_facts.as_ref().unwrap();
-
                 let mut prepend_statements = Vec::new();
 
-                for (ty, (mutability, lt_id)) in &target_facts.borrows {
+                for (ty, mutability, lt_id) in ensure_not_borrowed.iter().copied() {
                     let Some(lt_id) = lt_id else {
                         continue;
                     };
@@ -447,7 +454,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             .skip_binder()
                             .skip_binder()
                             .output(),
-                        *lt_id,
+                        lt_id,
                     )
                     .unwrap();
 
@@ -518,7 +525,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                     },
                                 ),
                                 TypeAndMut {
-                                    mutbl: *mutability,
+                                    mutbl: mutability,
                                     ty: tcx.types.unit,
                                 },
                             ),
@@ -533,7 +540,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                 tcx,
                                 tcx.lifetimes.re_erased,
                                 TypeAndMut {
-                                    mutbl: *mutability,
+                                    mutbl: mutability,
                                     ty: tcx.types.unit,
                                 },
                             ),
@@ -593,7 +600,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                                         },
                                     },
                                     Place {
-                                        local: token_locals[ty],
+                                        local: token_locals[&ty],
                                         projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
                                     },
                                 ),
@@ -695,18 +702,34 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         // If this function has a hardcoded fact set, use those.
-        let hardcoded_mut = Self::is_special_func(tcx, instance.def_id());
-
-        if let Some(hardcoded_mut) = hardcoded_mut {
-            entry.insert(Some(FuncFacts {
-                borrows: HashMap::from_iter([(
-                    instance.args[1].as_type().unwrap(),
-                    (hardcoded_mut, None),
-                )]),
-                borrows_all_except: None,
-            }));
-            return;
-        }
+        match Self::is_special_func(tcx, instance.def_id()) {
+            Some(SpecialFunc::Single(mutability)) => {
+                entry.insert(Some(FuncFacts {
+                    borrows: HashMap::from_iter([(
+                        instance.args[1].as_type().unwrap(),
+                        (mutability, None),
+                    )]),
+                    borrows_all_except: None,
+                }));
+                return;
+            }
+            Some(SpecialFunc::Excluding) => {
+                entry.insert(Some(FuncFacts {
+                    borrows: HashMap::default(),
+                    borrows_all_except: Some((
+                        instance.args[1]
+                            .as_type()
+                            .unwrap()
+                            .tuple_fields()
+                            .iter()
+                            .collect(),
+                        Vec::new(),
+                    )),
+                }));
+                return;
+            }
+            _ => {}
+        };
 
         // Acquire the function body.
         let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
@@ -724,7 +747,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // See who the function may call and where.
         let mut borrows = FxHashMap::default();
-        let mut borrows_all_except = None::<FxHashSet<_>>;
+        let mut borrows_all_except = None::<(FxHashSet<_>, Vec<_>)>;
 
         for bb in body.basic_blocks.iter() {
             // If the terminator is a call terminator.
@@ -751,9 +774,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            if let Some(target_borrows_all_except) = &target_facts.borrows_all_except {
+            if let Some((target_borrows_all_except, _)) = &target_facts.borrows_all_except {
                 borrows_all_except
-                    .get_or_insert_with(FxHashSet::default)
+                    .get_or_insert_with(Default::default)
+                    .0
                     .extend(target_borrows_all_except.iter().copied());
             }
 
@@ -785,6 +809,19 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     *curr_lt = Some(lt_id);
                 }
             }
+
+            if let Some((exceptions, tied)) = &target_facts.borrows_all_except {
+                let ties = if let Some((borrows_all_except, tied)) = &mut borrows_all_except {
+                    borrows_all_except.retain(|t| exceptions.contains(t));
+                    tied
+                } else {
+                    &mut borrows_all_except
+                        .insert((exceptions.clone(), Vec::new()))
+                        .1
+                };
+
+                ties.extend(tied.iter().copied());
+            }
         }
 
         self.func_facts.insert(
@@ -796,13 +833,25 @@ impl<'tcx> AnalysisDriver<'tcx> {
         );
     }
 
-    fn is_special_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Mutability> {
+    fn is_special_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<SpecialFunc> {
         match tcx.opt_item_name(def_id) {
-            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
-            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
+            v if v == Some(sym::__autoken_declare_tied_ref.get()) => {
+                Some(SpecialFunc::Single(Mutability::Not))
+            }
+            v if v == Some(sym::__autoken_declare_tied_mut.get()) => {
+                Some(SpecialFunc::Single(Mutability::Mut))
+            }
+            v if v == Some(sym::__autoken_declare_tied_all_except.get()) => {
+                Some(SpecialFunc::Excluding)
+            }
             _ => None,
         }
     }
+}
+
+enum SpecialFunc {
+    Single(Mutability),
+    Excluding,
 }
 
 #[allow(non_upper_case_globals)]
@@ -814,6 +863,9 @@ mod sym {
 
     pub static __autoken_declare_tied_mut: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_mut");
+
+    pub static __autoken_declare_tied_all_except: CachedSymbol =
+        CachedSymbol::new("__autoken_declare_tied_all_except");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }
