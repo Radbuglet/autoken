@@ -19,4 +19,5 @@ extern crate rustc_trait_selection;
 
 pub mod analyzer;
 pub mod entry;
+pub mod mir;
 pub mod util;

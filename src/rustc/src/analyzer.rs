@@ -5,26 +5,15 @@ use rustc_hir::{
     def_id::{DefId, DefIndex, LocalDefId},
 };
 
-use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::{
-        interpret::Scalar, AggregateKind, BasicBlock, BorrowKind, CastKind, Const, ConstOperand,
-        ConstValue, LocalDecl, MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue,
-        SourceInfo, SourceScope, Statement, StatementKind, Terminator, TerminatorKind,
-        UserTypeProjection,
-    },
-    ty::{
-        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex,
-        GenericArgs, GenericParamDefKind, Instance, List, Region, RegionKind, Ty, TyCtxt, TyKind,
-        TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
-    },
+    mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
+    ty::{GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{Symbol, DUMMY_SP};
-use rustc_target::abi::FieldIdx;
+use rustc_span::Symbol;
 
 use crate::{
     analyzer::sym::unnamed,
+    mir::{TokenKey, TokenMirBuilder},
     util::{
         feeder::{
             feed,
@@ -36,7 +25,7 @@ use crate::{
             find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
-        ty::{get_fn_sig_maybe_closure, instantiate_ignoring_regions},
+        ty::get_fn_sig_maybe_closure,
     },
 };
 
@@ -152,214 +141,29 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            // Create a local for every token.
-            let token_ref_imm_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+            let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
-            let token_ref_mut_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
-
-            let dangling_addr_local_ty = Ty::new_mut_ptr(tcx, tcx.types.unit);
-
-            let dangling_addr_local = body
-                .local_decls
-                .push(LocalDecl::new(dangling_addr_local_ty, DUMMY_SP));
-
-            // FIXME: Ensure that functions with `borrows_all_except` have a "borrows all" token.
-            let token_locals = facts
-                .borrows
-                .keys()
-                .map(|key| {
-                    (
-                        *key,
-                        body.local_decls
-                            .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
-                    )
-                })
-                .collect::<FxHashMap<_, _>>();
-
-            // Initialize the tokens and ascribe them their types.
-            let source_info = SourceInfo {
-                span: body.span,
-                // FIXME: This probably isn't a good idea.
-                scope: SourceScope::from_u32(0),
-            };
-
-            let mut start_stmts = Vec::new();
-            start_stmts.extend([Statement {
-                source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place {
-                        local: dangling_addr_local,
-                        projection: List::empty(),
-                    },
-                    Rvalue::Cast(
-                        CastKind::PointerFromExposedAddress,
-                        Operand::Constant(Box::new(ConstOperand {
-                            span: DUMMY_SP,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_target_usize(1, &tcx.data_layout)),
-                                tcx.types.usize,
-                            ),
-                        })),
-                        dangling_addr_local_ty,
-                    ),
-                ))),
-            }]);
-
-            for (key, &local) in &token_locals {
-                let (_, lt_id) = &facts.borrows[key];
-
-                if let Some(lt_id) = lt_id {
-                    // Find the lifetime
-                    let found_region = find_region_with_name(
-                        tcx,
-                        get_fn_sig_maybe_closure(tcx, orig_id.to_def_id())
-                            .skip_binder()
-                            .skip_binder()
-                            .output(),
-                        *lt_id,
-                    )
-                    .unwrap();
-
-                    let annotation = body
-                        .user_type_annotations
-                        .push(CanonicalUserTypeAnnotation {
-                            user_ty: Box::new(CanonicalUserType {
-                                value: UserType::Ty(Ty::new_ref(
-                                    tcx,
-                                    found_region,
-                                    TypeAndMut {
-                                        mutbl: Mutability::Mut,
-                                        ty: tcx.types.unit,
-                                    },
-                                )),
-                                max_universe: UniverseIndex::ROOT,
-                                variables: List::empty(),
-                            }),
-                            span: DUMMY_SP,
-                            inferred_ty: token_ref_mut_ty,
-                        });
-
-                    start_stmts.extend([
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    tcx.lifetimes.re_erased,
-                                    BorrowKind::Mut {
-                                        kind: MutBorrowKind::Default,
-                                    },
-                                    Place {
-                                        local: dangling_addr_local,
-                                        projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                                    },
-                                ),
-                            ))),
-                        },
-                        Statement {
-                            source_info,
-                            kind: StatementKind::AscribeUserType(
-                                Box::new((
-                                    Place {
-                                        local,
-                                        projection: List::empty(),
-                                    },
-                                    UserTypeProjection {
-                                        base: annotation,
-                                        projs: Vec::new(),
-                                    },
-                                )),
-                                Variance::Invariant,
-                            ),
-                        },
-                    ]);
-                } else {
-                    let unit_holder = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, DUMMY_SP));
-
-                    start_stmts.extend([
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: unit_holder,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                                    span: DUMMY_SP,
-                                    user_ty: None,
-                                    const_: Const::Val(ConstValue::ZeroSized, tcx.types.unit),
-                                }))),
-                            ))),
-                        },
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    tcx.lifetimes.re_erased,
-                                    BorrowKind::Mut {
-                                        kind: MutBorrowKind::Default,
-                                    },
-                                    Place {
-                                        local: unit_holder,
-                                        projection: List::empty(),
-                                    },
-                                ),
-                            ))),
-                        },
-                    ]);
-                }
-            }
-
-            let bbs = body.basic_blocks.as_mut();
-            bbs[BasicBlock::from_u32(0)]
-                .statements
-                .splice(0..0, start_stmts);
-
-            // For every function call...
-            for bb_idx in 0..bbs.len() {
-                let bb = &mut bbs[BasicBlock::from_usize(bb_idx)];
+            let bb_count = body_mutator.body().basic_blocks.len();
+            for bb in 0..bb_count {
+                let bb = BasicBlock::from_usize(bb);
 
                 // If it has a concrete callee...
                 let Some(Terminator {
-                    kind:
-                        TerminatorKind::Call {
-                            func: callee,
-                            destination,
-                            target,
-                            ..
-                        },
+                    kind: TerminatorKind::Call { func: callee, .. },
                     ..
-                }) = &bb.terminator
+                }) = &body_mutator.body().basic_blocks[bb].terminator
                 else {
                     continue;
                 };
 
                 // FIXME: Here too!
-                let Some(target_instance_mono) =
-                    get_static_callee_from_terminator(tcx, instance, &body.local_decls, callee)
-                else {
+                let Some(target_instance_mono) = get_static_callee_from_terminator(
+                    tcx,
+                    instance,
+                    &body_mutator.body().local_decls,
+                    callee,
+                ) else {
                     continue;
-                };
-
-                // N.B. the DefId of `target_instance_no_mono` need not match its monomorphized
-                // version.
-                let target_instance_no_mono = {
-                    let callee = callee.ty(&body.local_decls, tcx);
-                    let TyKind::FnDef(callee_id, generics) = callee.kind() else {
-                        unreachable!();
-                    };
-
-                    Instance::new(*callee_id, generics)
                 };
 
                 // Determine what it borrows
@@ -379,287 +183,50 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 }
 
                 if let Some((exceptions, ties)) = &callee_borrows.borrows_all_except {
-                    for local in token_locals.keys() {
-                        if exceptions.contains(local) {
+                    for ty in facts.borrows.keys() {
+                        if exceptions.contains(ty) {
                             continue;
                         }
 
                         if ties.is_empty() {
-                            ensure_not_borrowed.push((*local, Mutability::Mut, None));
+                            ensure_not_borrowed.push((*ty, Mutability::Mut, None));
                         } else {
                             for tie in ties {
-                                ensure_not_borrowed.push((*local, Mutability::Mut, Some(*tie)));
+                                ensure_not_borrowed.push((*ty, Mutability::Mut, Some(*tie)));
                             }
                         }
                     }
                 }
 
-                // Add borrow directives before the function.
-                for (ty, mutability, _tied) in ensure_not_borrowed.iter().copied() {
-                    let dummy_token_holder = match mutability {
-                        Mutability::Not => body
-                            .local_decls
-                            .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP)),
-                        Mutability::Mut => body
-                            .local_decls
-                            .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
-                    };
+                for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
+                    body_mutator.ensure_not_borrowed_at(bb, TokenKey::Ty(ty), mutability);
 
-                    bb.statements.push(Statement {
-                        source_info,
-                        kind: StatementKind::Assign(Box::new((
-                            Place {
-                                local: dummy_token_holder,
-                                projection: List::empty(),
-                            },
-                            Rvalue::Ref(
-                                tcx.lifetimes.re_erased,
-                                match mutability {
-                                    Mutability::Not => BorrowKind::Shared,
-                                    Mutability::Mut => BorrowKind::Mut {
-                                        kind: MutBorrowKind::Default,
-                                    },
-                                },
-                                Place {
-                                    local: token_locals[&ty],
-                                    projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                                },
-                            ),
-                        ))),
-                    });
+                    if let Some(tied) = tied {
+                        // Compute the type as which the function result is going to be bound.
+                        let mapped_region = find_region_with_name(
+                            tcx,
+                            // N.B. we need to use the monomorphized ID since the non-monomorphized
+                            //  ID could just be the parent trait function def, which won't have the
+                            //  user's regions.
+                            get_fn_sig_maybe_closure(tcx, target_instance_mono.def_id())
+                                .skip_binder()
+                                .skip_binder()
+                                .output(),
+                            tied,
+                        )
+                        .unwrap();
+
+                        body_mutator.tie_token_to_its_return(
+                            bb,
+                            TokenKey::Ty(ty),
+                            mutability,
+                            |region| region == mapped_region,
+                        );
+                    }
                 }
-
-                // Add ascriptions to the return type after.
-                let Some(target) = target else {
-                    continue;
-                };
-                let target = *target;
-                let destination = *destination;
-
-                let bb = &mut bbs[target];
-
-                let mut prepend_statements = Vec::new();
-
-                for (ty, mutability, lt_id) in ensure_not_borrowed.iter().copied() {
-                    let Some(lt_id) = lt_id else {
-                        continue;
-                    };
-
-                    // Compute the type as which the function result is going to be bound.
-                    let mapped_region = find_region_with_name(
-                        tcx,
-                        // N.B. we need to use the monomorphized ID since the non-monomorphized
-                        //  ID could just be the parent trait function def, which won't have the
-                        //  user's regions.
-                        get_fn_sig_maybe_closure(tcx, target_instance_mono.def_id())
-                            .skip_binder()
-                            .skip_binder()
-                            .output(),
-                        lt_id,
-                    )
-                    .unwrap();
-
-                    let mut var_assignments = FxHashMap::default();
-                    var_assignments.insert(mapped_region, BoundVar::from_usize(0));
-
-                    let target_fn_out_ty_semi_generic_intact_regions = instantiate_ignoring_regions(
-                        tcx,
-                        get_fn_sig_maybe_closure(tcx, target_instance_no_mono.def_id())
-                            .skip_binder()
-                            .skip_binder()
-                            .output(),
-                        target_instance_no_mono.args,
-                    );
-
-                    let fn_result = target_fn_out_ty_semi_generic_intact_regions.fold_with(
-                        &mut RegionFolder::new(tcx, &mut |region, index| {
-                            match region.kind() {
-                                // Mapped regions
-                                RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
-                                    if index == DebruijnIndex::from_u32(0) {
-                                        let var_assignments_count = var_assignments.len() as u32;
-                                        let bound_var =
-                                            *var_assignments.entry(region).or_insert_with(|| {
-                                                BoundVar::from_u32(var_assignments_count)
-                                            });
-
-                                        Region::new_bound(
-                                            tcx,
-                                            DebruijnIndex::from_u32(0),
-                                            BoundRegion {
-                                                kind: BoundRegionKind::BrAnon,
-                                                var: bound_var,
-                                            },
-                                        )
-                                    } else {
-                                        region
-                                    }
-                                }
-
-                                // Unaffected regions
-                                RegionKind::ReBound(_, _) => region,
-                                RegionKind::ReStatic => region,
-
-                                // Non-applicable regions
-                                RegionKind::ReVar(_) => unreachable!(),
-                                RegionKind::RePlaceholder(_) => unreachable!(),
-                                RegionKind::ReErased => unreachable!(),
-                                RegionKind::ReError(_) => unreachable!(),
-                            }
-                        }),
-                    );
-
-                    let fn_result_inferred = destination.ty(&body.local_decls, tcx).ty;
-
-                    // Create a tuple binder
-                    let tuple_binder = Ty::new_tup(
-                        tcx,
-                        &[
-                            Ty::new_ref(
-                                tcx,
-                                Region::new_bound(
-                                    tcx,
-                                    DebruijnIndex::from_u32(0),
-                                    BoundRegion {
-                                        kind: BoundRegionKind::BrAnon,
-                                        var: BoundVar::from_u32(0),
-                                    },
-                                ),
-                                TypeAndMut {
-                                    mutbl: mutability,
-                                    ty: tcx.types.unit,
-                                },
-                            ),
-                            fn_result,
-                        ],
-                    );
-
-                    let tuple_binder_inferred = Ty::new_tup(
-                        tcx,
-                        &[
-                            Ty::new_ref(
-                                tcx,
-                                tcx.lifetimes.re_erased,
-                                TypeAndMut {
-                                    mutbl: mutability,
-                                    ty: tcx.types.unit,
-                                },
-                            ),
-                            fn_result_inferred,
-                        ],
-                    );
-
-                    // Emit a type ascription statement
-                    let annotation = body
-                        .user_type_annotations
-                        .push(CanonicalUserTypeAnnotation {
-                            user_ty: Box::new(Canonical {
-                                value: UserType::Ty(tuple_binder),
-                                max_universe: UniverseIndex::ROOT,
-                                variables: tcx.mk_canonical_var_infos(
-                                    &var_assignments
-                                        .iter()
-                                        .map(|_| CanonicalVarInfo {
-                                            kind: CanonicalVarKind::Region(UniverseIndex::ROOT),
-                                        })
-                                        .collect::<Vec<_>>(),
-                                ),
-                            }),
-                            span: DUMMY_SP,
-                            inferred_ty: tuple_binder_inferred,
-                        });
-
-                    let binder_local = body
-                        .local_decls
-                        .push(LocalDecl::new(tuple_binder_inferred, DUMMY_SP));
-
-                    body.local_decls[destination.local].mutability = Mutability::Mut;
-
-                    let dummy_token_holder = match mutability {
-                        Mutability::Not => body
-                            .local_decls
-                            .push(LocalDecl::new(token_ref_imm_ty, DUMMY_SP)),
-                        Mutability::Mut => body
-                            .local_decls
-                            .push(LocalDecl::new(token_ref_mut_ty, DUMMY_SP)),
-                    };
-
-                    prepend_statements.extend([
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: dummy_token_holder,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    tcx.lifetimes.re_erased,
-                                    match mutability {
-                                        Mutability::Not => BorrowKind::Shared,
-                                        Mutability::Mut => BorrowKind::Mut {
-                                            kind: MutBorrowKind::Default,
-                                        },
-                                    },
-                                    Place {
-                                        local: token_locals[&ty],
-                                        projection: tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                                    },
-                                ),
-                            ))),
-                        },
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: binder_local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Aggregate(
-                                    Box::new(AggregateKind::Tuple),
-                                    IndexVec::from_iter([
-                                        Operand::Move(Place {
-                                            local: dummy_token_holder,
-                                            projection: List::empty(),
-                                        }),
-                                        Operand::Move(destination),
-                                    ]),
-                                ),
-                            ))),
-                        },
-                        Statement {
-                            source_info,
-                            kind: StatementKind::AscribeUserType(
-                                Box::new((
-                                    Place {
-                                        local: binder_local,
-                                        projection: List::empty(),
-                                    },
-                                    UserTypeProjection {
-                                        base: annotation,
-                                        projs: Vec::new(),
-                                    },
-                                )),
-                                Variance::Invariant,
-                            ),
-                        },
-                        Statement {
-                            source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                destination,
-                                Rvalue::Use(Operand::Move(Place {
-                                    local: binder_local,
-                                    projection: tcx.mk_place_elems(&[ProjectionElem::Field(
-                                        FieldIdx::from_u32(1),
-                                        fn_result_inferred,
-                                    )]),
-                                })),
-                            ))),
-                        },
-                    ]);
-                }
-
-                bb.statements.splice(0..0, prepend_statements);
             }
+
+            drop(body_mutator);
 
             // Feed the query system the shadow function's properties.
             let shadow_kind = tcx.def_kind(orig_id);
