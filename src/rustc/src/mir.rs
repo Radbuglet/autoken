@@ -173,6 +173,55 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
 
         for (local, ties) in self.tokens.values() {
             if ties.is_empty() {
+                // unit_holder: ()
+                let unit_holder = self
+                    .body
+                    .local_decls
+                    .push(LocalDecl::new(self.tcx.types.unit, DUMMY_SP));
+
+                Self::prepend_statement_raw(
+                    self.body,
+                    &mut self.preprender,
+                    init_basic_block,
+                    [
+                        // unit_holder = ();
+                        Statement {
+                            source_info: self.default_source_info,
+                            kind: StatementKind::Assign(Box::new((
+                                Place {
+                                    local: unit_holder,
+                                    projection: List::empty(),
+                                },
+                                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
+                                    span: DUMMY_SP,
+                                    user_ty: None,
+                                    const_: Const::Val(ConstValue::ZeroSized, self.tcx.types.unit),
+                                }))),
+                            ))),
+                        },
+                        // <local> = &mut unit_holder;
+                        Statement {
+                            source_info: self.default_source_info,
+                            kind: StatementKind::Assign(Box::new((
+                                Place {
+                                    local: *local,
+                                    projection: List::empty(),
+                                },
+                                Rvalue::Ref(
+                                    self.tcx.lifetimes.re_erased,
+                                    BorrowKind::Mut {
+                                        kind: MutBorrowKind::Default,
+                                    },
+                                    Place {
+                                        local: unit_holder,
+                                        projection: List::empty(),
+                                    },
+                                ),
+                            ))),
+                        },
+                    ],
+                );
+            } else {
                 // <local> = &mut *dangling_addr_local
                 Self::prepend_statement_raw(
                     self.body,
@@ -254,55 +303,6 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                         }],
                     );
                 }
-            } else {
-                // unit_holder: ()
-                let unit_holder = self
-                    .body
-                    .local_decls
-                    .push(LocalDecl::new(self.tcx.types.unit, DUMMY_SP));
-
-                Self::prepend_statement_raw(
-                    self.body,
-                    &mut self.preprender,
-                    init_basic_block,
-                    [
-                        // unit_holder = ();
-                        Statement {
-                            source_info: self.default_source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: unit_holder,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                                    span: DUMMY_SP,
-                                    user_ty: None,
-                                    const_: Const::Val(ConstValue::ZeroSized, self.tcx.types.unit),
-                                }))),
-                            ))),
-                        },
-                        // <local> = &mut unit_holder;
-                        Statement {
-                            source_info: self.default_source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: *local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    self.tcx.lifetimes.re_erased,
-                                    BorrowKind::Mut {
-                                        kind: MutBorrowKind::Default,
-                                    },
-                                    Place {
-                                        local: unit_holder,
-                                        projection: List::empty(),
-                                    },
-                                ),
-                            ))),
-                        },
-                    ],
-                );
             }
         }
     }

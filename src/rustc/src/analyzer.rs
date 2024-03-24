@@ -143,6 +143,24 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
             let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
+            for (key, (_, tied)) in &facts.borrows {
+                if let Some(tied) = tied {
+                    body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
+                }
+            }
+
+            if let Some((exceptions, tied)) = &facts.borrows_all_except {
+                for key in facts.borrows.keys() {
+                    if exceptions.contains(key) {
+                        continue;
+                    }
+
+                    for tied in tied {
+                        body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
+                    }
+                }
+            }
+
             let bb_count = body_mutator.body().basic_blocks.len();
             for bb in 0..bb_count {
                 let bb = BasicBlock::from_usize(bb);

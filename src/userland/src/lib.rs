@@ -48,6 +48,13 @@ pub fn __autoken_declare_tied_mut<I, T: ?Sized>() {}
 #[doc(hidden)]
 pub fn __autoken_declare_tied_all_except<I, T: Tuple>() {}
 
+#[doc(hidden)]
+pub fn borrow_counterpoint() {
+    struct Counterpoint;
+
+    __autoken_declare_tied_mut::<(), Counterpoint>();
+}
+
 #[macro_export]
 macro_rules! tie {
     ($lt:lifetime => ref $ty:ty) => {{
@@ -75,6 +82,7 @@ macro_rules! tie {
 
         let _: &$lt() = &();
 
+        $crate::borrow_counterpoint();
         $crate::__autoken_declare_tied_all_except::<AutokenLifetimeDefiner<'_>, $ty>();
     };
     (ref $ty:ty) => {{
