@@ -1,0 +1,13 @@
+{
+	"name": "Playground",
+	"image": "mcr.microsoft.com/devcontainers/rust:0-1-bullseye",
+	"customizations": {
+		"vscode": {
+			"settings": {},
+			"extensions": ["rust-lang.rust-analyzer"]
+		}
+	},
+	"postCreateCommand": "cargo install just",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "workspaceFolder": "/workspace/src/playground"
+}
