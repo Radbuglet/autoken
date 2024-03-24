@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 autoken = { path = "../userland" }
+generational-arena = "0.2.9"
+qcell = "0.5.4"

@@ -1,7 +1,55 @@
 #![no_std]
+#![allow(clippy::missing_safety_doc)]
 #![feature(tuple_trait)]
+#![feature(sync_unsafe_cell)]
 
-use core::marker::{PhantomData, Tuple};
+use core::{
+    cell::SyncUnsafeCell,
+    marker::{PhantomData, Tuple},
+};
+
+// === TokenCell === //
+
+pub struct TokenCell<T: ?Sized, L: ?Sized = T> {
+    _ty: PhantomData<fn(L) -> L>,
+    value: SyncUnsafeCell<T>,
+}
+
+impl<T: Default, L: ?Sized> Default for TokenCell<T, L> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: ?Sized, L: ?Sized> TokenCell<T, L> {
+    pub const fn new(value: T) -> Self
+    where
+        T: Sized,
+    {
+        Self {
+            _ty: PhantomData,
+            value: SyncUnsafeCell::new(value),
+        }
+    }
+
+    pub fn get<'a>(&'a self) -> &'a T {
+        tie!('a => ref L);
+        unsafe { &*self.value.get() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut<'a>(&'a self) -> &'a mut T {
+        tie!('a => mut L);
+        unsafe { &mut *self.value.get() }
+    }
+
+    pub fn into_inner(self) -> T
+    where
+        T: Sized,
+    {
+        self.value.into_inner()
+    }
+}
 
 // === Absorb === //
 
@@ -26,6 +74,10 @@ pub struct BorrowsAllExcept<'a, T: Tuple = ()> {
 }
 
 impl<'a, T: Tuple> BorrowsAllExcept<'a, T> {
+    pub unsafe fn new_unchecked() -> Self {
+        Self { _ty: PhantomData }
+    }
+
     pub fn acquire() -> Self {
         tie!('a => except T);
 
