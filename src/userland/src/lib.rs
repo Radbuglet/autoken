@@ -5,6 +5,7 @@
 
 use core::{
     cell::SyncUnsafeCell,
+    fmt,
     marker::{PhantomData, Tuple},
 };
 
@@ -15,13 +16,13 @@ pub struct TokenCell<T: ?Sized, L: ?Sized = T> {
     value: SyncUnsafeCell<T>,
 }
 
-impl<T: Default, L: ?Sized> Default for TokenCell<T, L> {
+impl<T: Default, L> Default for TokenCell<T, L> {
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T: ?Sized, L: ?Sized> TokenCell<T, L> {
+impl<T: ?Sized, L> TokenCell<T, L> {
     pub const fn new(value: T) -> Self
     where
         T: Sized,
@@ -53,63 +54,94 @@ impl<T: ?Sized, L: ?Sized> TokenCell<T, L> {
 
 // === Absorb === //
 
-pub unsafe fn absorb_borrows_except<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+pub unsafe fn absorb_only_ref<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
     #[doc(hidden)]
     #[allow(clippy::extra_unused_type_parameters)]
-    pub fn __autoken_absorb_borrows_except<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+    pub fn __autoken_absorb_only_ref<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
         f()
     }
 
-    __autoken_absorb_borrows_except::<T, R>(f)
+    __autoken_absorb_only_ref::<T, R>(f)
 }
 
-pub fn borrows_all<'a, T: Tuple>() -> BorrowsAllExcept<'a, T> {
-    tie!('a => except T);
+pub unsafe fn absorb_only_mut<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+    #[doc(hidden)]
+    #[allow(clippy::extra_unused_type_parameters)]
+    pub fn __autoken_absorb_only_ref<T: Tuple, R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
 
-    BorrowsAllExcept::acquire()
+    __autoken_absorb_only_ref::<T, R>(f)
 }
 
-pub struct BorrowsAllExcept<'a, T: Tuple = ()> {
-    _ty: PhantomData<fn() -> &'a T>,
+pub struct BorrowsMut<'a, T: Tuple> {
+    _ty: PhantomData<fn() -> (&'a (), T)>,
 }
 
-impl<'a, T: Tuple> BorrowsAllExcept<'a, T> {
+impl<T: Tuple> fmt::Debug for BorrowsMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowsMut").finish_non_exhaustive()
+    }
+}
+
+impl<'a, T: Tuple> BorrowsMut<'a, T> {
     pub unsafe fn new_unchecked() -> Self {
         Self { _ty: PhantomData }
     }
 
     pub fn acquire() -> Self {
-        tie!('a => except T);
-
+        tie!('a => mut many T);
         Self { _ty: PhantomData }
     }
 
     pub fn absorb<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        unsafe { absorb_borrows_except::<T, R>(f) }
+        unsafe { absorb_only_mut::<T, R>(f) }
+    }
+
+    pub fn absorb_ref<R>(&self, f: impl FnOnce() -> R) -> R {
+        unsafe { absorb_only_ref::<T, R>(f) }
+    }
+}
+
+pub struct BorrowsRef<'a, T: Tuple> {
+    _ty: PhantomData<fn() -> (&'a (), T)>,
+}
+
+impl<T: Tuple> fmt::Debug for BorrowsRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowsRef").finish_non_exhaustive()
+    }
+}
+
+impl<'a, T: Tuple> BorrowsRef<'a, T> {
+    pub unsafe fn new_unchecked() -> Self {
+        Self { _ty: PhantomData }
+    }
+
+    pub fn acquire() -> Self {
+        tie!('a => ref many T);
+        Self { _ty: PhantomData }
+    }
+
+    pub fn absorb<R>(&self, f: impl FnOnce() -> R) -> R {
+        unsafe { absorb_only_ref::<T, R>(f) }
     }
 }
 
 // === Tie === //
 
 #[doc(hidden)]
-pub fn __autoken_declare_tied_ref<I, T: ?Sized>() {}
+pub fn __autoken_declare_tied_ref<I, T: Tuple>() {}
 
 #[doc(hidden)]
-pub fn __autoken_declare_tied_mut<I, T: ?Sized>() {}
+pub fn __autoken_declare_tied_mut<I, T: Tuple>() {}
 
 #[doc(hidden)]
 pub fn __autoken_declare_tied_all_except<I, T: Tuple>() {}
 
-#[doc(hidden)]
-pub fn borrow_counterpoint() {
-    struct Counterpoint;
-
-    __autoken_declare_tied_mut::<(), Counterpoint>();
-}
-
 #[macro_export]
 macro_rules! tie {
-    ($lt:lifetime => ref $ty:ty) => {{
+    ($lt:lifetime => ref many $ty:ty) => {{
         struct AutokenLifetimeDefiner<$lt> {
             _v: &$lt(),
         }
@@ -118,7 +150,7 @@ macro_rules! tie {
 
         $crate::__autoken_declare_tied_ref::<AutokenLifetimeDefiner<'_>, $ty>();
     }};
-    ($lt:lifetime => mut $ty:ty) => {
+    ($lt:lifetime => mut many $ty:ty) => {
         struct AutokenLifetimeDefiner<$lt> {
             _v: &$lt(),
         }
@@ -127,23 +159,22 @@ macro_rules! tie {
 
         $crate::__autoken_declare_tied_mut::<AutokenLifetimeDefiner<'_>, $ty>();
     };
-    ($lt:lifetime => except $ty:ty) => {
-        struct AutokenLifetimeDefiner<$lt> {
-            _v: &$lt(),
-        }
-
-        let _: &$lt() = &();
-
-        $crate::borrow_counterpoint();
-        $crate::__autoken_declare_tied_all_except::<AutokenLifetimeDefiner<'_>, $ty>();
+    ($lt:lifetime => ref $ty:ty) => {{
+        $crate::tie!($lt => ref many ($ty,));
+    }};
+    ($lt:lifetime => mut $ty:ty) => {
+        $crate::tie!($lt => mut many ($ty,));
     };
-    (ref $ty:ty) => {{
+    (ref many $ty:ty) => {{
         $crate::__autoken_declare_tied_ref::<(), $ty>();
     }};
-    (mut $ty:ty) => {
+    (mut many $ty:ty) => {
         $crate::__autoken_declare_tied_mut::<(), $ty>();
     };
-    (except $ty:ty) => {
-        $crate::__autoken_declare_tied_all_except::<(), $ty>();
+    (ref $ty:ty) => {{
+        $crate::tie!(ref ($ty,));
+    }};
+    (mut $ty:ty) => {
+        $crate::tie!(mut ($ty,));
     };
 }

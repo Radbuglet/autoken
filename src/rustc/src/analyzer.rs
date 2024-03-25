@@ -1,4 +1,4 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::hash_map;
 
 use rustc_hir::{
     def::DefKind,
@@ -20,7 +20,7 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
-        hash::{FxHashMap, FxHashSet},
+        hash::FxHashMap,
         mir::{
             find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
@@ -40,7 +40,6 @@ pub struct AnalysisDriver<'tcx> {
 #[derive(Debug)]
 struct FuncFacts<'tcx> {
     borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
-    borrows_all_except: Option<(FxHashSet<Ty<'tcx>>, Vec<Symbol>)>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -115,7 +114,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 let facts = facts.as_ref().unwrap();
 
-                if !facts.borrows.is_empty() || facts.borrows_all_except.is_some() {
+                if !facts.borrows.is_empty() {
                     tcx.sess.dcx().span_err(
                         tcx.def_span(instance.def_id()),
                         "cannot unsize this function as it accesses global tokens",
@@ -146,18 +145,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
             for (key, (_, tied)) in &facts.borrows {
                 if let Some(tied) = tied {
                     body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
-                }
-            }
-
-            if let Some((exceptions, tied)) = &facts.borrows_all_except {
-                for key in facts.borrows.keys() {
-                    if exceptions.contains(key) {
-                        continue;
-                    }
-
-                    for tied in tied {
-                        body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
-                    }
                 }
             }
 
@@ -198,22 +185,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 for (ty, (mutbl, tie)) in &callee_borrows.borrows {
                     ensure_not_borrowed.push((*ty, *mutbl, *tie));
-                }
-
-                if let Some((exceptions, ties)) = &callee_borrows.borrows_all_except {
-                    for ty in facts.borrows.keys() {
-                        if exceptions.contains(ty) {
-                            continue;
-                        }
-
-                        if ties.is_empty() {
-                            ensure_not_borrowed.push((*ty, Mutability::Mut, None));
-                        } else {
-                            for tie in ties {
-                                ensure_not_borrowed.push((*ty, Mutability::Mut, Some(*tie)));
-                            }
-                        }
-                    }
                 }
 
                 for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
@@ -288,33 +259,17 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         // If this function has a hardcoded fact set, use those.
-        match Self::is_tie_func(tcx, instance.def_id()) {
-            Some(SpecialFunc::Single(mutability)) => {
-                entry.insert(Some(FuncFacts {
-                    borrows: HashMap::from_iter([(
-                        instance.args[1].as_type().unwrap(),
-                        (mutability, None),
-                    )]),
-                    borrows_all_except: None,
-                }));
-                return;
-            }
-            Some(SpecialFunc::Excluding) => {
-                entry.insert(Some(FuncFacts {
-                    borrows: HashMap::default(),
-                    borrows_all_except: Some((
-                        instance.args[1]
-                            .as_type()
-                            .unwrap()
-                            .tuple_fields()
-                            .iter()
-                            .collect(),
-                        Vec::new(),
-                    )),
-                }));
-                return;
-            }
-            _ => {}
+        if let Some(mutability) = Self::is_tie_func(tcx, instance.def_id()) {
+            entry.insert(Some(FuncFacts {
+                borrows: instance.args[1]
+                    .as_type()
+                    .unwrap()
+                    .tuple_fields()
+                    .iter()
+                    .map(|ty| (ty, (mutability, None)))
+                    .collect(),
+            }));
+            return;
         };
 
         // Acquire the function body.
@@ -333,7 +288,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // See who the function may call and where.
         let mut borrows = FxHashMap::default();
-        let mut borrows_all_except = None::<(FxHashSet<_>, Vec<_>)>;
 
         for bb in body.basic_blocks.iter() {
             // If the terminator is a call terminator.
@@ -359,13 +313,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let Some(Some(target_facts)) = &self.func_facts.get(&target_instance) else {
                 continue;
             };
-
-            if let Some((target_borrows_all_except, _)) = &target_facts.borrows_all_except {
-                borrows_all_except
-                    .get_or_insert_with(Default::default)
-                    .0
-                    .extend(target_borrows_all_except.iter().copied());
-            }
 
             let lt_id = Self::is_tie_func(tcx, target_instance.def_id()).map(|_| {
                 let param = target_instance.args[0].as_type().unwrap();
@@ -395,79 +342,38 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     *curr_lt = Some(lt_id);
                 }
             }
+        }
 
-            if let Some((exceptions, _)) = &target_facts.borrows_all_except {
-                let ties = if let Some((borrows_all_except, tied)) = &mut borrows_all_except {
-                    borrows_all_except.retain(|t| exceptions.contains(t));
-                    tied
-                } else {
-                    &mut borrows_all_except
-                        .insert((exceptions.clone(), Vec::new()))
-                        .1
+        // Now, apply the absorption rules.
+        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only_mut.get()) {
+            for ty in instance.args[0].as_type().unwrap().tuple_fields() {
+                borrows.remove(&ty);
+            }
+        }
+
+        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only_ref.get()) {
+            for ty in instance.args[0].as_type().unwrap().tuple_fields() {
+                let hash_map::Entry::Occupied(entry) = borrows.entry(ty) else {
+                    continue;
                 };
 
-                if let Some(Some(lt_id)) = lt_id {
-                    ties.push(lt_id);
+                if entry.get().0 == Mutability::Not {
+                    entry.remove();
                 }
             }
         }
 
-        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_borrows_except.get())
-        {
-            let remove_all_except = instance.args[0]
-                .as_type()
-                .unwrap()
-                .tuple_fields()
-                .iter()
-                .collect::<FxHashSet<_>>();
-
-            borrows.retain(|k, _| remove_all_except.contains(k));
-
-            if let Some((borrows_all_except, ties)) = borrows_all_except.take() {
-                for removal_all_exception in &remove_all_except {
-                    if !borrows_all_except.contains(removal_all_exception) {
-                        if ties.is_empty() {
-                            borrows.insert(*removal_all_exception, (Mutability::Mut, None));
-                        } else {
-                            for tie in &ties {
-                                borrows
-                                    .insert(*removal_all_exception, (Mutability::Mut, Some(*tie)));
-                            }
-                        }
-                    }
-                }
-            }
-            borrows_all_except = None;
-        }
-
-        self.func_facts.insert(
-            instance,
-            Some(FuncFacts {
-                borrows,
-                borrows_all_except,
-            }),
-        );
+        self.func_facts
+            .insert(instance, Some(FuncFacts { borrows }));
     }
 
-    fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<SpecialFunc> {
+    fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Mutability> {
         match tcx.opt_item_name(def_id) {
-            v if v == Some(sym::__autoken_declare_tied_ref.get()) => {
-                Some(SpecialFunc::Single(Mutability::Not))
-            }
-            v if v == Some(sym::__autoken_declare_tied_mut.get()) => {
-                Some(SpecialFunc::Single(Mutability::Mut))
-            }
-            v if v == Some(sym::__autoken_declare_tied_all_except.get()) => {
-                Some(SpecialFunc::Excluding)
-            }
+            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
+            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
             _ => None,
         }
     }
-}
-
-enum SpecialFunc {
-    Single(Mutability),
-    Excluding,
 }
 
 #[allow(non_upper_case_globals)]
@@ -480,11 +386,14 @@ mod sym {
     pub static __autoken_declare_tied_mut: CachedSymbol =
         CachedSymbol::new("__autoken_declare_tied_mut");
 
-    pub static __autoken_declare_tied_all_except: CachedSymbol =
-        CachedSymbol::new("__autoken_declare_tied_all_except");
+    pub static __autoken_absorb_only_mut: CachedSymbol =
+        CachedSymbol::new("__autoken_absorb_only_mut");
 
-    pub static __autoken_absorb_borrows_except: CachedSymbol =
-        CachedSymbol::new("__autoken_absorb_borrows_except");
+    pub static __autoken_absorb_only_ref: CachedSymbol =
+        CachedSymbol::new("__autoken_absorb_only_ref");
+
+    pub static __autoken_not_innate_ty_marker: CachedSymbol =
+        CachedSymbol::new("__autoken_not_innate_ty_marker");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }
