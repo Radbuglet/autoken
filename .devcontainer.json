@@ -7,7 +7,6 @@
 			"extensions": ["rust-lang.rust-analyzer"]
 		}
 	},
-	"postCreateCommand": "cargo install just",
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
     "workspaceFolder": "/workspace/src/playground"
 }

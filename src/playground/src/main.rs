@@ -1,6 +1,6 @@
 // Welcome to the interactive Pre-RFC for `auto_context_tokens`!
 //
-// To type-check the project, run `just` in the default terminal directory. To run it, type `just run`.
+// To type-check the project, run `make` in the default terminal directory. To run it, type `make run`.
 
 #![allow(dead_code)]
 #![allow(unused_imports)]
