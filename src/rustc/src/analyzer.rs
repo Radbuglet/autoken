@@ -25,7 +25,7 @@ use crate::{
             find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
             safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
         },
-        ty::get_fn_sig_maybe_closure,
+        ty::{get_fn_sig_maybe_closure, is_annotated_ty},
     },
 };
 
@@ -259,15 +259,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
         };
 
         // If this function has a hardcoded fact set, use those.
-        if let Some(mutability) = Self::is_tie_func(tcx, instance.def_id()) {
+        if Self::is_tie_func(tcx, instance.def_id()) {
             entry.insert(Some(FuncFacts {
-                borrows: instance.args[1]
-                    .as_type()
-                    .unwrap()
-                    .tuple_fields()
-                    .iter()
-                    .map(|ty| (ty, (mutability, None)))
-                    .collect(),
+                borrows: Self::instantiate_set(tcx, instance.args[1].as_type().unwrap()),
             }));
             return;
         };
@@ -314,7 +308,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 continue;
             };
 
-            let lt_id = Self::is_tie_func(tcx, target_instance.def_id()).map(|_| {
+            let lt_id = Self::is_tie_func(tcx, target_instance.def_id()).then(|| {
                 let param = target_instance.args[0].as_type().unwrap();
                 if param.is_unit() {
                     return None;
@@ -345,33 +339,115 @@ impl<'tcx> AnalysisDriver<'tcx> {
         }
 
         // Now, apply the absorption rules.
-        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only_mut.get()) {
-            for ty in instance.args[0].as_type().unwrap().tuple_fields() {
-                borrows.remove(&ty);
-            }
-        }
-
-        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only_ref.get()) {
-            for ty in instance.args[0].as_type().unwrap().tuple_fields() {
-                let hash_map::Entry::Occupied(entry) = borrows.entry(ty) else {
-                    continue;
-                };
-
-                if entry.get().0 == Mutability::Not {
-                    entry.remove();
-                }
-            }
+        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only.get()) {
+            Self::instantiate_set_proc(
+                tcx,
+                instance.args[0].as_type().unwrap(),
+                &mut |ty, mutability| match borrows.entry(ty) {
+                    hash_map::Entry::Occupied(entry) => {
+                        if mutability.is_mut() || entry.get().0 == Mutability::Not {
+                            entry.remove();
+                        }
+                    }
+                    hash_map::Entry::Vacant(_) => {}
+                },
+            );
         }
 
         self.func_facts
             .insert(instance, Some(FuncFacts { borrows }));
     }
 
-    fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Mutability> {
-        match tcx.opt_item_name(def_id) {
-            v if v == Some(sym::__autoken_declare_tied_ref.get()) => Some(Mutability::Not),
-            v if v == Some(sym::__autoken_declare_tied_mut.get()) => Some(Mutability::Mut),
-            _ => None,
+    fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+        tcx.opt_item_name(def_id) == Some(sym::__autoken_declare_tied.get())
+    }
+
+    fn instantiate_set(
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)> {
+        let mut set = FxHashMap::<Ty<'tcx>, (Mutability, Option<Symbol>)>::default();
+
+        Self::instantiate_set_proc(tcx, ty, &mut |ty, mutability| match set.entry(ty) {
+            hash_map::Entry::Occupied(entry) => {
+                if mutability.is_mut() {
+                    entry.into_mut().0 = Mutability::Mut;
+                }
+            }
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert((Mutability::Mut, None));
+            }
+        });
+
+        set
+    }
+
+    fn instantiate_set_proc(
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        add: &mut impl FnMut(Ty<'tcx>, Mutability),
+    ) {
+        match ty.kind() {
+            // Union
+            TyKind::Tuple(fields) => {
+                for field in fields.iter() {
+                    Self::instantiate_set_proc(tcx, field, add);
+                }
+            }
+            TyKind::Adt(def, generics)
+                if is_annotated_ty(def, sym::__autoken_ref_ty_marker.get()) =>
+            {
+                add(generics[0].as_type().unwrap(), Mutability::Not);
+            }
+            TyKind::Adt(def, generics)
+                if is_annotated_ty(def, sym::__autoken_mut_ty_marker.get()) =>
+            {
+                add(generics[0].as_type().unwrap(), Mutability::Mut);
+            }
+            TyKind::Adt(def, generics)
+                if is_annotated_ty(def, sym::__autoken_downgrade_ty_marker.get()) =>
+            {
+                let mut set = Self::instantiate_set(tcx, generics[0].as_type().unwrap());
+
+                for (mutability, _) in set.values_mut() {
+                    *mutability = Mutability::Not;
+                }
+
+                for (ty, (mutability, _)) in set {
+                    add(ty, mutability);
+                }
+            }
+            TyKind::Adt(def, generics)
+                if is_annotated_ty(def, sym::__autoken_diff_ty_marker.get()) =>
+            {
+                let mut set = Self::instantiate_set(tcx, generics[0].as_type().unwrap());
+
+                fn remover_func<'set, 'tcx>(
+                    set: &'set mut FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
+                ) -> impl FnMut(Ty<'tcx>, Mutability) + 'set {
+                    |ty, mutability| match set.entry(ty) {
+                        hash_map::Entry::Occupied(entry) => {
+                            if mutability.is_mut() {
+                                entry.remove();
+                            } else {
+                                entry.into_mut().0 = Mutability::Not;
+                            }
+                        }
+                        hash_map::Entry::Vacant(_) => {}
+                    }
+                }
+
+                Self::instantiate_set_proc(
+                    tcx,
+                    generics[1].as_type().unwrap(),
+                    &mut remover_func(&mut set),
+                );
+
+                for (ty, (mutability, _)) in set {
+                    add(ty, mutability);
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -380,20 +456,19 @@ impl<'tcx> AnalysisDriver<'tcx> {
 mod sym {
     use crate::util::mir::CachedSymbol;
 
-    pub static __autoken_declare_tied_ref: CachedSymbol =
-        CachedSymbol::new("__autoken_declare_tied_ref");
+    pub static __autoken_declare_tied: CachedSymbol = CachedSymbol::new("__autoken_declare_tied");
 
-    pub static __autoken_declare_tied_mut: CachedSymbol =
-        CachedSymbol::new("__autoken_declare_tied_mut");
+    pub static __autoken_absorb_only: CachedSymbol = CachedSymbol::new("__autoken_absorb_only");
 
-    pub static __autoken_absorb_only_mut: CachedSymbol =
-        CachedSymbol::new("__autoken_absorb_only_mut");
+    pub static __autoken_mut_ty_marker: CachedSymbol = CachedSymbol::new("__autoken_mut_ty_marker");
 
-    pub static __autoken_absorb_only_ref: CachedSymbol =
-        CachedSymbol::new("__autoken_absorb_only_ref");
+    pub static __autoken_ref_ty_marker: CachedSymbol = CachedSymbol::new("__autoken_ref_ty_marker");
 
-    pub static __autoken_not_innate_ty_marker: CachedSymbol =
-        CachedSymbol::new("__autoken_not_innate_ty_marker");
+    pub static __autoken_downgrade_ty_marker: CachedSymbol =
+        CachedSymbol::new("__autoken_downgrade_ty_marker");
+
+    pub static __autoken_diff_ty_marker: CachedSymbol =
+        CachedSymbol::new("__autoken_diff_ty_marker");
 
     pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }

@@ -4,28 +4,28 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
     ty::{
-        self, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamConst, Ty, TyCtxt,
-        TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
-        TypeVisitableExt, TypeVisitor,
+        self, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamConst, Ty,
+        TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
     },
 };
+use rustc_span::Symbol;
 
-pub fn enumerate_named_types<'tcx>(ty: Ty<'tcx>, f: impl FnMut(Ty<'tcx>)) {
-    struct MyVisitor<F>(F);
+pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
+    let mut fields = def.all_fields();
 
-    impl<'tcx, F> TypeVisitor<TyCtxt<'tcx>> for MyVisitor<F>
-    where
-        F: FnMut(Ty<'tcx>),
-    {
-        type Result = ();
+    let Some(field) = fields.next() else {
+        return false;
+    };
 
-        fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
-            self.0(t);
-            t.super_visit_with(self)
-        }
+    if field.name != marker {
+        return false;
     }
 
-    ty.visit_with(&mut MyVisitor(f))
+    let None = fields.next() else {
+        return false;
+    };
+
+    true
 }
 
 pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {
