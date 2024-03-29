@@ -1,13 +1,13 @@
 use std::collections::hash_map;
 
-use rustc_hir::{
-    def::DefKind,
-    def_id::{DefId, DefIndex, LocalDefId},
-};
+use rustc_hir::{def::DefKind, def_id::DefId};
 
 use rustc_middle::{
     mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
-    ty::{GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt, TyKind},
+    ty::{
+        GenericArg, GenericArgKind, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Ty,
+        TyCtxt, TyKind,
+    },
 };
 use rustc_span::Symbol;
 
@@ -20,342 +20,156 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
-        hash::FxHashMap,
+        hash::{FxHashMap, FxHashSet},
         mir::{
-            find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
-            safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
+            does_have_instance_mir, find_region_with_name, for_each_unsized_func,
+            iter_all_local_def_ids, safeishly_grab_local_def_id_mir,
         },
         ty::{get_fn_sig_maybe_closure, is_annotated_ty},
     },
 };
 
+use petgraph::stable_graph::{NodeIndex, StableGraph};
+
 // === Engine === //
 
 #[derive(Debug, Default)]
 pub struct AnalysisDriver<'tcx> {
-    func_facts: FxHashMap<Instance<'tcx>, Option<FuncFacts<'tcx>>>,
-    id_gen: u64,
+    generic_map: FxHashMap<DefId, NodeIndex>,
+    generic_graph: StableGraph<FunctionFacts<'tcx>, &'tcx List<GenericArg<'tcx>>>,
 }
 
-#[derive(Debug)]
-struct FuncFacts<'tcx> {
-    borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
+#[derive(Debug, Default)]
+struct FunctionFacts<'tcx> {
+    borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
     pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
-        let id_count = tcx.untracked().definitions.read().def_index_count();
-
         // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
-        //
-        // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
-        for i in 0..id_count {
-            let local_def = LocalDefId {
-                local_def_index: DefIndex::from_usize(i),
-            };
-
-            if safeishly_grab_def_id_mir(tcx, local_def).is_some() {
-                assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
+        for did in iter_all_local_def_ids(tcx) {
+            if safeishly_grab_local_def_id_mir(tcx, did).is_some() {
+                assert!(read_feed::<MirBuiltStasher>(tcx, did).is_some());
             }
         }
 
-        // Get the token use sets of each function.
+        // Compute isolated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
 
-        for i in 0..id_count {
-            let local_def = LocalDefId {
-                local_def_index: DefIndex::from_usize(i),
-            };
-
-            // Ensure that we're analyzing a function...
-            if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
-                continue;
-            }
-
-            // ...which can be properly monomorphized.
-            let mut args_wf = true;
-            let args =
-                // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
-                // over the generic arguments of the parent.
-                GenericArgs::for_item(tcx, local_def.to_def_id(), |param, _| match param.kind {
-                    // We can handle these
-                    GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
-                    GenericParamDefKind::Const {
-                        is_host_effect: true,
-                        ..
-                    } => tcx.consts.true_.into(),
-
-                    // We can't handle these; return a dummy value and set the `args_wf` flag.
-                    GenericParamDefKind::Type { .. } => {
-                        args_wf = false;
-                        tcx.types.unit.into()
-                    }
-                    GenericParamDefKind::Const { .. } => {
-                        args_wf = false;
-                        tcx.consts.true_.into()
-                    }
-                });
-
-            if args_wf {
-                self.analyze_fn_facts(tcx, Instance::new(local_def.to_def_id(), args));
+        for did in iter_all_local_def_ids(tcx) {
+            let did = did.to_def_id();
+            if does_have_instance_mir(tcx, did) && !Self::is_tie_func(tcx, did) {
+                self.discover_isolated_func_facts(tcx, did);
             }
         }
 
-        // Check for undeclared unsizing.
-        for instance in self.func_facts.keys().copied() {
-            let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-                continue;
-            };
-
-            for_each_unsized_func(tcx, instance, body, |instance| {
-                let Some(facts) = self.func_facts.get(&instance) else {
-                    return;
-                };
-
-                let facts = facts.as_ref().unwrap();
-
-                if !facts.borrows.is_empty() {
-                    tcx.sess.dcx().span_err(
-                        tcx.def_span(instance.def_id()),
-                        "cannot unsize this function as it accesses global tokens",
-                    );
-                }
-            });
-        }
-
-        // Generate shadow functions for each locally-visited function.
+        // Compute propagated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
+        dbg!(&self.generic_graph);
 
-        let mut shadows = Vec::new();
-
-        for (instance, facts) in &self.func_facts {
-            let facts = facts.as_ref().unwrap();
-            let Some(orig_id) = instance.def_id().as_local() else {
-                continue;
-            };
-
-            // Modify body
-            let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_id).cloned() else {
-                // Some `DefIds` with facts are just shims—not functions with actual MIR.
-                continue;
-            };
-
-            let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
-
-            for (key, (_, tied)) in &facts.borrows {
-                if let Some(tied) = tied {
-                    body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
-                }
-            }
-
-            let bb_count = body_mutator.body().basic_blocks.len();
-            for bb in 0..bb_count {
-                let bb = BasicBlock::from_usize(bb);
-
-                // If it has a concrete callee...
-                let Some(Terminator {
-                    kind: TerminatorKind::Call { func: callee, .. },
-                    ..
-                }) = &body_mutator.body().basic_blocks[bb].terminator
-                else {
-                    continue;
-                };
-
-                // FIXME: Here too!
-                let Some(target_instance_mono) = get_static_callee_from_terminator(
-                    tcx,
-                    instance,
-                    &body_mutator.body().local_decls,
-                    callee,
-                ) else {
-                    continue;
-                };
-
-                // Determine what it borrows
-                let Some(callee_borrows) = &self.func_facts.get(&target_instance_mono) else {
-                    // This could happen if the optimized MIR reveals that a given function is
-                    // unreachable.
-                    continue;
-                };
-
-                let callee_borrows = callee_borrows.as_ref().unwrap();
-
-                // Determine the set of tokens borrowed by this function.
-                let mut ensure_not_borrowed = Vec::new();
-
-                for (ty, (mutbl, tie)) in &callee_borrows.borrows {
-                    ensure_not_borrowed.push((*ty, *mutbl, *tie));
-                }
-
-                for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
-                    body_mutator.ensure_not_borrowed_at(bb, TokenKey::Ty(ty), mutability);
-
-                    if let Some(tied) = tied {
-                        // Compute the type as which the function result is going to be bound.
-                        let mapped_region = find_region_with_name(
-                            tcx,
-                            // N.B. we need to use the monomorphized ID since the non-monomorphized
-                            //  ID could just be the parent trait function def, which won't have the
-                            //  user's regions.
-                            get_fn_sig_maybe_closure(tcx, target_instance_mono.def_id())
-                                .skip_binder()
-                                .skip_binder()
-                                .output(),
-                            tied,
-                        )
-                        .unwrap();
-
-                        body_mutator.tie_token_to_its_return(
-                            bb,
-                            TokenKey::Ty(ty),
-                            mutability,
-                            |region| region == mapped_region,
-                        );
-                    }
-                }
-            }
-
-            drop(body_mutator);
-
-            // Feed the query system the shadow function's properties.
-            let shadow_kind = tcx.def_kind(orig_id);
-            let shadow_def = tcx.at(body.span).create_def(
-                tcx.local_parent(orig_id),
-                Symbol::intern(&format!(
-                    "{}_autoken_shadow_{}",
-                    tcx.opt_item_name(orig_id.to_def_id())
-                        .unwrap_or_else(|| unnamed.get()),
-                    self.id_gen,
-                )),
-                shadow_kind,
-            );
-            self.id_gen += 1;
-
-            feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
-            shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_id)));
-            shadow_def.visibility(tcx.visibility(orig_id));
-
-            if shadow_kind == DefKind::AssocFn {
-                shadow_def.associated_item(tcx.associated_item(orig_id));
-            }
-
-            // ...and queue it up for borrow checking!
-            shadows.push(shadow_def);
-        }
-
-        // Finally, borrow check everything in a single go to avoid issues with stolen values.
-        for shadow in shadows {
-            // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
-            let _ = tcx.mir_borrowck(shadow.def_id());
-        }
+        // TODO
     }
 
-    // FIXME: Ensure that facts collected after a self-recursive function was analyzed are also
-    //  propagated to it.
-    fn analyze_fn_facts(&mut self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
-        // Ensure that we don't analyze the same function circularly or redundantly.
-        let hash_map::Entry::Vacant(entry) = self.func_facts.entry(instance) else {
-            return;
+    fn discover_isolated_func_facts(&mut self, tcx: TyCtxt<'tcx>, src_did: DefId) -> NodeIndex {
+        assert!(does_have_instance_mir(tcx, src_did));
+        assert!(!Self::is_tie_func(tcx, src_did));
+
+        // See if we have a node already
+        let entry = match self.generic_map.entry(src_did) {
+            hash_map::Entry::Vacant(entry) => entry,
+            hash_map::Entry::Occupied(entry) => {
+                return *entry.into_mut();
+            }
         };
 
-        // If this function has a hardcoded fact set, use those.
-        if Self::is_tie_func(tcx, instance.def_id()) {
-            entry.insert(Some(FuncFacts {
-                borrows: Self::instantiate_set(tcx, instance.args[1].as_type().unwrap()),
-            }));
-            return;
-        };
+        let src_id = self.generic_graph.add_node(FunctionFacts::default());
+        entry.insert(src_id);
 
-        // Acquire the function body.
-        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-            return;
-        };
+        let src_body = tcx.optimized_mir(src_did);
 
-        // This is a real function so let's add it to the fact map.
-        entry.insert(None);
-
-        // Ensure that we analyze the facts of each unsized function since unsize-checking depends
-        // on this information being available.
-        for_each_unsized_func(tcx, instance, body, |instance| {
-            self.analyze_fn_facts(tcx, instance);
-        });
-
-        // See who the function may call and where.
-        let mut borrows = FxHashMap::default();
-
-        for bb in body.basic_blocks.iter() {
-            // If the terminator is a call terminator.
+        for src_bb in src_body.basic_blocks.iter() {
             let Some(Terminator {
-                kind: TerminatorKind::Call { func: callee, .. },
+                kind:
+                    TerminatorKind::Call {
+                        func: dest_func, ..
+                    },
                 ..
-            }) = &bb.terminator
+            }) = &src_bb.terminator
             else {
                 continue;
             };
 
-            let Some(target_instance) =
-                get_static_callee_from_terminator(tcx, &instance, &body.local_decls, callee)
-            else {
-                // FIXME: Handle these as well.
-                continue;
-            };
+            let dest_func = dest_func.ty(&src_body.local_decls, tcx);
 
-            // Recurse into its callee.
-            self.analyze_fn_facts(tcx, target_instance);
-
-            // ...and add its borrows to the borrows set.
-            let Some(Some(target_facts)) = &self.func_facts.get(&target_instance) else {
-                continue;
-            };
-
-            let lt_id = Self::is_tie_func(tcx, target_instance.def_id()).then(|| {
-                let param = target_instance.args[0].as_type().unwrap();
-                if param.is_unit() {
-                    return None;
+            let (dest_did, dest_args) = match dest_func.kind() {
+                TyKind::FnPtr(_) => {
+                    // (ignored: this is a dynamic call)
+                    continue;
                 }
+                TyKind::FnDef(did, args) => (*did, *args),
+                TyKind::Closure(did, args) => (*did, args.as_closure().args),
+                _ => unreachable!(),
+            };
 
-                let first_field = param.ty_adt_def().unwrap().all_fields().next().unwrap();
-                let first_field = tcx.type_of(first_field.did).skip_binder();
-                let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind() else {
-                    unreachable!();
+            let Ok(dest_args) =
+                tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
+            else {
+                continue;
+            };
+
+            let Ok(Some(dest_instance)) = tcx.resolve_instance(
+                tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))),
+            ) else {
+                continue;
+            };
+
+            let dest_did = dest_instance.def_id();
+
+            if Self::is_tie_func(tcx, dest_did) {
+                let borrows = &mut self.generic_graph[src_id].borrows;
+
+                let tied = dest_args[0].expect_ty();
+                let tied = if tied.is_unit() {
+                    None
+                } else {
+                    let first_field = tied.ty_adt_def().unwrap().all_fields().next().unwrap();
+                    let first_field = tcx.type_of(first_field.did).skip_binder();
+                    let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind() else {
+                        unreachable!();
+                    };
+
+                    Some(first_field.get_name().unwrap())
                 };
 
-                Some(first_field.get_name().unwrap())
-            });
+                Self::instantiate_set_proc(
+                    tcx,
+                    tcx.erase_regions_ty(dest_args[1].expect_ty()),
+                    &mut |key, mutability| {
+                        let (curr_mutability, curr_ties) = borrows
+                            .entry(key)
+                            .or_insert((mutability, FxHashSet::default()));
 
-            for (borrow_key, (borrow_mut, _)) in &target_facts.borrows {
-                let (curr_mut, curr_lt) = borrows
-                    .entry(*borrow_key)
-                    .or_insert((Mutability::Not, None));
-
-                if borrow_mut.is_mut() {
-                    *curr_mut = Mutability::Mut;
-                }
-
-                if let Some(Some(lt_id)) = lt_id {
-                    *curr_lt = Some(lt_id);
-                }
-            }
-        }
-
-        // Now, apply the absorption rules.
-        if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only.get()) {
-            Self::instantiate_set_proc(
-                tcx,
-                instance.args[0].as_type().unwrap(),
-                &mut |ty, mutability| match borrows.entry(ty) {
-                    hash_map::Entry::Occupied(entry) => {
-                        if mutability.is_mut() || entry.get().0 == Mutability::Not {
-                            entry.remove();
+                        if let Some(tied) = tied {
+                            curr_ties.insert(tied);
                         }
-                    }
-                    hash_map::Entry::Vacant(_) => {}
-                },
-            );
+
+                        *curr_mutability = (*curr_mutability).max(mutability);
+                    },
+                );
+
+                continue;
+            }
+
+            if !does_have_instance_mir(tcx, dest_did) {
+                continue;
+            }
+
+            let dst_id = self.discover_isolated_func_facts(tcx, dest_did);
+
+            self.generic_graph.add_edge(src_id, dst_id, dest_args);
         }
 
-        self.func_facts
-            .insert(instance, Some(FuncFacts { borrows }));
+        src_id
     }
 
     fn is_tie_func(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
@@ -447,7 +261,9 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     add(ty, mutability);
                 }
             }
-            _ => unreachable!(),
+
+            // TODO: Users can actually reach this now if they place a generic. We should reject that.
+            _ => unreachable!("{ty:?}"),
         }
     }
 }

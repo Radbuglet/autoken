@@ -2,15 +2,18 @@ use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
 use rustc_hash::FxHashMap;
-use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
-use rustc_index::IndexVec;
+use rustc_hir::{
+    def::DefKind,
+    def_id::{DefId, DefIndex, LocalDefId},
+    ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
+};
 use rustc_middle::{
-    mir::{Body, CastKind, Local, LocalDecl, Operand, Rvalue, StatementKind},
+    mir::{Body, CastKind, Rvalue, StatementKind},
     ty::{
         adjustment::PointerCoercion,
         fold::{FnMutDelegate, RegionFolder},
-        EarlyBinder, GenericArg, Instance, InstanceDef, ParamEnv, Region, Ty, TyCtxt, TyKind,
-        TypeAndMut, TypeFoldable, VtblEntry,
+        EarlyBinder, GenericArg, Instance, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeAndMut,
+        TypeFoldable, VtblEntry,
     },
 };
 use rustc_span::Symbol;
@@ -34,6 +37,17 @@ impl CachedSymbol {
     pub fn get(&self) -> Symbol {
         *self.sym.get_or_init(|| Symbol::intern(self.raw))
     }
+}
+
+// === `iter_all_local_def_ids` === //
+
+// N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
+pub fn iter_all_local_def_ids(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDefId> {
+    let idx_count = tcx.untracked().definitions.read().def_index_count();
+
+    (0..idx_count).map(|i| LocalDefId {
+        local_def_index: DefIndex::from_usize(i),
+    })
 }
 
 // === `find_region_with_name` === //
@@ -64,36 +78,12 @@ pub fn find_region_with_name<'tcx>(
     })
 }
 
-// === `get_callee_from_terminator` === //
-
-pub fn get_static_callee_from_terminator<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: &Instance<'tcx>,
-    caller_local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-    callee: &Operand<'tcx>,
-) -> Option<Instance<'tcx>> {
-    let callee = callee.ty(caller_local_decls, tcx);
-    let callee = caller.instantiate_mir_and_normalize_erasing_regions(
-        tcx,
-        ParamEnv::reveal_all(),
-        EarlyBinder::bind(callee),
-    );
-
-    let TyKind::FnDef(callee_id, generics) = callee.kind() else {
-        return None;
-    };
-
-    Some(Instance::expect_resolve(
-        tcx,
-        ParamEnv::reveal_all(),
-        *callee_id,
-        generics,
-    ))
-}
-
 // === `safeishly_grab_def_id_mir` === //
 
-pub fn safeishly_grab_def_id_mir(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
+pub fn safeishly_grab_local_def_id_mir(
+    tcx: TyCtxt<'_>,
+    id: LocalDefId,
+) -> Option<&Steal<Body<'_>>> {
     // Copied from `rustc_hir_typecheck::primary_body_of`
     match tcx.hir_node_by_def_id(id) {
         Node::Item(item) => match item.kind {
@@ -132,61 +122,15 @@ pub fn safeishly_grab_def_id_mir(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Ste
     Some(tcx.mir_built(id))
 }
 
-// === `safeishly_grab_instance_mir` === //
+// === `does_have_instance_mir` === //
 
-#[derive(Debug)]
-pub enum MirGrabResult<'tcx> {
-    Found(&'tcx Body<'tcx>),
-    Dynamic,
-    BottomsOut,
+pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn)
+        && !tcx.is_foreign_item(did)
+        && tcx.is_mir_available(did)
 }
 
-pub fn safeishly_grab_instance_mir<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: InstanceDef<'tcx>,
-) -> MirGrabResult<'tcx> {
-    match instance {
-        // Items are defined by users and thus have MIR... even if they're from an external crate.
-        InstanceDef::Item(item) => {
-            // However, foreign items and lang-items don't have MIR
-            if !tcx.is_foreign_item(item) {
-                MirGrabResult::Found(tcx.instance_mir(instance))
-            } else {
-                MirGrabResult::BottomsOut
-            }
-        }
-
-        // This is a shim around `FnDef` (or maybe an `FnPtr`?) for `FnTrait::call_x`. We generate
-        // the shim MIR for it and let the regular instance body processing handle it.
-        InstanceDef::FnPtrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
-
-        // All the remaining things here require shims. We referenced...
-        //
-        // https://github.com/rust-lang/rust/blob/9c20ddd956426d577d77cb3f57a7db2227a3c6e9/compiler/rustc_mir_transform/src/shim.rs#L29
-        //
-        // ...to figure out which instance def types support this operation.
-
-        // These are always supported.
-        InstanceDef::ThreadLocalShim(_)
-        | InstanceDef::DropGlue(_, _)
-        | InstanceDef::ClosureOnceShim { .. }
-        | InstanceDef::CloneShim(_, _)
-        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
-
-        // These are never supported and will never return to the user.
-        InstanceDef::Intrinsic(_) => MirGrabResult::BottomsOut,
-
-        // These are dynamic dispatches and should not be analyzed since we analyze them in a
-        // different way.
-        InstanceDef::VTableShim(_) | InstanceDef::ReifyShim(_) | InstanceDef::Virtual(_, _) => {
-            MirGrabResult::Dynamic
-        }
-
-        // TODO: Handle these properly.
-        InstanceDef::ConstructCoroutineInClosureShim { .. }
-        | InstanceDef::CoroutineKindShim { .. } => MirGrabResult::Dynamic,
-    }
-}
+// === Unsizing Analysis === //
 
 // Referenced from https://github.com/rust-lang/rust/blob/4b85902b438f791c5bfcb6b1c5b476d5b88e2bef/compiler/rustc_codegen_cranelift/src/unsize.rs#L62
 pub fn get_unsized_ty<'tcx>(
