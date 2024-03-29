@@ -4,15 +4,15 @@ use rustc_hir::{def::DefKind, def_id::DefId};
 
 use rustc_middle::{
     mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
+    query::Key,
     ty::{
         GenericArg, GenericArgKind, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Ty,
         TyCtxt, TyKind,
     },
 };
-use rustc_span::Symbol;
+use rustc_span::{sym::TyKind, Span, Symbol};
 
 use crate::{
-    analyzer::sym::unnamed,
     mir::{TokenKey, TokenMirBuilder},
     util::{
         feeder::{
@@ -42,6 +42,7 @@ pub struct AnalysisDriver<'tcx> {
 #[derive(Debug, Default)]
 struct FunctionFacts<'tcx> {
     borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
+    sets: FxHashMap<Ty<'tcx>, Mutability>,
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -65,7 +66,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Compute propagated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
-        dbg!(&self.generic_graph);
+        // dbg!(&self.generic_graph);
 
         // TODO
     }
@@ -126,7 +127,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let dest_did = dest_instance.def_id();
 
             if Self::is_tie_func(tcx, dest_did) {
-                let borrows = &mut self.generic_graph[src_id].borrows;
+                let facts = &mut self.generic_graph[src_id];
 
                 let tied = dest_args[0].expect_ty();
                 let tied = if tied.is_unit() {
@@ -143,9 +144,11 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                 Self::instantiate_set_proc(
                     tcx,
+                    src_body.span,
                     tcx.erase_regions_ty(dest_args[1].expect_ty()),
                     &mut |key, mutability| {
-                        let (curr_mutability, curr_ties) = borrows
+                        let (curr_mutability, curr_ties) = facts
+                            .borrows
                             .entry(key)
                             .or_insert((mutability, FxHashSet::default()));
 
@@ -155,6 +158,10 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
                         *curr_mutability = (*curr_mutability).max(mutability);
                     },
+                    Some(&mut |set, mutability| {
+                        let curr_mut = facts.sets.entry(set).or_insert(mutability);
+                        *curr_mut = (*curr_mut).max(mutability);
+                    }),
                 );
 
                 continue;
@@ -178,68 +185,99 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
     fn instantiate_set(
         tcx: TyCtxt<'tcx>,
+        span: Span,
         ty: Ty<'tcx>,
+        add_generic_union_set: Option<&mut (dyn FnMut(Ty<'tcx>, Mutability) + '_)>,
     ) -> FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)> {
         let mut set = FxHashMap::<Ty<'tcx>, (Mutability, Option<Symbol>)>::default();
 
-        Self::instantiate_set_proc(tcx, ty, &mut |ty, mutability| match set.entry(ty) {
-            hash_map::Entry::Occupied(entry) => {
-                if mutability.is_mut() {
-                    entry.into_mut().0 = Mutability::Mut;
+        Self::instantiate_set_proc(
+            tcx,
+            span,
+            ty,
+            &mut |ty, mutability| match set.entry(ty) {
+                hash_map::Entry::Occupied(entry) => {
+                    if mutability.is_mut() {
+                        entry.into_mut().0 = Mutability::Mut;
+                    }
                 }
-            }
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert((Mutability::Mut, None));
-            }
-        });
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert((Mutability::Mut, None));
+                }
+            },
+            add_generic_union_set,
+        );
 
         set
     }
 
     fn instantiate_set_proc(
         tcx: TyCtxt<'tcx>,
+        span: Span,
         ty: Ty<'tcx>,
-        add: &mut impl FnMut(Ty<'tcx>, Mutability),
+        add_ty: &mut dyn FnMut(Ty<'tcx>, Mutability),
+        mut add_generic_union_set: Option<&mut (dyn FnMut(Ty<'tcx>, Mutability) + '_)>,
     ) {
         match ty.kind() {
             // Union
             TyKind::Tuple(fields) => {
                 for field in fields.iter() {
-                    Self::instantiate_set_proc(tcx, field, add);
+                    Self::instantiate_set_proc(
+                        tcx,
+                        span,
+                        field,
+                        add_ty,
+                        add_generic_union_set.as_deref_mut(),
+                    );
                 }
             }
             TyKind::Adt(def, generics)
                 if is_annotated_ty(def, sym::__autoken_ref_ty_marker.get()) =>
             {
-                add(generics[0].as_type().unwrap(), Mutability::Not);
+                add_ty(generics[0].as_type().unwrap(), Mutability::Not);
             }
             TyKind::Adt(def, generics)
                 if is_annotated_ty(def, sym::__autoken_mut_ty_marker.get()) =>
             {
-                add(generics[0].as_type().unwrap(), Mutability::Mut);
+                add_ty(generics[0].as_type().unwrap(), Mutability::Mut);
             }
             TyKind::Adt(def, generics)
                 if is_annotated_ty(def, sym::__autoken_downgrade_ty_marker.get()) =>
             {
-                let mut set = Self::instantiate_set(tcx, generics[0].as_type().unwrap());
+                let mut set = Self::instantiate_set(
+                    tcx,
+                    span,
+                    generics[0].as_type().unwrap(),
+                    add_generic_union_set
+                        .as_deref_mut()
+                        .map(|add_generic_union_set| {
+                            |set: Ty<'tcx>, _mut: Mutability| {
+                                add_generic_union_set(set, Mutability::Not)
+                            }
+                        })
+                        .as_mut()
+                        .map(|v| v as &mut (dyn FnMut(Ty<'tcx>, Mutability) + '_)),
+                );
 
                 for (mutability, _) in set.values_mut() {
                     *mutability = Mutability::Not;
                 }
 
                 for (ty, (mutability, _)) in set {
-                    add(ty, mutability);
+                    add_ty(ty, mutability);
                 }
             }
             TyKind::Adt(def, generics)
                 if is_annotated_ty(def, sym::__autoken_diff_ty_marker.get()) =>
             {
-                let mut set = Self::instantiate_set(tcx, generics[0].as_type().unwrap());
+                let mut set =
+                    Self::instantiate_set(tcx, span, generics[0].as_type().unwrap(), None);
 
-                fn remover_func<'set, 'tcx>(
-                    set: &'set mut FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
-                ) -> impl FnMut(Ty<'tcx>, Mutability) + 'set {
-                    |ty, mutability| match set.entry(ty) {
+                Self::instantiate_set_proc(
+                    tcx,
+                    span,
+                    generics[1].as_type().unwrap(),
+                    &mut |ty, mutability| match set.entry(ty) {
                         hash_map::Entry::Occupied(entry) => {
                             if mutability.is_mut() {
                                 entry.remove();
@@ -248,22 +286,24 @@ impl<'tcx> AnalysisDriver<'tcx> {
                             }
                         }
                         hash_map::Entry::Vacant(_) => {}
-                    }
-                }
-
-                Self::instantiate_set_proc(
-                    tcx,
-                    generics[1].as_type().unwrap(),
-                    &mut remover_func(&mut set),
+                    },
+                    None,
                 );
 
                 for (ty, (mutability, _)) in set {
-                    add(ty, mutability);
+                    add_ty(ty, mutability);
                 }
             }
 
-            // TODO: Users can actually reach this now if they place a generic. We should reject that.
-            _ => unreachable!("{ty:?}"),
+            TyKind::Param(_) | TyKind::Alias(_, _) => {
+                if let Some(add_generic_union_set) = &mut add_generic_union_set {
+                    add_generic_union_set(ty, Mutability::Mut);
+                } else {
+                    tcx.dcx()
+                        .span_err(span, "generic sets can only appear in top-level unions");
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }
