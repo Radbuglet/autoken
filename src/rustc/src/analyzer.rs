@@ -6,8 +6,8 @@ use rustc_middle::{
     mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
     query::Key,
     ty::{
-        GenericArg, GenericArgKind, GenericArgs, GenericParamDefKind, Instance, List, ParamEnv, Ty,
-        TyCtxt, TyKind,
+        EarlyBinder, GenericArg, GenericArgKind, GenericArgs, GenericParamDefKind, Instance, List,
+        ParamEnv, Ty, TyCtxt, TyKind,
     },
 };
 use rustc_span::{sym::TyKind, Span, Symbol};
@@ -40,10 +40,21 @@ pub struct AnalysisDriver<'tcx> {
     generic_graph: StableGraph<FunctionFacts<'tcx>, &'tcx List<GenericArg<'tcx>>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct FunctionFacts<'tcx> {
+    def_id: DefId,
     borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
     sets: FxHashMap<Ty<'tcx>, Mutability>,
+}
+
+impl FunctionFacts<'_> {
+    pub fn new(def_id: DefId) -> Self {
+        Self {
+            def_id,
+            borrows: FxHashMap::default(),
+            sets: FxHashMap::default(),
+        }
+    }
 }
 
 impl<'tcx> AnalysisDriver<'tcx> {
@@ -70,15 +81,34 @@ impl<'tcx> AnalysisDriver<'tcx> {
         propagate_graph(
             &mut self.generic_graph,
             // merge_into
-            |graph, edge, from, called| {
-                // TODO
+            |graph, edge, caller, called| {
+                let caller_instance = Instance::new(graph[caller].def_id, graph[edge]);
+
+                let (caller, called) = graph.index_twice_mut(caller, called);
+
+                for (ty, (mutability, _)) in &called.borrows {
+                    let ty = caller_instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(*ty),
+                    );
+
+                    let (other_mutability, _) = caller
+                        .borrows
+                        .entry(ty)
+                        .or_insert((*mutability, FxHashSet::default()));
+
+                    *other_mutability = (*other_mutability).max(*mutability);
+                }
+
+                // TODO: Handle borrow sets and constraints
             },
             // replicate
             |graph, into, from| {
-                let (into, from) = graph.index_twice_mut(into, from);
-                *into = from.clone();
+                graph[into] = graph[from].clone();
             },
         );
+
         dbg!(&self.generic_graph);
     }
 
@@ -94,7 +124,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             }
         };
 
-        let src_id = self.generic_graph.add_node(FunctionFacts::default());
+        let src_id = self.generic_graph.add_node(FunctionFacts::new(src_did));
         entry.insert(src_id);
 
         let src_body = tcx.optimized_mir(src_did);

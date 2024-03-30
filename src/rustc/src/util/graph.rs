@@ -9,23 +9,45 @@ use petgraph::{
 };
 
 #[derive(Default)]
-pub struct OutEdgeIter {
+pub struct EdgeIter {
     buffer: Vec<(EdgeIndex, NodeIndex)>,
 }
 
-impl OutEdgeIter {
+impl EdgeIter {
     pub fn iter<N, E>(
         &mut self,
         graph: &mut StableGraph<N, E>,
         node: NodeIndex,
+        direction: Direction,
     ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
         self.buffer.clear();
-        self.buffer.extend(
-            graph
-                .edges_directed(node, Direction::Outgoing)
-                .map(|edge| (edge.id(), edge.target())),
-        );
+        self.buffer
+            .extend(graph.edges_directed(node, direction).map(|edge| {
+                (
+                    edge.id(),
+                    match direction {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    },
+                )
+            }));
         self.buffer.iter().copied()
+    }
+
+    pub fn iter_in<N, E>(
+        &mut self,
+        graph: &mut StableGraph<N, E>,
+        node: NodeIndex,
+    ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
+        self.iter(graph, node, Direction::Incoming)
+    }
+
+    pub fn iter_out<N, E>(
+        &mut self,
+        graph: &mut StableGraph<N, E>,
+        node: NodeIndex,
+    ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
+        self.iter(graph, node, Direction::Outgoing)
     }
 }
 
@@ -53,18 +75,18 @@ pub fn propagate_graph<N, E>(
     const SENTINEL_IN_SCC_NOT_VISITED: usize = usize::MAX - 1;
     const SENTINEL_IN_SCC_VISITED: usize = usize::MAX;
 
-    let mut out_edges = OutEdgeIter::default();
+    let mut edges = EdgeIter::default();
 
     // Prepare a regular toposort. We do this now so we can reuse the in-degree buffer to store
     // sentinel values for the SCC phase.
-    let mut topo_in_degs = Vec::new();
+    let mut topo_out_degs = Vec::new();
     let mut topo_visit_queue = Vec::new();
 
     for node in graph.node_indices() {
-        debug_assert_eq!(node.index(), topo_in_degs.len());
+        debug_assert_eq!(node.index(), topo_out_degs.len());
 
-        let in_degree = graph.edges_directed(node, Direction::Incoming).count();
-        topo_in_degs.push(in_degree);
+        let in_degree = graph.edges_directed(node, Direction::Outgoing).count();
+        topo_out_degs.push(in_degree);
 
         if in_degree == 0 {
             topo_visit_queue.push(node);
@@ -77,36 +99,36 @@ pub fn propagate_graph<N, E>(
     for nodes in tarjan_scc_filter_trivial(&*graph) {
         // Give each of the nodes in the component a sentinel in-degree.
         for &node in &nodes {
-            debug_assert_ne!(topo_in_degs[node.index()], 0);
-            topo_in_degs[node.index()] = SENTINEL_IN_SCC_NOT_VISITED;
+            debug_assert_ne!(topo_out_degs[node.index()], 0);
+            topo_out_degs[node.index()] = SENTINEL_IN_SCC_NOT_VISITED;
         }
 
-        // Visit every node in the component in level-order.
+        // Visit every node in the component in level-order going in the reverse direction of the links.
         let (first, remaining) = nodes.split_first().unwrap();
         tarjan_visit_queue.clear();
         tarjan_visit_queue.push_front(*first);
 
         while let Some(node) = tarjan_visit_queue.pop_front() {
             // Mark this node as visited.
-            topo_in_degs[node.index()] = SENTINEL_IN_SCC_VISITED;
+            topo_out_degs[node.index()] = SENTINEL_IN_SCC_VISITED;
 
             // Look for nodes which we've yet to visit.
-            for (edge, target) in out_edges.iter(graph, node) {
-                if topo_in_degs[target.index()] != SENTINEL_IN_SCC_NOT_VISITED {
+            for (edge, source) in edges.iter_in(graph, node) {
+                if topo_out_degs[source.index()] != SENTINEL_IN_SCC_NOT_VISITED {
                     continue;
                 }
 
                 // ...and merge them.
                 // N.B. the handling of sentinels ensures that we never have the scenario where
                 // `node == target`.
-                merge_into(graph, edge, node, target);
+                merge_into(graph, edge, source, node);
 
                 // Finally, add them to the queue.
-                tarjan_visit_queue.push_back(target);
+                tarjan_visit_queue.push_back(source);
             }
         }
 
-        debug_assert!(!topo_in_degs
+        debug_assert!(!topo_out_degs
             .iter()
             .any(|v| *v == SENTINEL_IN_SCC_NOT_VISITED));
 
@@ -118,22 +140,22 @@ pub fn propagate_graph<N, E>(
 
     // Propagate everywhere else.
     while let Some(node) = topo_visit_queue.pop() {
-        debug_assert_eq!(topo_in_degs[node.index()], 0);
+        debug_assert_eq!(topo_out_degs[node.index()], 0);
 
-        for (edge, target) in out_edges.iter(graph, node) {
+        for (edge, source) in edges.iter_in(graph, node) {
             // Handle merge
-            if node != target {
-                merge_into(graph, edge, node, target);
+            if node != source {
+                merge_into(graph, edge, source, node);
             }
 
             // Handle toposort logic
-            let target_deg = &mut topo_in_degs[target.index()];
+            let source_deg = &mut topo_out_degs[source.index()];
 
-            if *target_deg != SENTINEL_IN_SCC_VISITED {
-                *target_deg -= 1;
+            if *source_deg != SENTINEL_IN_SCC_VISITED {
+                *source_deg -= 1;
 
-                if *target_deg == 0 {
-                    topo_visit_queue.push(target);
+                if *source_deg == 0 {
+                    topo_visit_queue.push(source);
                 }
             }
         }
