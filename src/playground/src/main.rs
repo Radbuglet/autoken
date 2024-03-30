@@ -6,9 +6,13 @@ fn whee<T>() {
     let f = || {};
 
     f();
-    woo::<T>();
+
+    let foo = woo::<T>();
+    let _ = woo::<T>();
+    let _ = foo;
 }
 
-fn woo<T>() {
-    autoken::tie!(ref T);
+fn woo<'a, T>() -> &'a () {
+    autoken::tie!('a => mut T);
+    &()
 }

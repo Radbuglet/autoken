@@ -8,11 +8,11 @@ use rustc_hir::{
     ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::{
-    mir::{Body, CastKind, Rvalue, StatementKind},
+    mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
     ty::{
         adjustment::PointerCoercion,
         fold::{FnMutDelegate, RegionFolder},
-        EarlyBinder, GenericArg, Instance, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeAndMut,
+        EarlyBinder, GenericArg, Instance, List, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeAndMut,
         TypeFoldable, VtblEntry,
     },
 };
@@ -128,6 +128,48 @@ pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
     matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn)
         && !tcx.is_foreign_item(did)
         && tcx.is_mir_available(did)
+}
+
+// === Whee === //
+
+pub fn get_static_callee_from_terminator<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    terminator: &Option<Terminator<'tcx>>,
+    local_decls: &LocalDecls<'tcx>,
+) -> Option<(DefId, &'tcx List<GenericArg<'tcx>>)> {
+    let Some(Terminator {
+        kind: TerminatorKind::Call {
+            func: dest_func, ..
+        },
+        ..
+    }) = terminator
+    else {
+        return None;
+    };
+
+    let dest_func = dest_func.ty(local_decls, tcx);
+
+    let (dest_did, dest_args) = match dest_func.kind() {
+        TyKind::FnPtr(_) => {
+            // (ignored: this is a dynamic call)
+            return None;
+        }
+        TyKind::FnDef(did, args) => (*did, *args),
+        TyKind::Closure(did, args) => (*did, args.as_closure().args),
+        _ => unreachable!(),
+    };
+
+    let Ok(dest_args) = tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args) else {
+        return None;
+    };
+
+    let Ok(Some(dest_instance)) =
+        tcx.resolve_instance(tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))))
+    else {
+        return None;
+    };
+
+    Some((dest_instance.def_id(), dest_args))
 }
 
 // === Unsizing Analysis === //

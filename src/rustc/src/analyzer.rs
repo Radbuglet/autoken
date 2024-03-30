@@ -3,14 +3,10 @@ use std::collections::hash_map;
 use rustc_hir::{def::DefKind, def_id::DefId};
 
 use rustc_middle::{
-    mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
-    query::Key,
-    ty::{
-        EarlyBinder, GenericArg, GenericArgKind, GenericArgs, GenericParamDefKind, Instance, List,
-        ParamEnv, Ty, TyCtxt, TyKind,
-    },
+    mir::{BasicBlock, Mutability},
+    ty::{EarlyBinder, GenericArg, Instance, List, ParamEnv, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{sym::TyKind, Span, Symbol};
+use rustc_span::{Span, Symbol};
 
 use crate::{
     mir::{TokenKey, TokenMirBuilder},
@@ -23,7 +19,7 @@ use crate::{
         graph::propagate_graph,
         hash::{FxHashMap, FxHashSet},
         mir::{
-            does_have_instance_mir, find_region_with_name, for_each_unsized_func,
+            does_have_instance_mir, find_region_with_name, get_static_callee_from_terminator,
             iter_all_local_def_ids, safeishly_grab_local_def_id_mir,
         },
         ty::{get_fn_sig_maybe_closure, is_annotated_ty},
@@ -38,6 +34,7 @@ use petgraph::stable_graph::{NodeIndex, StableGraph};
 pub struct AnalysisDriver<'tcx> {
     generic_map: FxHashMap<DefId, NodeIndex>,
     generic_graph: StableGraph<FunctionFacts<'tcx>, &'tcx List<GenericArg<'tcx>>>,
+    id_gen: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +106,124 @@ impl<'tcx> AnalysisDriver<'tcx> {
             },
         );
 
-        dbg!(&self.generic_graph);
+        // Generate shadow functions for each locally-visited function.
+        assert!(!tcx.untracked().definitions.is_frozen());
+
+        let mut shadows = Vec::new();
+
+        for src_facts in self.generic_graph.node_weights() {
+            let Some(orig_id) = src_facts.def_id.as_local() else {
+                continue;
+            };
+
+            // Modify body
+            let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_id).cloned() else {
+                // Some `DefIds` with facts are just shims—not functions with actual MIR.
+                continue;
+            };
+
+            let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
+
+            for (key, (_, tied)) in &src_facts.borrows {
+                for tied in tied {
+                    body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
+                }
+            }
+
+            let bb_count = body_mutator.body().basic_blocks.len();
+            for bb in 0..bb_count {
+                let bb = BasicBlock::from_usize(bb);
+
+                // Fetch static callee
+                let Some((target_did, target_args)) = get_static_callee_from_terminator(
+                    tcx,
+                    &body_mutator.body().basic_blocks[bb].terminator,
+                    &body_mutator.body().local_decls,
+                ) else {
+                    continue;
+                };
+
+                let Some(&target_id) = self.generic_map.get(&target_did) else {
+                    continue;
+                };
+
+                // Determine what it borrows
+                let target_facts = &self.generic_graph[target_id];
+
+                // Determine the set of tokens borrowed by this function.
+                let mut ensure_not_borrowed = Vec::new();
+                let callee_instance = Instance::new(target_did, target_args);
+
+                for (ty, (mutbl, tie)) in &target_facts.borrows {
+                    let ty = callee_instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        ParamEnv::reveal_all(),
+                        EarlyBinder::bind(*ty),
+                    );
+                    ensure_not_borrowed.push((ty, *mutbl, tie));
+                }
+
+                for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
+                    body_mutator.ensure_not_borrowed_at(bb, TokenKey::Ty(ty), mutability);
+
+                    for &tied in tied {
+                        // Compute the type as which the function result is going to be bound.
+                        let mapped_region = find_region_with_name(
+                            tcx,
+                            // N.B. we need to use the monomorphized ID since the non-monomorphized
+                            //  ID could just be the parent trait function def, which won't have the
+                            //  user's regions.
+                            get_fn_sig_maybe_closure(tcx, target_did)
+                                .skip_binder()
+                                .skip_binder()
+                                .output(),
+                            tied,
+                        )
+                        .unwrap();
+
+                        body_mutator.tie_token_to_its_return(
+                            bb,
+                            TokenKey::Ty(ty),
+                            mutability,
+                            |region| region == mapped_region,
+                        );
+                    }
+                }
+            }
+
+            drop(body_mutator);
+
+            // Feed the query system the shadow function's properties.
+            let shadow_kind = tcx.def_kind(orig_id);
+            let shadow_def = tcx.at(body.span).create_def(
+                tcx.local_parent(orig_id),
+                Symbol::intern(&format!(
+                    "{}_autoken_shadow_{}",
+                    tcx.opt_item_name(orig_id.to_def_id())
+                        .unwrap_or_else(|| sym::unnamed.get()),
+                    self.id_gen,
+                )),
+                shadow_kind,
+            );
+            self.id_gen += 1;
+
+            feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
+            shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_id)));
+            shadow_def.visibility(tcx.visibility(orig_id));
+
+            if shadow_kind == DefKind::AssocFn {
+                shadow_def.associated_item(tcx.associated_item(orig_id));
+            }
+
+            // ...and queue it up for borrow checking!
+            shadows.push(shadow_def);
+        }
+
+        // Finally, borrow check everything in a single go to avoid issues with stolen values.
+        for shadow in shadows {
+            // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
+            let _ = tcx.mir_borrowck(shadow.def_id());
+        }
     }
 
     fn discover_isolated_func_facts(&mut self, tcx: TyCtxt<'tcx>, src_did: DefId) -> NodeIndex {
@@ -130,42 +244,11 @@ impl<'tcx> AnalysisDriver<'tcx> {
         let src_body = tcx.optimized_mir(src_did);
 
         for src_bb in src_body.basic_blocks.iter() {
-            let Some(Terminator {
-                kind:
-                    TerminatorKind::Call {
-                        func: dest_func, ..
-                    },
-                ..
-            }) = &src_bb.terminator
+            let Some((dest_did, dest_args)) =
+                get_static_callee_from_terminator(tcx, &src_bb.terminator, &src_body.local_decls)
             else {
                 continue;
             };
-
-            let dest_func = dest_func.ty(&src_body.local_decls, tcx);
-
-            let (dest_did, dest_args) = match dest_func.kind() {
-                TyKind::FnPtr(_) => {
-                    // (ignored: this is a dynamic call)
-                    continue;
-                }
-                TyKind::FnDef(did, args) => (*did, *args),
-                TyKind::Closure(did, args) => (*did, args.as_closure().args),
-                _ => unreachable!(),
-            };
-
-            let Ok(dest_args) =
-                tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
-            else {
-                continue;
-            };
-
-            let Ok(Some(dest_instance)) = tcx.resolve_instance(
-                tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))),
-            ) else {
-                continue;
-            };
-
-            let dest_did = dest_instance.def_id();
 
             if Self::is_tie_func(tcx, dest_did) {
                 let facts = &mut self.generic_graph[src_id];
