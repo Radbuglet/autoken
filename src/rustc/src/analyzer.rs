@@ -20,6 +20,7 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
+        graph::propagate_graph,
         hash::{FxHashMap, FxHashSet},
         mir::{
             does_have_instance_mir, find_region_with_name, for_each_unsized_func,
@@ -39,7 +40,7 @@ pub struct AnalysisDriver<'tcx> {
     generic_graph: StableGraph<FunctionFacts<'tcx>, &'tcx List<GenericArg<'tcx>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct FunctionFacts<'tcx> {
     borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
     sets: FxHashMap<Ty<'tcx>, Mutability>,
@@ -66,9 +67,19 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Compute propagated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
-        // dbg!(&self.generic_graph);
-
-        // TODO
+        propagate_graph(
+            &mut self.generic_graph,
+            // merge_into
+            |graph, edge, from, called| {
+                // TODO
+            },
+            // replicate
+            |graph, into, from| {
+                let (into, from) = graph.index_twice_mut(into, from);
+                *into = from.clone();
+            },
+        );
+        dbg!(&self.generic_graph);
     }
 
     fn discover_isolated_func_facts(&mut self, tcx: TyCtxt<'tcx>, src_did: DefId) -> NodeIndex {
