@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
-    ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
+    ImplItemKind, ItemKind, LangItem, Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::{
     mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
@@ -137,39 +137,47 @@ pub fn get_static_callee_from_terminator<'tcx>(
     terminator: &Option<Terminator<'tcx>>,
     local_decls: &LocalDecls<'tcx>,
 ) -> Option<(DefId, &'tcx List<GenericArg<'tcx>>)> {
-    let Some(Terminator {
-        kind: TerminatorKind::Call {
+    match &terminator.as_ref()?.kind {
+        TerminatorKind::Call {
             func: dest_func, ..
-        },
-        ..
-    }) = terminator
-    else {
-        return None;
-    };
+        } => {
+            let dest_func = dest_func.ty(local_decls, tcx);
 
-    let dest_func = dest_func.ty(local_decls, tcx);
+            let (dest_did, dest_args) = match dest_func.kind() {
+                TyKind::FnPtr(_) => {
+                    // (ignored: this is a dynamic call)
+                    return None;
+                }
+                TyKind::FnDef(did, args) => (*did, *args),
+                TyKind::Closure(did, args) => (*did, args.as_closure().args),
+                _ => unreachable!(),
+            };
 
-    let (dest_did, dest_args) = match dest_func.kind() {
-        TyKind::FnPtr(_) => {
-            // (ignored: this is a dynamic call)
-            return None;
+            let Ok(dest_args) =
+                tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
+            else {
+                return None;
+            };
+
+            let Ok(Some(dest_instance)) = tcx.resolve_instance(
+                tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))),
+            ) else {
+                return None;
+            };
+
+            Some((dest_instance.def_id(), dest_args))
         }
-        TyKind::FnDef(did, args) => (*did, *args),
-        TyKind::Closure(did, args) => (*did, args.as_closure().args),
-        _ => unreachable!(),
-    };
+        TerminatorKind::Drop {
+            place: dest_obj, ..
+        } => {
+            let dest_ty = dest_obj.ty(local_decls, tcx);
+            let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
+            let args = tcx.mk_args(&[dest_ty.ty.into()]);
 
-    let Ok(dest_args) = tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args) else {
-        return None;
-    };
-
-    let Ok(Some(dest_instance)) =
-        tcx.resolve_instance(tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))))
-    else {
-        return None;
-    };
-
-    Some((dest_instance.def_id(), dest_args))
+            Some((def_id, args))
+        }
+        _ => None,
+    }
 }
 
 // === Unsizing Analysis === //
