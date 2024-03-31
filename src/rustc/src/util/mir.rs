@@ -16,7 +16,7 @@ use rustc_middle::{
         TypeFoldable, VtblEntry,
     },
 };
-use rustc_span::Symbol;
+use rustc_span::{ErrorGuaranteed, Symbol};
 use rustc_trait_selection::traits::supertraits;
 
 // === Misc === //
@@ -130,23 +130,31 @@ pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
         && tcx.is_mir_available(did)
 }
 
-// === Whee === //
+// === get_static_callee_from_terminator === //
+
+#[derive(Debug, Copy, Clone)]
+pub enum TerminalCallKind<'tcx> {
+    Static(DefId, &'tcx List<GenericArg<'tcx>>),
+    Generic(DefId, &'tcx List<GenericArg<'tcx>>),
+    Dynamic,
+}
 
 pub fn get_static_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
     terminator: &Option<Terminator<'tcx>>,
     local_decls: &LocalDecls<'tcx>,
-) -> Option<(DefId, &'tcx List<GenericArg<'tcx>>)> {
+) -> Option<TerminalCallKind<'tcx>> {
     match &terminator.as_ref()?.kind {
         TerminatorKind::Call {
             func: dest_func, ..
         } => {
+            // Get the type of the function local we're calling.
             let dest_func = dest_func.ty(local_decls, tcx);
 
+            // Attempt to fetch a `DefId` and arguments for the callee.
             let (dest_did, dest_args) = match dest_func.kind() {
                 TyKind::FnPtr(_) => {
-                    // (ignored: this is a dynamic call)
-                    return None;
+                    return Some(TerminalCallKind::Dynamic);
                 }
                 TyKind::FnDef(did, args) => (*did, *args),
                 TyKind::Closure(did, args) => (*did, args.as_closure().args),
@@ -156,16 +164,21 @@ pub fn get_static_callee_from_terminator<'tcx>(
             let Ok(dest_args) =
                 tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
             else {
+                // TODO: What does it mean when this fails?
                 return None;
             };
 
-            let Ok(Some(dest_instance)) = tcx.resolve_instance(
-                tcx.erase_regions(ParamEnv::reveal_all().and((dest_did, dest_args))),
-            ) else {
-                return None;
-            };
+            match resolve_instance(tcx, dest_did, dest_args) {
+                Ok(Some(dest_instance)) => {
+                    Some(TerminalCallKind::Static(dest_instance.def_id(), dest_args))
+                }
 
-            Some((dest_instance.def_id(), dest_args))
+                // `Ok(None)` when the `GenericArgsRef` are still too generic
+                Ok(None) => Some(TerminalCallKind::Generic(dest_did, dest_args)),
+
+                // the `Instance` resolution process couldn't complete due to errors elsewhere
+                Err(_) => None,
+            }
         }
         TerminatorKind::Drop {
             place: dest_obj, ..
@@ -174,10 +187,18 @@ pub fn get_static_callee_from_terminator<'tcx>(
             let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
             let args = tcx.mk_args(&[dest_ty.ty.into()]);
 
-            Some((def_id, args))
+            Some(TerminalCallKind::Static(def_id, args))
         }
         _ => None,
     }
+}
+
+pub fn resolve_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: DefId,
+    args: &'tcx List<GenericArg<'tcx>>,
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
+    tcx.resolve_instance(tcx.erase_regions(ParamEnv::reveal_all().and((did, args))))
 }
 
 // === Unsizing Analysis === //

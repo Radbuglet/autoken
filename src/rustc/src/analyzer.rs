@@ -20,7 +20,8 @@ use crate::{
         hash::{FxHashMap, FxHashSet},
         mir::{
             does_have_instance_mir, find_region_with_name, get_static_callee_from_terminator,
-            iter_all_local_def_ids, safeishly_grab_local_def_id_mir,
+            iter_all_local_def_ids, resolve_instance, safeishly_grab_local_def_id_mir,
+            TerminalCallKind,
         },
         ty::{get_fn_sig_maybe_closure, is_annotated_ty},
     },
@@ -42,6 +43,7 @@ struct FunctionFacts<'tcx> {
     def_id: DefId,
     borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
     sets: FxHashMap<Ty<'tcx>, Mutability>,
+    generic_calls: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
 }
 
 impl FunctionFacts<'_> {
@@ -50,6 +52,7 @@ impl FunctionFacts<'_> {
             def_id,
             borrows: FxHashMap::default(),
             sets: FxHashMap::default(),
+            generic_calls: FxHashSet::default(),
         }
     }
 }
@@ -75,27 +78,54 @@ impl<'tcx> AnalysisDriver<'tcx> {
 
         // Compute propagated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
+
         propagate_graph(
             &mut self.generic_graph,
             // merge_into
             |graph, edge, caller, called| {
                 let caller_instance = Instance::new(graph[caller].def_id, graph[edge]);
 
-                let (caller, called) = graph.index_twice_mut(caller, called);
+                let (caller_data, called_data) = graph.index_twice_mut(caller, called);
 
-                for (ty, (mutability, _)) in &called.borrows {
+                for (ty, (mutability, _)) in &called_data.borrows {
                     let ty = caller_instance.instantiate_mir_and_normalize_erasing_regions(
                         tcx,
                         ParamEnv::reveal_all(),
                         EarlyBinder::bind(*ty),
                     );
 
-                    let (other_mutability, _) = caller
+                    let (other_mutability, _) = caller_data
                         .borrows
                         .entry(ty)
                         .or_insert((*mutability, FxHashSet::default()));
 
                     *other_mutability = (*other_mutability).max(*mutability);
+                }
+
+                for (called_did, called_args) in &called_data.generic_calls {
+                    // TODO: Handle this:
+                    // let called_args = tcx.mk_args_from_iter(called_args.iter().map(|arg| {
+                    //     caller_instance.instantiate_mir_and_normalize_erasing_regions(
+                    //         tcx,
+                    //         ParamEnv::reveal_all(),
+                    //         EarlyBinder::bind(arg),
+                    //     )
+                    // }));
+                    //
+                    // match resolve_instance(tcx, *called_did, called_args) {
+                    //     Ok(Some(called)) => {
+                    //         let called_did = called.def_id();
+                    //         let called_args = called.args;
+                    //
+                    //         edges_to_add.push((caller, self.generic_map[&called_did], called_args));
+                    //     }
+                    //     Ok(None) => {
+                    //         caller_data.generic_calls.insert((*called_did, called_args));
+                    //     }
+                    //     Err(_) => {
+                    //         // (ignored)
+                    //     }
+                    // }
                 }
 
                 // TODO: Handle borrow sets and constraints
@@ -135,11 +165,13 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 let bb = BasicBlock::from_usize(bb);
 
                 // Fetch static callee
-                let Some((target_did, target_args)) = get_static_callee_from_terminator(
-                    tcx,
-                    &body_mutator.body().basic_blocks[bb].terminator,
-                    &body_mutator.body().local_decls,
-                ) else {
+                let Some(TerminalCallKind::Static(target_did, target_args)) =
+                    get_static_callee_from_terminator(
+                        tcx,
+                        &body_mutator.body().basic_blocks[bb].terminator,
+                        &body_mutator.body().local_decls,
+                    )
+                else {
                     continue;
                 };
 
@@ -244,60 +276,72 @@ impl<'tcx> AnalysisDriver<'tcx> {
         let src_body = tcx.optimized_mir(src_did);
 
         for src_bb in src_body.basic_blocks.iter() {
-            let Some((dest_did, dest_args)) =
-                get_static_callee_from_terminator(tcx, &src_bb.terminator, &src_body.local_decls)
-            else {
-                continue;
-            };
+            match get_static_callee_from_terminator(tcx, &src_bb.terminator, &src_body.local_decls)
+            {
+                Some(TerminalCallKind::Static(dest_did, dest_args)) => {
+                    if Self::is_tie_func(tcx, dest_did) {
+                        let facts = &mut self.generic_graph[src_id];
 
-            if Self::is_tie_func(tcx, dest_did) {
-                let facts = &mut self.generic_graph[src_id];
+                        let tied = dest_args[0].expect_ty();
+                        let tied = if tied.is_unit() {
+                            None
+                        } else {
+                            let first_field =
+                                tied.ty_adt_def().unwrap().all_fields().next().unwrap();
+                            let first_field = tcx.type_of(first_field.did).skip_binder();
+                            let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind()
+                            else {
+                                unreachable!();
+                            };
 
-                let tied = dest_args[0].expect_ty();
-                let tied = if tied.is_unit() {
-                    None
-                } else {
-                    let first_field = tied.ty_adt_def().unwrap().all_fields().next().unwrap();
-                    let first_field = tcx.type_of(first_field.did).skip_binder();
-                    let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind() else {
-                        unreachable!();
-                    };
+                            Some(first_field.get_name().unwrap())
+                        };
 
-                    Some(first_field.get_name().unwrap())
-                };
+                        Self::instantiate_set_proc(
+                            tcx,
+                            src_body.span,
+                            tcx.erase_regions_ty(dest_args[1].expect_ty()),
+                            &mut |key, mutability| {
+                                let (curr_mutability, curr_ties) = facts
+                                    .borrows
+                                    .entry(key)
+                                    .or_insert((mutability, FxHashSet::default()));
 
-                Self::instantiate_set_proc(
-                    tcx,
-                    src_body.span,
-                    tcx.erase_regions_ty(dest_args[1].expect_ty()),
-                    &mut |key, mutability| {
-                        let (curr_mutability, curr_ties) = facts
-                            .borrows
-                            .entry(key)
-                            .or_insert((mutability, FxHashSet::default()));
+                                if let Some(tied) = tied {
+                                    curr_ties.insert(tied);
+                                }
 
-                        if let Some(tied) = tied {
-                            curr_ties.insert(tied);
-                        }
+                                *curr_mutability = (*curr_mutability).max(mutability);
+                            },
+                            Some(&mut |set, mutability| {
+                                let curr_mut = facts.sets.entry(set).or_insert(mutability);
+                                *curr_mut = (*curr_mut).max(mutability);
+                            }),
+                        );
 
-                        *curr_mutability = (*curr_mutability).max(mutability);
-                    },
-                    Some(&mut |set, mutability| {
-                        let curr_mut = facts.sets.entry(set).or_insert(mutability);
-                        *curr_mut = (*curr_mut).max(mutability);
-                    }),
-                );
+                        continue;
+                    }
 
-                continue;
+                    if !does_have_instance_mir(tcx, dest_did) {
+                        continue;
+                    }
+
+                    let dst_id = self.discover_isolated_func_facts(tcx, dest_did);
+
+                    self.generic_graph.add_edge(src_id, dst_id, dest_args);
+                }
+                Some(TerminalCallKind::Generic(dest_did, dest_args)) => {
+                    self.generic_graph[src_id]
+                        .generic_calls
+                        .insert((dest_did, dest_args));
+                }
+                Some(TerminalCallKind::Dynamic) => {
+                    // (ignored)
+                }
+                None => {
+                    // (ignored)
+                }
             }
-
-            if !does_have_instance_mir(tcx, dest_did) {
-                continue;
-            }
-
-            let dst_id = self.discover_isolated_func_facts(tcx, dest_did);
-
-            self.generic_graph.add_edge(src_id, dst_id, dest_args);
         }
 
         src_id
