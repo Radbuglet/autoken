@@ -1,4 +1,4 @@
-use core::hash;
+use core::{fmt, hash};
 
 use rustc_hash::FxHashSet;
 
@@ -6,12 +6,15 @@ use super::hash::FxHashMap;
 
 const INFINITE_DEPTH: u32 = u32::MAX;
 
-pub struct GraphPropagator<'f, Cx, Node, Data, F> {
+type GraphPropagatorFunc<'f, Cx, Node, Data> =
+    dyn Fn(&mut GraphPropagatorCx<'_, 'f, Cx, Node, Data>, Node) -> Data + 'f;
+
+pub struct GraphPropagator<'f, Cx, Node, Data> {
     // User supplied context
     cx: Cx,
 
     // User-supplied callback for computing facts for a node.
-    compute_facts: &'f F,
+    compute_facts: &'f GraphPropagatorFunc<'f, Cx, Node, Data>,
 
     // A mapping from nodes which have finished computing to their facts.
     fact_map: FxHashMap<Node, Data>,
@@ -23,13 +26,12 @@ pub struct GraphPropagator<'f, Cx, Node, Data, F> {
     scc_sets: Vec<FxHashSet<Node>>,
 }
 
-impl<'f, Cx, Node, Data, F> GraphPropagator<'f, Cx, Node, Data, F>
+impl<'f, Cx, Node, Data> GraphPropagator<'f, Cx, Node, Data>
 where
-    Node: Copy + hash::Hash + Eq,
+    Node: fmt::Debug + Copy + hash::Hash + Eq,
     Data: Clone,
-    F: Fn(&mut GraphPropagatorCx<'_, Self>, Node) -> Data,
 {
-    pub fn new(cx: Cx, compute_facts: &'f F) -> Self {
+    pub fn new(cx: Cx, compute_facts: &'f GraphPropagatorFunc<'f, Cx, Node, Data>) -> Self {
         Self {
             cx,
             compute_facts,
@@ -47,7 +49,7 @@ where
         &mut self.cx
     }
 
-    pub fn fact_computer(&self) -> &'f F {
+    pub fn fact_computer(&self) -> &'f GraphPropagatorFunc<'f, Cx, Node, Data> {
         self.compute_facts
     }
 
@@ -103,7 +105,8 @@ where
         let my_scc_set = self.scc_sets.pop().unwrap();
         let min_back_depth_for_caller = if min_back_depth == my_depth {
             for node in my_scc_set {
-                self.fact_map.get_mut(&node).unwrap().clone_from(&my_facts);
+                // FIXME: The handling of SCCs still isn't good.
+                // self.fact_map.get_mut(&node).unwrap().clone_from(&my_facts);
             }
 
             // We just discharged the back-references and parent functions only care whether
@@ -143,43 +146,24 @@ pub trait AnyGraphPropagator {
     fn context_mut(&mut self) -> &mut Self::Cx;
 }
 
-impl<'f, Cx, Node, Data, F> AnyGraphPropagator for GraphPropagator<'f, Cx, Node, Data, F>
-where
-    Node: Copy + hash::Hash + Eq,
-    Data: Clone,
-    F: Fn(&mut GraphPropagatorCx<'_, Self>, Node) -> Data,
-{
-    type Cx = Cx;
-    type Node = Node;
-    type Data = Data;
-
-    fn analyze_inner(&mut self, my_node: Self::Node, my_depth: u32) -> u32 {
-        self.analyze_inner(my_node, my_depth)
-    }
-
-    fn fact_map_mut(&mut self) -> &mut FxHashMap<Self::Node, Self::Data> {
-        self.fact_map_mut()
-    }
-
-    fn context_mut(&mut self) -> &mut Self::Cx {
-        self.context_mut()
-    }
-}
-
-pub struct GraphPropagatorCx<'p, P: AnyGraphPropagator> {
-    propagator: &'p mut P,
+pub struct GraphPropagatorCx<'p, 'f, Cx, Node, Data> {
+    propagator: &'p mut GraphPropagator<'f, Cx, Node, Data>,
     min_back_depth: u32,
     child_depth: u32,
 }
 
-impl<'p, P: AnyGraphPropagator> GraphPropagatorCx<'p, P> {
-    pub fn analyze(&mut self, node: P::Node) -> Option<&mut P::Data> {
+impl<'p, 'f, Cx, Node, Data> GraphPropagatorCx<'p, 'f, Cx, Node, Data>
+where
+    Node: fmt::Debug + Copy + hash::Hash + Eq,
+    Data: Clone,
+{
+    pub fn analyze(&mut self, node: Node) -> Option<&mut Data> {
         let its_depth = self.propagator.analyze_inner(node, self.child_depth);
         self.min_back_depth = self.min_back_depth.min(its_depth);
         self.propagator.fact_map_mut().get_mut(&node)
     }
 
-    pub fn context_mut(&mut self) -> &mut P::Cx {
+    pub fn context_mut(&mut self) -> &mut Cx {
         self.propagator.context_mut()
     }
 }

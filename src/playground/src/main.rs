@@ -3,17 +3,36 @@ fn main() {
 }
 
 fn whee<T, V>() {
-    let f = || {};
+    //     let f = || {};
+    //
+    //     f();
+    //
+    //     let sg = scopeguard::guard((), |()| {
+    //         woo::<T>();
+    //     });
+    //     let foo = woo::<T>();
+    //     let _ = woo::<V>();
+    //     drop(sg);
+    //     let _ = foo;
 
-    f();
-
-    let sg = scopeguard::guard((), |()| {
-        woo::<T>();
-    });
     let foo = woo::<T>();
-    let _ = woo::<V>();
-    drop(sg);
+    // gah_wrap::<T>();
+    gah(|| {
+        woo::<T>();
+        woo::<f32>();
+    });
     let _ = foo;
+}
+
+fn gah_wrap<T>() {
+    gah(|| {
+        woo::<T>();
+        woo::<f32>();
+    });
+}
+
+fn gah<F: FnOnce()>(f: F) {
+    f();
 }
 
 fn woo<'a, T>() -> &'a () {

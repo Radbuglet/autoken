@@ -12,7 +12,7 @@ use rustc_middle::{mir::Body, ty::TyCtxt};
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
-    analyzer::AnalysisDriver,
+    analyzer::analyze,
     util::feeder::{
         feed,
         feeders::{MirBuiltFeeder, MirBuiltStasher},
@@ -88,9 +88,7 @@ impl Callbacks for AnalyzeMirCallbacks {
         queries: &'tcx Queries<'tcx>,
     ) -> Compilation {
         if should_run_analysis() {
-            queries.global_ctxt().unwrap().enter(|tcx| {
-                AnalysisDriver::default().analyze(tcx);
-            });
+            queries.global_ctxt().unwrap().enter(analyze);
         }
 
         Compilation::Continue

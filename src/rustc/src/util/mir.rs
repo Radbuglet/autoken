@@ -125,9 +125,12 @@ pub fn safeishly_grab_local_def_id_mir(
 // === `does_have_instance_mir` === //
 
 pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
-    matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn)
-        && !tcx.is_foreign_item(did)
-        && tcx.is_mir_available(did)
+    let is_func_kind = matches!(
+        tcx.def_kind(did),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    );
+
+    is_func_kind && !tcx.is_foreign_item(did) && tcx.is_mir_available(did)
 }
 
 // === get_static_callee_from_terminator === //
@@ -169,9 +172,10 @@ pub fn get_static_callee_from_terminator<'tcx>(
             };
 
             match resolve_instance(tcx, dest_did, dest_args) {
-                Ok(Some(dest_instance)) => {
-                    Some(TerminalCallKind::Static(dest_instance.def_id(), dest_args))
-                }
+                Ok(Some(dest_instance)) => Some(TerminalCallKind::Static(
+                    dest_instance.def_id(),
+                    dest_instance.args,
+                )),
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
                 Ok(None) => Some(TerminalCallKind::Generic(dest_did, dest_args)),
@@ -183,11 +187,13 @@ pub fn get_static_callee_from_terminator<'tcx>(
         TerminatorKind::Drop {
             place: dest_obj, ..
         } => {
-            let dest_ty = dest_obj.ty(local_decls, tcx);
-            let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
-            let args = tcx.mk_args(&[dest_ty.ty.into()]);
-
-            Some(TerminalCallKind::Static(def_id, args))
+            // TODO: Reinstate
+            //             let dest_ty = dest_obj.ty(local_decls, tcx);
+            //             let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
+            //             let args = tcx.mk_args(&[dest_ty.ty.into()]);
+            //
+            //             Some(TerminalCallKind::Static(def_id, args))
+            None
         }
         _ => None,
     }
