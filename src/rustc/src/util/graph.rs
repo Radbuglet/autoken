@@ -1,163 +1,185 @@
-use std::collections::VecDeque;
+use core::hash;
 
-use petgraph::{
-    algo::TarjanScc,
-    graph::{EdgeIndex, NodeIndex},
-    stable_graph::StableGraph,
-    visit::{EdgeRef, IntoNeighbors, IntoNodeIdentifiers, NodeIndexable},
-    Direction,
-};
+use rustc_hash::FxHashSet;
 
-#[derive(Default)]
-pub struct EdgeIter {
-    buffer: Vec<(EdgeIndex, NodeIndex)>,
+use super::hash::FxHashMap;
+
+const INFINITE_DEPTH: u32 = u32::MAX;
+
+pub struct GraphPropagator<'f, Cx, Node, Data, F> {
+    // User supplied context
+    cx: Cx,
+
+    // User-supplied callback for computing facts for a node.
+    compute_facts: &'f F,
+
+    // A mapping from nodes which have finished computing to their facts.
+    fact_map: FxHashMap<Node, Data>,
+
+    // A mapping from nodes which have *not* finished computing to their depth in the DFS.
+    depth_map: FxHashMap<Node, u32>,
+
+    // An index-map from depths to the set of nodes which recurse back to it.
+    scc_sets: Vec<FxHashSet<Node>>,
 }
 
-impl EdgeIter {
-    pub fn iter<N, E>(
-        &mut self,
-        graph: &mut StableGraph<N, E>,
-        node: NodeIndex,
-        direction: Direction,
-    ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
-        self.buffer.clear();
-        self.buffer
-            .extend(graph.edges_directed(node, direction).map(|edge| {
-                (
-                    edge.id(),
-                    match direction {
-                        Direction::Outgoing => edge.target(),
-                        Direction::Incoming => edge.source(),
-                    },
-                )
-            }));
-        self.buffer.iter().copied()
-    }
-
-    pub fn iter_in<N, E>(
-        &mut self,
-        graph: &mut StableGraph<N, E>,
-        node: NodeIndex,
-    ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
-        self.iter(graph, node, Direction::Incoming)
-    }
-
-    pub fn iter_out<N, E>(
-        &mut self,
-        graph: &mut StableGraph<N, E>,
-        node: NodeIndex,
-    ) -> impl ExactSizeIterator<Item = (EdgeIndex, NodeIndex)> + '_ {
-        self.iter(graph, node, Direction::Outgoing)
-    }
-}
-
-pub fn tarjan_scc_filter_trivial<G>(g: G) -> Vec<Vec<G::NodeId>>
+impl<'f, Cx, Node, Data, F> GraphPropagator<'f, Cx, Node, Data, F>
 where
-    G: IntoNodeIdentifiers + IntoNeighbors + NodeIndexable,
+    Node: Copy + hash::Hash + Eq,
+    Data: Clone,
+    F: Fn(&mut GraphPropagatorCx<'_, Self>, Node) -> Data,
 {
-    let mut sccs = Vec::new();
-    {
-        let mut tarjan_scc = TarjanScc::new();
-        tarjan_scc.run(g, |scc| {
-            if scc.len() > 1 {
-                sccs.push(scc.to_vec());
-            }
-        });
+    pub fn new(cx: Cx, compute_facts: &'f F) -> Self {
+        Self {
+            cx,
+            compute_facts,
+            fact_map: FxHashMap::default(),
+            depth_map: FxHashMap::default(),
+            scc_sets: Vec::new(),
+        }
     }
-    sccs
+
+    pub fn context(&self) -> &Cx {
+        &self.cx
+    }
+
+    pub fn context_mut(&mut self) -> &mut Cx {
+        &mut self.cx
+    }
+
+    pub fn fact_computer(&self) -> &'f F {
+        self.compute_facts
+    }
+
+    pub fn fact_map(&self) -> &FxHashMap<Node, Data> {
+        &self.fact_map
+    }
+
+    pub fn fact_map_mut(&mut self) -> &mut FxHashMap<Node, Data> {
+        &mut self.fact_map
+    }
+
+    pub fn into_fact_map(self) -> FxHashMap<Node, Data> {
+        self.fact_map
+    }
+
+    pub fn analyze(&mut self, start: Node) -> &Data {
+        self.analyze_inner(start, 0);
+        &self.fact_map[&start]
+    }
+
+    fn analyze_inner(&mut self, my_node: Node, my_depth: u32) -> u32 {
+        // Ensure that we're not recursing to a node which is in the process of being visited.
+        if self.fact_map.contains_key(&my_node) {
+            return INFINITE_DEPTH;
+        }
+
+        if let Some(depth) = self.depth_map.get(&my_node) {
+            return *depth;
+        }
+
+        self.depth_map.insert(my_node, my_depth);
+
+        // Add an entry to the `scc_sets` map.
+        self.scc_sets.push(FxHashSet::default());
+
+        // Compute facts for this node
+        let compute_facts = self.compute_facts;
+        let mut prop_cx = GraphPropagatorCx {
+            propagator: self,
+            min_back_depth: INFINITE_DEPTH,
+            child_depth: my_depth + 1,
+        };
+        let my_facts = (compute_facts)(&mut prop_cx, my_node);
+        let min_back_depth = prop_cx.min_back_depth;
+
+        // If we were self-recursive, add an entry to the `scc_sets` map.
+        // We don't push ourself because there's no need to clone our own facts.
+        if min_back_depth != INFINITE_DEPTH && min_back_depth != my_depth {
+            self.scc_sets[min_back_depth as usize].insert(my_node);
+        }
+
+        // If we're the root of the SCC, let's copy over all our facts to everything in the SCC.
+        let my_scc_set = self.scc_sets.pop().unwrap();
+        let min_back_depth_for_caller = if min_back_depth == my_depth {
+            for node in my_scc_set {
+                self.fact_map.get_mut(&node).unwrap().clone_from(&my_facts);
+            }
+
+            // We just discharged the back-references and parent functions only care whether
+            // their ancestors were referenced by a descendant.
+            INFINITE_DEPTH
+        } else if min_back_depth == INFINITE_DEPTH {
+            // Otherwise, if no descendants of this node contribute to an SCC, let's just do nothing.
+
+            // We just discharged the back-references and parent functions only care whether
+            // their ancestors were referenced by a descendant.
+            INFINITE_DEPTH
+        } else {
+            // Otherwise, an even earlier function has to take care of unifying the SCC.
+            self.scc_sets.last_mut().unwrap().extend(my_scc_set);
+
+            // An ancestor still has to handle this.
+            min_back_depth
+        };
+
+        // Update the fact map
+        self.fact_map.insert(my_node, my_facts);
+        self.depth_map.remove(&my_node);
+
+        min_back_depth_for_caller
+    }
 }
 
-pub fn propagate_graph<N, E>(
-    graph: &mut StableGraph<N, E>,
-    mut merge_into: impl FnMut(&mut StableGraph<N, E>, EdgeIndex, NodeIndex, NodeIndex),
-    mut replicate: impl FnMut(&mut StableGraph<N, E>, NodeIndex, NodeIndex),
-) {
-    const SENTINEL_IN_SCC_NOT_VISITED: usize = usize::MAX - 1;
-    const SENTINEL_IN_SCC_VISITED: usize = usize::MAX;
+pub trait AnyGraphPropagator {
+    type Cx;
+    type Node: Copy + hash::Hash + Eq;
+    type Data: Clone;
 
-    let mut edges = EdgeIter::default();
+    fn analyze_inner(&mut self, my_node: Self::Node, my_depth: u32) -> u32;
 
-    // Prepare a regular toposort. We do this now so we can reuse the in-degree buffer to store
-    // sentinel values for the SCC phase.
-    let mut topo_out_degs = Vec::new();
-    let mut topo_visit_queue = Vec::new();
+    fn fact_map_mut(&mut self) -> &mut FxHashMap<Self::Node, Self::Data>;
 
-    for node in graph.node_indices() {
-        debug_assert_eq!(node.index(), topo_out_degs.len());
+    fn context_mut(&mut self) -> &mut Self::Cx;
+}
 
-        let in_degree = graph.edges_directed(node, Direction::Outgoing).count();
-        topo_out_degs.push(in_degree);
+impl<'f, Cx, Node, Data, F> AnyGraphPropagator for GraphPropagator<'f, Cx, Node, Data, F>
+where
+    Node: Copy + hash::Hash + Eq,
+    Data: Clone,
+    F: Fn(&mut GraphPropagatorCx<'_, Self>, Node) -> Data,
+{
+    type Cx = Cx;
+    type Node = Node;
+    type Data = Data;
 
-        if in_degree == 0 {
-            topo_visit_queue.push(node);
-        }
+    fn analyze_inner(&mut self, my_node: Self::Node, my_depth: u32) -> u32 {
+        self.analyze_inner(my_node, my_depth)
     }
 
-    // Propagate in strongly-connected components.
-    let mut tarjan_visit_queue = VecDeque::new();
-
-    for nodes in tarjan_scc_filter_trivial(&*graph) {
-        // Give each of the nodes in the component a sentinel in-degree.
-        for &node in &nodes {
-            debug_assert_ne!(topo_out_degs[node.index()], 0);
-            topo_out_degs[node.index()] = SENTINEL_IN_SCC_NOT_VISITED;
-        }
-
-        // Visit every node in the component in level-order going in the reverse direction of the links.
-        let (first, remaining) = nodes.split_first().unwrap();
-        tarjan_visit_queue.clear();
-        tarjan_visit_queue.push_front(*first);
-
-        while let Some(node) = tarjan_visit_queue.pop_front() {
-            // Mark this node as visited.
-            topo_out_degs[node.index()] = SENTINEL_IN_SCC_VISITED;
-
-            // Look for nodes which we've yet to visit.
-            for (edge, source) in edges.iter_in(graph, node) {
-                if topo_out_degs[source.index()] != SENTINEL_IN_SCC_NOT_VISITED {
-                    continue;
-                }
-
-                // ...and merge them.
-                // N.B. the handling of sentinels ensures that we never have the scenario where
-                // `node == target`.
-                merge_into(graph, edge, source, node);
-
-                // Finally, add them to the queue.
-                tarjan_visit_queue.push_back(source);
-            }
-        }
-
-        debug_assert!(!topo_out_degs
-            .iter()
-            .any(|v| *v == SENTINEL_IN_SCC_NOT_VISITED));
-
-        // Replicate the first node's results.
-        for &remaining in remaining {
-            replicate(graph, remaining, *first);
-        }
+    fn fact_map_mut(&mut self) -> &mut FxHashMap<Self::Node, Self::Data> {
+        self.fact_map_mut()
     }
 
-    // Propagate everywhere else.
-    while let Some(node) = topo_visit_queue.pop() {
-        debug_assert_eq!(topo_out_degs[node.index()], 0);
+    fn context_mut(&mut self) -> &mut Self::Cx {
+        self.context_mut()
+    }
+}
 
-        for (edge, source) in edges.iter_in(graph, node) {
-            // Handle merge
-            if node != source {
-                merge_into(graph, edge, source, node);
-            }
+pub struct GraphPropagatorCx<'p, P: AnyGraphPropagator> {
+    propagator: &'p mut P,
+    min_back_depth: u32,
+    child_depth: u32,
+}
 
-            // Handle toposort logic
-            let source_deg = &mut topo_out_degs[source.index()];
+impl<'p, P: AnyGraphPropagator> GraphPropagatorCx<'p, P> {
+    pub fn analyze(&mut self, node: P::Node) -> Option<&mut P::Data> {
+        let its_depth = self.propagator.analyze_inner(node, self.child_depth);
+        self.min_back_depth = self.min_back_depth.min(its_depth);
+        self.propagator.fact_map_mut().get_mut(&node)
+    }
 
-            if *source_deg != SENTINEL_IN_SCC_VISITED {
-                *source_deg -= 1;
-
-                if *source_deg == 0 {
-                    topo_visit_queue.push(source);
-                }
-            }
-        }
+    pub fn context_mut(&mut self) -> &mut P::Cx {
+        self.propagator.context_mut()
     }
 }

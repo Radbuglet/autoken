@@ -16,7 +16,6 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
-        graph::propagate_graph,
         hash::{FxHashMap, FxHashSet},
         mir::{
             does_have_instance_mir, find_region_with_name, get_static_callee_from_terminator,
@@ -79,62 +78,62 @@ impl<'tcx> AnalysisDriver<'tcx> {
         // Compute propagated function facts
         assert!(!tcx.untracked().definitions.is_frozen());
 
-        propagate_graph(
-            &mut self.generic_graph,
-            // merge_into
-            |graph, edge, caller, called| {
-                let caller_instance = Instance::new(graph[caller].def_id, graph[edge]);
-
-                let (caller_data, called_data) = graph.index_twice_mut(caller, called);
-
-                for (ty, (mutability, _)) in &called_data.borrows {
-                    let ty = caller_instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        EarlyBinder::bind(*ty),
-                    );
-
-                    let (other_mutability, _) = caller_data
-                        .borrows
-                        .entry(ty)
-                        .or_insert((*mutability, FxHashSet::default()));
-
-                    *other_mutability = (*other_mutability).max(*mutability);
-                }
-
-                for (called_did, called_args) in &called_data.generic_calls {
-                    // TODO: Handle this:
-                    // let called_args = tcx.mk_args_from_iter(called_args.iter().map(|arg| {
-                    //     caller_instance.instantiate_mir_and_normalize_erasing_regions(
-                    //         tcx,
-                    //         ParamEnv::reveal_all(),
-                    //         EarlyBinder::bind(arg),
-                    //     )
-                    // }));
-                    //
-                    // match resolve_instance(tcx, *called_did, called_args) {
-                    //     Ok(Some(called)) => {
-                    //         let called_did = called.def_id();
-                    //         let called_args = called.args;
-                    //
-                    //         edges_to_add.push((caller, self.generic_map[&called_did], called_args));
-                    //     }
-                    //     Ok(None) => {
-                    //         caller_data.generic_calls.insert((*called_did, called_args));
-                    //     }
-                    //     Err(_) => {
-                    //         // (ignored)
-                    //     }
-                    // }
-                }
-
-                // TODO: Handle borrow sets and constraints
-            },
-            // replicate
-            |graph, into, from| {
-                graph[into] = graph[from].clone();
-            },
-        );
+        //         propagate_graph(
+        //             &mut self.generic_graph,
+        //             // merge_into
+        //             |graph, edge, caller, called| {
+        //                 let caller_instance = Instance::new(graph[caller].def_id, graph[edge]);
+        //
+        //                 let (caller_data, called_data) = graph.index_twice_mut(caller, called);
+        //
+        //                 for (ty, (mutability, _)) in &called_data.borrows {
+        //                     let ty = caller_instance.instantiate_mir_and_normalize_erasing_regions(
+        //                         tcx,
+        //                         ParamEnv::reveal_all(),
+        //                         EarlyBinder::bind(*ty),
+        //                     );
+        //
+        //                     let (other_mutability, _) = caller_data
+        //                         .borrows
+        //                         .entry(ty)
+        //                         .or_insert((*mutability, FxHashSet::default()));
+        //
+        //                     *other_mutability = (*other_mutability).max(*mutability);
+        //                 }
+        //
+        //                 for (called_did, called_args) in &called_data.generic_calls {
+        //                     // TODO: Handle this:
+        //                     // let called_args = tcx.mk_args_from_iter(called_args.iter().map(|arg| {
+        //                     //     caller_instance.instantiate_mir_and_normalize_erasing_regions(
+        //                     //         tcx,
+        //                     //         ParamEnv::reveal_all(),
+        //                     //         EarlyBinder::bind(arg),
+        //                     //     )
+        //                     // }));
+        //                     //
+        //                     // match resolve_instance(tcx, *called_did, called_args) {
+        //                     //     Ok(Some(called)) => {
+        //                     //         let called_did = called.def_id();
+        //                     //         let called_args = called.args;
+        //                     //
+        //                     //         edges_to_add.push((caller, self.generic_map[&called_did], called_args));
+        //                     //     }
+        //                     //     Ok(None) => {
+        //                     //         caller_data.generic_calls.insert((*called_did, called_args));
+        //                     //     }
+        //                     //     Err(_) => {
+        //                     //         // (ignored)
+        //                     //     }
+        //                     // }
+        //                 }
+        //
+        //                 // TODO: Handle borrow sets and constraints
+        //             },
+        //             // replicate
+        //             |graph, into, from| {
+        //                 graph[into] = graph[from].clone();
+        //             },
+        //         );
 
         // Generate shadow functions for each locally-visited function.
         assert!(!tcx.untracked().definitions.is_frozen());

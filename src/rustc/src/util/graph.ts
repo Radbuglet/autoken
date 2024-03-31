@@ -53,14 +53,33 @@ function propagateFacts<Node, Facts extends object>(
             for (const node of my_scc_set) {
                 fact_map.set(node, my_facts);
             }
+
+            return {
+                facts: my_facts,
+                // We just discharged the back-references and parent functions only care whether
+                // their ancestors were referenced by a descendant.
+                min_back_depth: Number.POSITIVE_INFINITY
+            };
+        } else if (min_back_depth === Number.POSITIVE_INFINITY) {
+            // Otherwise, if no descendants of this node contribute to an SCC, let's just do nothing.
+            return {
+                facts: my_facts,
+                // We just discharged the back-references and parent functions only care whether
+                // their ancestors were referenced by a descendant.
+                min_back_depth: Number.POSITIVE_INFINITY
+            };
         } else {
             // Otherwise, an even earlier function has to take care of unifying the SCC.
             for (const node of my_scc_set) {
                 sccs_to_connect_to[-1]!.add(node);
             }
-        }
 
-        // TODO
+            return {
+                facts: my_facts,
+                // An ancestor still has to handle this.
+                min_back_depth,
+            };
+        }
     }
 
     recurse(start, 0);
