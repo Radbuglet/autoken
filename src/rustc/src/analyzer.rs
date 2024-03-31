@@ -59,7 +59,7 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
         for src_bb in src_body.basic_blocks.iter() {
             match get_static_callee_from_terminator(tcx, &src_bb.terminator, &src_body.local_decls)
             {
-                Some(TerminalCallKind::Static(dest_did, dest_args)) => {
+                Some(TerminalCallKind::Static(dest_span, dest_did, dest_args)) => {
                     if is_tie_func(tcx, dest_did) {
                         let tied = dest_args[0].expect_ty();
                         let tied = if tied.is_unit() {
@@ -102,10 +102,10 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
 
                         continue;
                     } else if does_have_instance_mir(tcx, dest_did) {
-                        analysis_queue.push((dest_did, dest_args));
+                        analysis_queue.push((dest_span, dest_did, dest_args));
                     }
                 }
-                Some(TerminalCallKind::Generic(dest_did, dest_args)) => {
+                Some(TerminalCallKind::Generic(_dest_span, dest_did, dest_args)) => {
                     src_facts.generic_calls.insert((dest_did, dest_args));
                 }
                 Some(TerminalCallKind::Dynamic) => {
@@ -118,36 +118,53 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
         }
 
         // Analyze callees
-
         #[allow(clippy::mutable_key_type)]
         let mut already_analyzed = FxHashSet::default();
 
-        while let Some((dest_did, dest_args)) = analysis_queue.pop() {
+        while let Some((dest_span, dest_did, dest_args)) = analysis_queue.pop() {
+            // Don't analyze the same callee more than once.
             if !already_analyzed.insert((dest_did, dest_args)) {
                 continue;
             };
 
+            // Fetch facts for the destination.
             let Some(dest_facts) = cx.analyze(dest_did) else {
                 continue;
             };
 
             let dest_instance = Instance::new(dest_did, dest_args);
 
-            for (ty, (mutability, _)) in &dest_facts.borrows {
-                let ty = dest_instance.instantiate_mir_and_normalize_erasing_regions(
+            // Inherit borrows
+            let mut concrete_to_generic = FxHashMap::default();
+            for (generic_ty, (mutability, _)) in &dest_facts.borrows {
+                let concrete_ty = dest_instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     ParamEnv::reveal_all(),
-                    EarlyBinder::bind(*ty),
+                    EarlyBinder::bind(*generic_ty),
                 );
+
+                match concrete_to_generic.entry(concrete_ty) {
+                    hash_map::Entry::Occupied(replaced_generic) => {
+                        let replaced_generic = replaced_generic.into_mut();
+                        tcx.dcx().span_err(
+                            dest_span,
+                            format!("call unifies two presumed-distinct generic parameters {replaced_generic} and {generic_ty} to {concrete_ty}"),
+                        );
+                    }
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert(*generic_ty);
+                    }
+                }
 
                 let (other_mutability, _) = src_facts
                     .borrows
-                    .entry(ty)
+                    .entry(concrete_ty)
                     .or_insert((*mutability, FxHashSet::default()));
 
                 *other_mutability = (*other_mutability).max(*mutability);
             }
 
+            // Inherit generic calls
             for (rec_called_did, rec_called_args) in &dest_facts.generic_calls {
                 let rec_called_args = tcx.mk_args_from_iter(rec_called_args.iter().map(|arg| {
                     dest_instance.instantiate_mir_and_normalize_erasing_regions(
@@ -160,7 +177,11 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
                 match resolve_instance(tcx, *rec_called_did, rec_called_args) {
                     Ok(Some(rec_instance)) => {
                         if does_have_instance_mir(tcx, rec_instance.def_id()) {
-                            analysis_queue.push((rec_instance.def_id(), rec_instance.args));
+                            analysis_queue.push((
+                                dest_span,
+                                rec_instance.def_id(),
+                                rec_instance.args,
+                            ));
                         }
                     }
                     Ok(None) => {
@@ -219,7 +240,7 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
             let bb = BasicBlock::from_usize(bb);
 
             // Fetch static callee
-            let Some(TerminalCallKind::Static(target_did, target_args)) =
+            let Some(TerminalCallKind::Static(_target_span, target_did, target_args)) =
                 get_static_callee_from_terminator(
                     tcx,
                     &body_mutator.body().basic_blocks[bb].terminator,

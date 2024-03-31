@@ -16,7 +16,7 @@ use rustc_middle::{
         TypeFoldable, VtblEntry,
     },
 };
-use rustc_span::{ErrorGuaranteed, Symbol};
+use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
 
 // === Misc === //
@@ -137,8 +137,8 @@ pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
 
 #[derive(Debug, Copy, Clone)]
 pub enum TerminalCallKind<'tcx> {
-    Static(DefId, &'tcx List<GenericArg<'tcx>>),
-    Generic(DefId, &'tcx List<GenericArg<'tcx>>),
+    Static(Span, DefId, &'tcx List<GenericArg<'tcx>>),
+    Generic(Span, DefId, &'tcx List<GenericArg<'tcx>>),
     Dynamic,
 }
 
@@ -149,7 +149,9 @@ pub fn get_static_callee_from_terminator<'tcx>(
 ) -> Option<TerminalCallKind<'tcx>> {
     match &terminator.as_ref()?.kind {
         TerminatorKind::Call {
-            func: dest_func, ..
+            func: dest_func,
+            fn_span,
+            ..
         } => {
             // Get the type of the function local we're calling.
             let dest_func = dest_func.ty(local_decls, tcx);
@@ -173,12 +175,13 @@ pub fn get_static_callee_from_terminator<'tcx>(
 
             match resolve_instance(tcx, dest_did, dest_args) {
                 Ok(Some(dest_instance)) => Some(TerminalCallKind::Static(
+                    *fn_span,
                     dest_instance.def_id(),
                     dest_instance.args,
                 )),
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
-                Ok(None) => Some(TerminalCallKind::Generic(dest_did, dest_args)),
+                Ok(None) => Some(TerminalCallKind::Generic(*fn_span, dest_did, dest_args)),
 
                 // the `Instance` resolution process couldn't complete due to errors elsewhere
                 Err(_) => None,
