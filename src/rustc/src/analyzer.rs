@@ -29,11 +29,62 @@ use crate::{
 
 // === Engine === //
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct FunctionFacts<'tcx> {
+    def_id: DefId,
     borrows: FxHashMap<Ty<'tcx>, (Mutability, FxHashSet<Symbol>)>,
     sets: FxHashMap<Ty<'tcx>, Mutability>,
     generic_calls: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
+}
+
+impl<'tcx> FunctionFacts<'tcx> {
+    pub fn new(def_id: DefId) -> Self {
+        Self {
+            def_id,
+            borrows: FxHashMap::default(),
+            sets: FxHashMap::default(),
+            generic_calls: FxHashSet::default(),
+        }
+    }
+
+    pub fn instantiate_simple_borrows(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> impl Iterator<Item = (Ty<'tcx>, Ty<'tcx>, Mutability, &FxHashSet<Symbol>)> + '_ {
+        let instance = Instance::new(self.def_id, args);
+
+        self.borrows
+            .iter()
+            .map(move |(&generic_ty, (mutability, symbols))| {
+                let concrete_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                    tcx,
+                    ParamEnv::reveal_all(),
+                    EarlyBinder::bind(generic_ty),
+                );
+                (generic_ty, concrete_ty, *mutability, symbols)
+            })
+    }
+
+    pub fn instantiate_generic_calls(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> impl Iterator<Item = (DefId, &'tcx List<GenericArg<'tcx>>)> + '_ {
+        let instance = Instance::new(self.def_id, args);
+
+        self.generic_calls.iter().map(move |(def_id, args)| {
+            let args = tcx.mk_args_from_iter(args.iter().map(|arg| {
+                instance.instantiate_mir_and_normalize_erasing_regions(
+                    tcx,
+                    ParamEnv::reveal_all(),
+                    EarlyBinder::bind(arg),
+                )
+            }));
+
+            (*def_id, args)
+        })
+    }
 }
 
 pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
@@ -53,7 +104,7 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
 
         // Trace call edges
         let src_body = tcx.optimized_mir(src_did);
-        let mut src_facts = FunctionFacts::default();
+        let mut src_facts = FunctionFacts::new(src_did);
         let mut analysis_queue = Vec::new();
 
         for src_bb in src_body.basic_blocks.iter() {
@@ -132,49 +183,37 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
                 continue;
             };
 
-            let dest_instance = Instance::new(dest_did, dest_args);
-
             // Inherit borrows
             let mut concrete_to_generic = FxHashMap::default();
-            for (generic_ty, (mutability, _)) in &dest_facts.borrows {
-                let concrete_ty = dest_instance.instantiate_mir_and_normalize_erasing_regions(
-                    tcx,
-                    ParamEnv::reveal_all(),
-                    EarlyBinder::bind(*generic_ty),
-                );
-
+            for (generic_ty, concrete_ty, mutability, _ties) in
+                dest_facts.instantiate_simple_borrows(tcx, dest_args)
+            {
                 match concrete_to_generic.entry(concrete_ty) {
                     hash_map::Entry::Occupied(replaced_generic) => {
                         let replaced_generic = replaced_generic.into_mut();
                         tcx.dcx().span_err(
                             dest_span,
-                            format!("call unifies two presumed-distinct generic parameters {replaced_generic} and {generic_ty} to {concrete_ty}"),
+                            format!("call unifies two presumed-distinct borrowed tokens {replaced_generic} and {generic_ty} to {concrete_ty}"),
                         );
                     }
                     hash_map::Entry::Vacant(entry) => {
-                        entry.insert(*generic_ty);
+                        entry.insert(generic_ty);
                     }
                 }
 
                 let (other_mutability, _) = src_facts
                     .borrows
                     .entry(concrete_ty)
-                    .or_insert((*mutability, FxHashSet::default()));
+                    .or_insert((mutability, FxHashSet::default()));
 
-                *other_mutability = (*other_mutability).max(*mutability);
+                *other_mutability = (*other_mutability).max(mutability);
             }
 
             // Inherit generic calls
-            for (rec_called_did, rec_called_args) in &dest_facts.generic_calls {
-                let rec_called_args = tcx.mk_args_from_iter(rec_called_args.iter().map(|arg| {
-                    dest_instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        EarlyBinder::bind(arg),
-                    )
-                }));
-
-                match resolve_instance(tcx, *rec_called_did, rec_called_args) {
+            for (rec_called_did, rec_called_args) in
+                dest_facts.instantiate_generic_calls(tcx, dest_args)
+            {
+                match resolve_instance(tcx, rec_called_did, rec_called_args) {
                     Ok(Some(rec_instance)) => {
                         if does_have_instance_mir(tcx, rec_instance.def_id()) {
                             analysis_queue.push((
@@ -187,7 +226,7 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
                     Ok(None) => {
                         src_facts
                             .generic_calls
-                            .insert((*rec_called_did, rec_called_args));
+                            .insert((rec_called_did, rec_called_args));
                     }
                     Err(_) => {
                         // (ignored)
@@ -257,16 +296,12 @@ pub fn analyze<'tcx>(tcx: TyCtxt<'tcx>) {
 
             // Determine the set of tokens borrowed by this function.
             let mut ensure_not_borrowed = Vec::new();
-            let callee_instance = Instance::new(target_did, target_args);
 
-            for (ty, (mutbl, tie)) in &target_facts.borrows {
-                let ty = callee_instance.instantiate_mir_and_normalize_erasing_regions(
-                    tcx,
-                    ParamEnv::reveal_all(),
-                    EarlyBinder::bind(*ty),
-                );
-                ensure_not_borrowed.push((ty, *mutbl, tie));
+            for (_, ty, mutbl, tie) in target_facts.instantiate_simple_borrows(tcx, target_args) {
+                ensure_not_borrowed.push((ty, mutbl, tie));
             }
+
+            // TODO: Instantiate generics
 
             for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
                 body_mutator.ensure_not_borrowed_at(bb, TokenKey::Ty(ty), mutability);

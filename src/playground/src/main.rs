@@ -16,11 +16,11 @@ fn whee<T, V>() {
     //     drop(sg);
     //     let _ = foo;
 
-    let foo = woo::<T>();
+    let foo = woo::<(T, V)>();
     // gah_wrap::<T>();
     gah(|| {
-        woo::<T>();
-        woo::<V>();
+        woo::<(T, V)>();
+        woo::<(V, T)>();
         woo::<f32>();
     });
     let _ = foo;
