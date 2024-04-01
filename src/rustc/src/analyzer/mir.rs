@@ -41,10 +41,7 @@ pub struct TokenMirBuilder<'tcx, 'body> {
 }
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub enum TokenKey<'tcx> {
-    Ty(Ty<'tcx>),
-    Counterpoint,
-}
+pub struct TokenKey<'tcx>(pub Ty<'tcx>);
 
 impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
     pub fn new(tcx: TyCtxt<'tcx>, body: &'body mut Body<'tcx>) -> Self {

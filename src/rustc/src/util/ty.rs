@@ -10,6 +10,10 @@ use rustc_middle::{
 };
 use rustc_span::Symbol;
 
+pub fn is_generic_ty(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Param(_) | TyKind::Alias(_, _))
+}
+
 pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
     let mut fields = def.all_fields();
 
