@@ -9,19 +9,20 @@ use rustc_span::{Span, Symbol};
 use crate::util::{hash::FxHashSet, ty::is_generic_ty};
 
 rustc_index::newtype_index! {
-    pub struct FunctionFactsId {}
+    pub struct FactsId {}
 }
 
 #[derive(Debug, Default)]
 pub struct FunctionFactStore<'tcx> {
-    pub facts: IndexVec<FunctionFactsId, FunctionFacts<'tcx>>,
+    pub facts: IndexVec<FactsId, FunctionFacts<'tcx>>,
 }
 
 impl<'tcx> FunctionFactStore<'tcx> {
-    pub fn create(&mut self, def_id: DefId) -> FunctionFactsId {
+    pub fn create(&mut self, def_id: DefId) -> FactsId {
         self.facts.push(FunctionFacts {
             def_id,
             generic_restrictions: FxHashMap::default(),
+            max_generic_restriction_id: 0,
             borrows: FxHashMap::default(),
             borrow_sets: FxHashMap::default(),
             generic_calls: FxHashMap::default(),
@@ -32,10 +33,10 @@ impl<'tcx> FunctionFactStore<'tcx> {
         &mut self,
         tcx: TyCtxt<'tcx>,
         span: Span,
-        src: FunctionFactsId,
-        dest: FunctionFactsId,
+        src: FactsId,
+        dest: FactsId,
         args: &'tcx List<GenericArg<'tcx>>,
-        lookup_did: impl FnMut(&mut Self, DefId) -> FunctionFactsId,
+        lookup_did: impl FnMut(&mut Self, DefId) -> FactsId,
     ) {
         if src == dest {
             todo!();
@@ -46,6 +47,9 @@ impl<'tcx> FunctionFactStore<'tcx> {
         // Import and validate generic restrictions
         {
             let mut concrete_to_generic = FxHashMap::default();
+
+            let geq_class_base = src_data.max_generic_restriction_id;
+            src_data.max_generic_restriction_id += dest_data.max_generic_restriction_id;
 
             for (generic_ty, concrete_ty, eq_class) in
                 dest_data.instantiate_generic_restrictions(tcx, args)
@@ -70,7 +74,9 @@ impl<'tcx> FunctionFactStore<'tcx> {
                     }
                 }
 
-                src_data.generic_restrictions.insert(concrete_ty, eq_class);
+                src_data
+                    .generic_restrictions
+                    .insert(concrete_ty, geq_class_base + eq_class);
             }
         }
 
@@ -78,11 +84,7 @@ impl<'tcx> FunctionFactStore<'tcx> {
         for (_generic_ty, concrete_ty, borrow_info) in
             dest_data.instantiate_simple_borrows(tcx, args)
         {
-            src_data.push_borrow(
-                concrete_ty,
-                borrow_info.mutability,
-                borrow_info.tied_to.iter().copied(),
-            );
+            src_data.push_borrow(concrete_ty, borrow_info.mutability, []);
         }
 
         // Import set borrows
@@ -102,6 +104,9 @@ pub struct FunctionFacts<'tcx> {
     /// Types used in borrows and their permitted equivalence classes.
     pub generic_restrictions: FxHashMap<Ty<'tcx>, u32>,
 
+    /// The maximum generic restriction ID used in this fact set.
+    pub max_generic_restriction_id: u32,
+
     /// The tokens the function borrows and the lifetimes they're tied to.
     pub borrows: FxHashMap<Ty<'tcx>, BorrowInfo>,
 
@@ -114,6 +119,15 @@ pub struct FunctionFacts<'tcx> {
 }
 
 impl<'tcx> FunctionFacts<'tcx> {
+    pub fn push_generic_restriction(&mut self, ty: Ty<'tcx>, id: u32) {
+        self.generic_restrictions.insert(ty, id);
+        self.max_generic_restriction_id = self.max_generic_restriction_id.max(id);
+    }
+
+    pub fn push_unique_generic_restriction(&mut self, ty: Ty<'tcx>) {
+        self.push_generic_restriction(ty, self.max_generic_restriction_id + 1);
+    }
+
     pub fn push_borrow(
         &mut self,
         ty: Ty<'tcx>,

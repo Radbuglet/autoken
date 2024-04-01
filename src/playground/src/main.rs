@@ -17,12 +17,13 @@ fn whee<T, V>() {
     //     let _ = foo;
 
     let foo = woo::<(T, V)>();
+    woo::<(V, T)>();
     // gah_wrap::<T>();
-    gah(|| {
-        woo::<(T, V)>();
-        woo::<(V, T)>();
-        woo::<f32>();
-    });
+    // gah(|| {
+    //     woo::<(T, V)>();
+    //     woo::<(V, T)>();
+    //     woo::<f32>();
+    // });
     let _ = foo;
 }
 
