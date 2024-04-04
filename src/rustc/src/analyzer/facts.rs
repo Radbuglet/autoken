@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-// === FunctionFacts === //
+// === Function Fact Store === //
 
 pub fn has_facts(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     !is_tie_func(tcx, def_id) && has_instance_mir(tcx, def_id)
@@ -138,7 +138,58 @@ impl<'tcx> FunctionFacts<'tcx> {
             alias_classes: FxHashMap::default(),
         }
     }
+}
 
+#[derive(Debug)]
+pub struct BorrowInfo {
+    pub mutability: Mutability,
+    pub tied_to: FxHashSet<Symbol>,
+}
+
+impl Default for BorrowInfo {
+    fn default() -> Self {
+        Self {
+            mutability: Mutability::Not,
+            tied_to: FxHashSet::default(),
+        }
+    }
+}
+
+impl BorrowInfo {
+    pub fn upgrade(&mut self, mutability: Mutability, tied_to: Option<Symbol>) {
+        self.mutability = self.mutability.max(mutability);
+
+        if let Some(tied_to) = tied_to {
+            self.tied_to.insert(tied_to);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GenericCallInfo<'tcx> {
+    pub does_not_borrow: FxHashMap<Ty<'tcx>, Mutability>,
+}
+
+rustc_index::newtype_index! {
+    pub struct AliasClass {}
+}
+
+// === Function Fact Instantiation === //
+
+#[derive(Debug, Copy, Clone)]
+pub enum FactInstantiatedCall<'tcx, 'a> {
+    Concrete {
+        did: DefId,
+        args: &'tcx List<GenericArg<'tcx>>,
+    },
+    Generic {
+        did: DefId,
+        args: &'tcx List<GenericArg<'tcx>>,
+        info: &'a GenericCallInfo<'tcx>,
+    },
+}
+
+impl<'tcx> FunctionFacts<'tcx> {
     pub fn instantiate_arg<T>(&self, tcx: TyCtxt<'tcx>, ty: T, args: ConcretizationArgs<'tcx>) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
@@ -239,61 +290,16 @@ impl<'tcx> FunctionFacts<'tcx> {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum FactInstantiatedCall<'tcx, 'a> {
-    Concrete {
-        did: DefId,
-        args: &'tcx List<GenericArg<'tcx>>,
-    },
-    Generic {
-        did: DefId,
-        args: &'tcx List<GenericArg<'tcx>>,
-        info: &'a GenericCallInfo<'tcx>,
-    },
-}
-
-#[derive(Debug)]
-pub struct BorrowInfo {
-    pub mutability: Mutability,
-    pub tied_to: FxHashSet<Symbol>,
-}
-
-impl Default for BorrowInfo {
-    fn default() -> Self {
-        Self {
-            mutability: Mutability::Not,
-            tied_to: FxHashSet::default(),
-        }
-    }
-}
-
-impl BorrowInfo {
-    pub fn upgrade(&mut self, mutability: Mutability, tied_to: Option<Symbol>) {
-        self.mutability = self.mutability.max(mutability);
-
-        if let Some(tied_to) = tied_to {
-            self.tied_to.insert(tied_to);
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct GenericCallInfo<'tcx> {
-    pub does_not_borrow: FxHashMap<Ty<'tcx>, Mutability>,
-}
-
-rustc_index::newtype_index! {
-    pub struct AliasClass {}
-}
-
-// === FactExplorer === //
+// === Function Fact Exploration === //
 
 static EMPTY_TIED_SET: &FxHashSet<Symbol> = &new_const_hash_set();
+
+pub type ConcretizedFunc<'tcx> = (DefId, ConcretizationArgs<'tcx>);
 
 pub struct FactExplorer<'tcx, 'facts> {
     pub tcx: TyCtxt<'tcx>,
     pub facts: &'facts FunctionFactStore<'tcx>,
-    pub reachable: ReachableFactExplorer<'tcx>,
+    pub reachable: ReachableFactExplorer<'tcx, 'facts>,
     borrows: FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>,
 }
 
@@ -314,10 +320,11 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
     ) -> &FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)> {
         self.borrows.clear();
 
-        for (def_id, args) in self
+        let reachable = self
             .reachable
-            .iter_reachable(self.tcx, self.facts, src_def_id, args)
-        {
+            .iter_reachable(self.tcx, self.facts, src_def_id, args);
+
+        for (def_id, args) in reachable.iter_concrete() {
             for (_, ty, info) in self
                 .facts
                 .lookup(def_id)
@@ -341,28 +348,34 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
     }
 }
 
+// Reachability
 #[derive(Default)]
-pub struct ReachableFactExplorer<'tcx> {
-    visit_set: FxHashSet<(DefId, ConcretizationArgs<'tcx>)>,
+pub struct ReachableFactExplorer<'tcx, 'facts> {
+    visit_set: FxHashSet<ConcretizedFunc<'tcx>>,
+    generic_visit_set: FxHashMap<ConcretizedFunc<'tcx>, &'facts GenericCallInfo<'tcx>>,
 }
 
-impl<'tcx> ReachableFactExplorer<'tcx> {
+impl<'tcx, 'facts> ReachableFactExplorer<'tcx, 'facts> {
     pub fn iter_reachable(
         &mut self,
         tcx: TyCtxt<'tcx>,
-        facts: &FunctionFactStore<'tcx>,
+        facts: &'facts FunctionFactStore<'tcx>,
         def_id: DefId,
         args: ConcretizationArgs<'tcx>,
-    ) -> impl Iterator<Item = (DefId, ConcretizationArgs<'tcx>)> + '_ {
+    ) -> ReachableFuncs<'_, 'tcx, 'facts> {
         self.visit_set.clear();
         self.iter_reachable_inner(tcx, facts, def_id, args);
-        self.visit_set.iter().copied()
+
+        ReachableFuncs {
+            visit_set: &self.visit_set,
+            generic_visit_set: &self.generic_visit_set,
+        }
     }
 
     fn iter_reachable_inner(
         &mut self,
         tcx: TyCtxt<'tcx>,
-        facts: &FunctionFactStore<'tcx>,
+        facts: &'facts FunctionFactStore<'tcx>,
         src_did: DefId,
         src_args: ConcretizationArgs<'tcx>,
     ) {
@@ -375,15 +388,48 @@ impl<'tcx> ReachableFactExplorer<'tcx> {
         }
 
         for dest in src_facts.instantiate_all_calls(tcx, src_args) {
-            let FactInstantiatedCall::Concrete {
-                did: dest_did,
-                args: dest_args,
-            } = dest
-            else {
-                continue;
-            };
-
-            self.iter_reachable_inner(tcx, facts, dest_did, Some(dest_args));
+            match dest {
+                FactInstantiatedCall::Concrete {
+                    did: dest_did,
+                    args: dest_args,
+                } => {
+                    self.iter_reachable_inner(tcx, facts, dest_did, Some(dest_args));
+                }
+                FactInstantiatedCall::Generic { did, args, info } => {
+                    self.generic_visit_set.insert((did, Some(args)), info);
+                }
+            }
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct ReachableFuncs<'a, 'tcx, 'facts> {
+    pub visit_set: &'a FxHashSet<(DefId, ConcretizationArgs<'tcx>)>,
+    pub generic_visit_set:
+        &'a FxHashMap<(DefId, ConcretizationArgs<'tcx>), &'facts GenericCallInfo<'tcx>>,
+}
+
+impl<'a, 'tcx, 'facts> ReachableFuncs<'a, 'tcx, 'facts> {
+    pub fn has_generic_visits(self) -> bool {
+        self.generic_visit_set.is_empty()
+    }
+
+    pub fn iter_concrete(self) -> impl Iterator<Item = (DefId, ConcretizationArgs<'tcx>)> + 'a {
+        self.visit_set.iter().copied()
+    }
+
+    pub fn iter_generic(
+        self,
+    ) -> impl Iterator<
+        Item = (
+            DefId,
+            ConcretizationArgs<'tcx>,
+            &'facts GenericCallInfo<'tcx>,
+        ),
+    > + 'a {
+        self.generic_visit_set
+            .iter()
+            .map(|((did, args), info)| (*did, *args, *info))
     }
 }
