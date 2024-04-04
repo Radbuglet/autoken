@@ -1,6 +1,6 @@
 fn main() {
-    // whee::<u32, i32>();
-    whee::<u32, u32>();
+    whee::<u32, i32>();
+    // whee::<u32, u32>();
 }
 
 fn whee<T, V>() {
@@ -18,12 +18,12 @@ fn whee<T, V>() {
 
     let foo = woo::<(T, V)>();
     woo::<(V, T)>();
-    // gah_wrap::<T>();
-    // gah(|| {
-    //     woo::<(T, V)>();
-    //     woo::<(V, T)>();
-    //     woo::<f32>();
-    // });
+    gah_wrap::<T>();
+    gah(|| {
+        woo::<(T, V)>();
+        woo::<(V, T)>();
+        woo::<f32>();
+    });
     let _ = foo;
 }
 

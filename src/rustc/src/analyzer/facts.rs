@@ -101,10 +101,8 @@ impl<'tcx> FunctionFactStore<'tcx> {
         // TODO: Optimize this graph to reduce redundant searching.
     }
 
-    pub fn lookup(&self, def_id: DefId) -> &FunctionFacts<'tcx> {
-        self.facts
-            .get(&def_id)
-            .unwrap_or_else(|| panic!("failed to find facts for {def_id:?}"))
+    pub fn lookup(&self, def_id: DefId) -> Option<&FunctionFacts<'tcx>> {
+        self.facts.get(&def_id)
     }
 }
 
@@ -311,18 +309,19 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
 
     pub fn iter_borrows(
         &mut self,
-        def_id: DefId,
+        src_def_id: DefId,
         args: ConcretizationArgs<'tcx>,
     ) -> &FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)> {
         self.borrows.clear();
 
         for (def_id, args) in self
             .reachable
-            .iter_reachable(self.tcx, self.facts, def_id, args)
+            .iter_reachable(self.tcx, self.facts, src_def_id, args)
         {
             for (_, ty, info) in self
                 .facts
                 .lookup(def_id)
+                .unwrap() // iter_reachable only yields functions with facts
                 .instantiate_found_borrows(self.tcx, args)
             {
                 let (mutability, set) = self
@@ -332,7 +331,7 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
 
                 *mutability = (*mutability).max(info.mutability);
 
-                if !info.tied_to.is_empty() {
+                if def_id == src_def_id && !info.tied_to.is_empty() {
                     *set = &info.tied_to;
                 }
             }
@@ -367,11 +366,15 @@ impl<'tcx> ReachableFactExplorer<'tcx> {
         src_did: DefId,
         src_args: ConcretizationArgs<'tcx>,
     ) {
+        let Some(src_facts) = facts.lookup(src_did) else {
+            return;
+        };
+
         if !self.visit_set.insert((src_did, src_args)) {
             return;
         }
 
-        for dest in facts.lookup(src_did).instantiate_all_calls(tcx, src_args) {
+        for dest in src_facts.instantiate_all_calls(tcx, src_args) {
             let FactInstantiatedCall::Concrete {
                 did: dest_did,
                 args: dest_args,

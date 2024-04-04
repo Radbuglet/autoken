@@ -85,7 +85,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
-        for (key, info) in &facts.lookup(orig_id.to_def_id()).found_borrows {
+        for (key, info) in &facts.lookup(orig_id.to_def_id()).unwrap().found_borrows {
             for tied in &info.tied_to {
                 body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
             }
