@@ -49,6 +49,8 @@ impl<'tcx> FunctionFactStore<'tcx> {
                         if is_tie_func(tcx, called_did) {
                             let tied_to = get_tie(tcx, args[0].expect_ty());
 
+                            // TODO: Populate alias classes.
+
                             instantiate_set_proc(
                                 tcx,
                                 span,
@@ -69,12 +71,15 @@ impl<'tcx> FunctionFactStore<'tcx> {
                                 }),
                             );
                         } else if has_instance_mir(tcx, called_did) {
-                            entry.calls.insert((called_did, args));
+                            entry.known_calls.insert((called_did, args));
                             self.collection_queue.push(called_did);
                         }
                     }
                     Some(TerminalCallKind::Generic(_span, called_did, args)) => {
-                        entry.calls.insert((called_did, args));
+                        entry
+                            .generic_calls
+                            .entry((called_did, args))
+                            .or_insert_with(GenericCallInfo::default);
                     }
                     Some(TerminalCallKind::Dynamic) => {
                         // (ignored)
@@ -99,9 +104,21 @@ impl<'tcx> FunctionFactStore<'tcx> {
 #[derive(Debug)]
 pub struct FunctionFacts<'tcx> {
     pub def_id: DefId,
-    pub calls: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
+
+    /// The statically-resolved non-generic functions this function can call.
+    pub known_calls: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
+
+    /// The statically-resolved generic functions this function can call and their promises on what
+    /// they won't borrow.
+    pub generic_calls: FxHashMap<(DefId, &'tcx List<GenericArg<'tcx>>), GenericCallInfo<'tcx>>,
+
+    /// The set of all concrete borrows for this function without accounting for deep calls.
     pub found_borrows: FxHashMap<Ty<'tcx>, BorrowInfo>,
+
+    /// The set of all borrows of generic sets in this function without accounting for deep calls.
     pub generic_borrow_sets: FxHashMap<Ty<'tcx>, BorrowInfo>,
+
+    /// The function's restrictions on types which it assumes not to alias.
     pub alias_classes: FxHashMap<Ty<'tcx>, AliasClass>,
 }
 
@@ -109,7 +126,8 @@ impl<'tcx> FunctionFacts<'tcx> {
     pub fn new(def_id: DefId) -> Self {
         Self {
             def_id,
-            calls: FxHashSet::default(),
+            known_calls: FxHashSet::default(),
+            generic_calls: FxHashMap::default(),
             found_borrows: FxHashMap::default(),
             generic_borrow_sets: FxHashMap::default(),
             alias_classes: FxHashMap::default(),
@@ -132,27 +150,58 @@ impl<'tcx> FunctionFacts<'tcx> {
         )
     }
 
-    pub fn instantiate_calls(
+    pub fn instantiate_args(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: &'tcx List<GenericArg<'tcx>>,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> &'tcx List<GenericArg<'tcx>> {
+        tcx.mk_args_from_iter(ty.iter().map(|arg| self.instantiate_arg(tcx, arg, args)))
+    }
+
+    pub fn instantiate_known_calls(
         &self,
         tcx: TyCtxt<'tcx>,
         args: &'tcx List<GenericArg<'tcx>>,
-    ) -> impl Iterator<Item = (CallConcretizationResult, &'tcx List<GenericArg<'tcx>>)> + '_ {
-        self.calls.iter().filter_map(move |(def_id, called_args)| {
-            let args = tcx.mk_args_from_iter(
-                called_args
-                    .iter()
-                    .map(|arg| self.instantiate_arg(tcx, arg, args)),
-            );
+    ) -> impl Iterator<Item = (DefId, &'tcx List<GenericArg<'tcx>>)> + '_ {
+        self.known_calls
+            .iter()
+            .map(move |(did, called_args)| (*did, self.instantiate_args(tcx, called_args, args)))
+    }
 
-            match resolve_instance(tcx, *def_id, args) {
-                Ok(Some(instance)) => Some((
-                    CallConcretizationResult::Concrete(instance.def_id()),
-                    instance.args,
-                )),
-                Ok(None) => Some((CallConcretizationResult::Generic(*def_id), args)),
-                Err(_) => None,
-            }
-        })
+    pub fn instantiate_generic_calls(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> impl Iterator<Item = FactInstantiatedCall<'tcx, '_>> + '_ {
+        self.generic_calls
+            .iter()
+            .filter_map(move |((did, called_args), info)| {
+                let called_args = self.instantiate_args(tcx, called_args, args);
+
+                match resolve_instance(tcx, *did, called_args) {
+                    Ok(Some(instance)) => Some(FactInstantiatedCall::Concrete {
+                        did: instance.def_id(),
+                        args: instance.args,
+                    }),
+                    Ok(None) => Some(FactInstantiatedCall::Generic {
+                        did: *did,
+                        args: called_args,
+                        info,
+                    }),
+                    Err(_) => None,
+                }
+            })
+    }
+
+    pub fn instantiate_all_calls(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> impl Iterator<Item = FactInstantiatedCall<'tcx, '_>> + '_ {
+        self.instantiate_known_calls(tcx, args)
+            .map(|(did, args)| FactInstantiatedCall::Concrete { did, args })
+            .chain(self.instantiate_generic_calls(tcx, args))
     }
 
     pub fn instantiate_found_borrows(
@@ -177,9 +226,16 @@ impl<'tcx> FunctionFacts<'tcx> {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub enum CallConcretizationResult {
-    Concrete(DefId),
-    Generic(DefId),
+pub enum FactInstantiatedCall<'tcx, 'a> {
+    Concrete {
+        did: DefId,
+        args: &'tcx List<GenericArg<'tcx>>,
+    },
+    Generic {
+        did: DefId,
+        args: &'tcx List<GenericArg<'tcx>>,
+        info: &'a GenericCallInfo<'tcx>,
+    },
 }
 
 #[derive(Debug)]
@@ -205,6 +261,11 @@ impl BorrowInfo {
             self.tied_to.insert(tied_to);
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct GenericCallInfo<'tcx> {
+    pub does_not_borrow: FxHashMap<Ty<'tcx>, Mutability>,
 }
 
 rustc_index::newtype_index! {
@@ -242,8 +303,12 @@ impl<'tcx> FunctionFactExplorer<'tcx> {
             return;
         }
 
-        for (dest_did, dest_args) in facts.lookup(src_did).instantiate_calls(tcx, src_args) {
-            let CallConcretizationResult::Concrete(dest_did) = dest_did else {
+        for dest in facts.lookup(src_did).instantiate_all_calls(tcx, src_args) {
+            let FactInstantiatedCall::Concrete {
+                did: dest_did,
+                args: dest_args,
+            } = dest
+            else {
                 continue;
             };
 

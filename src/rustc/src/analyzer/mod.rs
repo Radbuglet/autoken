@@ -5,7 +5,10 @@ use crate::util::{
     mir::{has_instance_mir, iter_all_local_def_ids, safeishly_grab_local_def_id_mir},
 };
 
-use self::{facts::FunctionFactStore, sets::is_tie_func};
+use self::{
+    facts::{FunctionFactExplorer, FunctionFactStore},
+    sets::is_tie_func,
+};
 
 mod facts;
 mod mir;
@@ -34,7 +37,18 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     facts.optimize();
 
     // Validate generic assumptions
-    // TODO
+    let mut explorer = FunctionFactExplorer::default();
+
+    for did in iter_all_local_def_ids(tcx) {
+        let did = did.to_def_id();
+
+        if is_tie_func(tcx, did) || !has_instance_mir(tcx, did) {
+            continue;
+        }
+
+        // Ensure that types have no alias.
+        // TODO
+    }
 
     // Create shadow MIR
     // TODO
