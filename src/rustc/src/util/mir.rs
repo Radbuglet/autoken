@@ -122,9 +122,9 @@ pub fn safeishly_grab_local_def_id_mir(
     Some(tcx.mir_built(id))
 }
 
-// === `does_have_instance_mir` === //
+// === `has_instance_mir` === //
 
-pub fn does_have_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
+pub fn has_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
     let is_func_kind = matches!(
         tcx.def_kind(did),
         DefKind::Fn | DefKind::AssocFn | DefKind::Closure

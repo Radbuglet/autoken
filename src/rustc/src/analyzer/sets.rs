@@ -15,6 +15,22 @@ pub fn is_tie_func(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.opt_item_name(def_id) == Some(sym::__autoken_declare_tied.get())
 }
 
+pub fn get_tie<'tcx>(tcx: TyCtxt<'tcx>, tied: Ty<'tcx>) -> Option<Symbol> {
+    if tied.is_unit() {
+        None
+    } else {
+        let first_field = tied.ty_adt_def().unwrap().all_fields().next().unwrap();
+
+        let first_field = tcx.type_of(first_field.did).skip_binder();
+
+        let TyKind::Ref(first_field, _pointee, _mut) = first_field.kind() else {
+            unreachable!();
+        };
+
+        Some(first_field.get_name().unwrap())
+    }
+}
+
 pub fn instantiate_set<'tcx>(
     tcx: TyCtxt<'tcx>,
     span: Span,

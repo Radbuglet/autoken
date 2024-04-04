@@ -2,159 +2,129 @@ use std::collections::hash_map;
 
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_index::IndexVec;
-use rustc_middle::ty::{EarlyBinder, GenericArg, Instance, List, Mutability, ParamEnv, Ty, TyCtxt};
-use rustc_span::{Span, Symbol};
+use rustc_middle::ty::{
+    EarlyBinder, GenericArg, Instance, List, Mutability, ParamEnv, Ty, TyCtxt, TypeFoldable,
+};
+use rustc_span::Symbol;
 
-use crate::util::{hash::FxHashSet, ty::is_generic_ty};
+use crate::{
+    analyzer::sets::{get_tie, instantiate_set_proc, is_tie_func},
+    util::{
+        hash::FxHashSet,
+        mir::{
+            get_static_callee_from_terminator, has_instance_mir, resolve_instance, TerminalCallKind,
+        },
+    },
+};
 
-rustc_index::newtype_index! {
-    pub struct FactsId {}
-}
+// === FunctionFacts === //
 
 #[derive(Debug, Default)]
 pub struct FunctionFactStore<'tcx> {
-    pub facts: IndexVec<FactsId, FunctionFacts<'tcx>>,
+    facts: FxHashMap<DefId, FunctionFacts<'tcx>>,
+    collection_queue: Vec<DefId>,
 }
 
 impl<'tcx> FunctionFactStore<'tcx> {
-    pub fn create(&mut self, def_id: DefId) -> FactsId {
-        self.facts.push(FunctionFacts {
-            def_id,
-            generic_restrictions: FxHashMap::default(),
-            max_generic_restriction_id: 0,
-            borrows: FxHashMap::default(),
-            borrow_sets: FxHashMap::default(),
-            generic_calls: FxHashMap::default(),
-        })
-    }
+    pub fn collect(&mut self, tcx: TyCtxt<'tcx>, def_id: DefId) {
+        self.collection_queue.push(def_id);
 
-    pub fn import(
-        &mut self,
-        tcx: TyCtxt<'tcx>,
-        span: Span,
-        src: FactsId,
-        dest: FactsId,
-        args: &'tcx List<GenericArg<'tcx>>,
-        lookup_did: impl FnMut(&mut Self, DefId) -> FactsId,
-    ) {
-        if src == dest {
-            todo!();
-        }
+        while let Some(def_id) = self.collection_queue.pop() {
+            // Ensure that we're analyzing a new function
+            let hash_map::Entry::Vacant(entry) = self.facts.entry(def_id) else {
+                continue;
+            };
+            let entry = entry.insert(FunctionFacts::new(def_id));
 
-        let (src_data, dest_data) = self.facts.pick2_mut(src, dest);
+            // Validate the function
+            assert!(!is_tie_func(tcx, def_id));
+            assert!(has_instance_mir(tcx, def_id));
 
-        // Import and validate generic restrictions
-        {
-            let mut concrete_to_generic = FxHashMap::default();
+            // Traverse the function
+            let body = tcx.optimized_mir(def_id);
 
-            let geq_class_base = src_data.max_generic_restriction_id;
-            src_data.max_generic_restriction_id += dest_data.max_generic_restriction_id;
+            for bb in body.basic_blocks.iter() {
+                match get_static_callee_from_terminator(tcx, &bb.terminator, &body.local_decls) {
+                    Some(TerminalCallKind::Static(span, called_did, args)) => {
+                        if is_tie_func(tcx, called_did) {
+                            let tied_to = get_tie(tcx, args[0].expect_ty());
 
-            for (generic_ty, concrete_ty, eq_class) in
-                dest_data.instantiate_generic_restrictions(tcx, args)
-            {
-                match concrete_to_generic.entry(concrete_ty) {
-                    hash_map::Entry::Occupied(entry) => {
-                        let (other_generic_ty, other_eq_class) = entry.into_mut();
-
-                        if eq_class != *other_eq_class {
-                            tcx.dcx().span_err(
+                            instantiate_set_proc(
+                                tcx,
                                 span,
-                                format!(
-                                    "this call's generic parameters cause {other_generic_ty} and \
-                                     {generic_ty} to unify to {concrete_ty} but the function assumes \
-                                     that these types are distinct
-                                "),
+                                args[1].expect_ty(),
+                                &mut |ty, mutability| {
+                                    entry
+                                        .found_borrows
+                                        .entry(ty)
+                                        .or_insert_with(Default::default)
+                                        .upgrade(mutability, tied_to);
+                                },
+                                Some(&mut |ty, mutability| {
+                                    entry
+                                        .generic_borrow_sets
+                                        .entry(ty)
+                                        .or_insert_with(Default::default)
+                                        .upgrade(mutability, tied_to);
+                                }),
                             );
+                        } else if has_instance_mir(tcx, called_did) {
+                            entry.calls.insert((called_did, args));
+                            self.collection_queue.push(called_did);
                         }
                     }
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert((generic_ty, eq_class));
+                    Some(TerminalCallKind::Generic(_span, called_did, args)) => {
+                        entry.calls.insert((called_did, args));
+                    }
+                    Some(TerminalCallKind::Dynamic) => {
+                        // (ignored)
+                    }
+                    None => {
+                        // (ignored)
                     }
                 }
-
-                src_data
-                    .generic_restrictions
-                    .insert(concrete_ty, geq_class_base + eq_class);
             }
         }
+    }
 
-        // Import basic borrows
-        for (_generic_ty, concrete_ty, borrow_info) in
-            dest_data.instantiate_simple_borrows(tcx, args)
-        {
-            src_data.push_borrow(concrete_ty, borrow_info.mutability, []);
-        }
+    pub fn optimize(&mut self) {
+        // TODO: Optimize this graph to reduce redundant searching.
+    }
 
-        // Import set borrows
-        for (set, borrow_info) in dest_data.instantiate_set_borrows(tcx, args) {
-            // TODO
-        }
-
-        // Import generic calls
-        // TODO
+    pub fn lookup(&self, def_id: DefId) -> &FunctionFacts<'tcx> {
+        &self.facts[&def_id]
     }
 }
 
 #[derive(Debug)]
 pub struct FunctionFacts<'tcx> {
     pub def_id: DefId,
-
-    /// Types used in borrows and their permitted equivalence classes.
-    pub generic_restrictions: FxHashMap<Ty<'tcx>, u32>,
-
-    /// The maximum generic restriction ID used in this fact set.
-    pub max_generic_restriction_id: u32,
-
-    /// The tokens the function borrows and the lifetimes they're tied to.
-    pub borrows: FxHashMap<Ty<'tcx>, BorrowInfo>,
-
-    /// The sets of generic token set types to eventually union into the borrow set.
-    pub borrow_sets: FxHashMap<Ty<'tcx>, BorrowInfo>,
-
-    /// The set of generic functions the function calls and their restrictions on what they are not
-    /// allowed to borrow.
-    pub generic_calls: FxHashMap<(DefId, &'tcx List<GenericArg<'tcx>>), FxHashSet<Ty<'tcx>>>,
+    pub calls: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
+    pub found_borrows: FxHashMap<Ty<'tcx>, BorrowInfo>,
+    pub generic_borrow_sets: FxHashMap<Ty<'tcx>, BorrowInfo>,
+    pub alias_classes: FxHashMap<Ty<'tcx>, AliasClass>,
 }
 
 impl<'tcx> FunctionFacts<'tcx> {
-    pub fn push_generic_restriction(&mut self, ty: Ty<'tcx>, id: u32) {
-        self.generic_restrictions.insert(ty, id);
-        self.max_generic_restriction_id = self.max_generic_restriction_id.max(id);
-    }
-
-    pub fn push_unique_generic_restriction(&mut self, ty: Ty<'tcx>) {
-        self.push_generic_restriction(ty, self.max_generic_restriction_id + 1);
-    }
-
-    pub fn push_borrow(
-        &mut self,
-        ty: Ty<'tcx>,
-        mutability: Mutability,
-        tied_to: impl IntoIterator<Item = Symbol>,
-    ) {
-        match self.borrows.entry(ty) {
-            hash_map::Entry::Occupied(entry) => {
-                let entry = entry.into_mut();
-                entry.mutability = entry.mutability.max(mutability);
-                entry.tied_to.extend(tied_to);
-            }
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(BorrowInfo {
-                    mutability,
-                    tied_to: tied_to.into_iter().collect(),
-                });
-            }
+    pub fn new(def_id: DefId) -> Self {
+        Self {
+            def_id,
+            calls: FxHashSet::default(),
+            found_borrows: FxHashMap::default(),
+            generic_borrow_sets: FxHashMap::default(),
+            alias_classes: FxHashMap::default(),
         }
     }
 
-    pub fn instantiate_ty(
+    pub fn instantiate_arg<T>(
         &self,
         tcx: TyCtxt<'tcx>,
-        ty: Ty<'tcx>,
+        ty: T,
         args: &'tcx List<GenericArg<'tcx>>,
-    ) -> Ty<'tcx> {
+    ) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
         Instance::new(self.def_id, args).instantiate_mir_and_normalize_erasing_regions(
             tcx,
             ParamEnv::reveal_all(),
@@ -162,76 +132,122 @@ impl<'tcx> FunctionFacts<'tcx> {
         )
     }
 
-    pub fn instantiate_generic_restrictions(
+    pub fn instantiate_calls(
         &self,
         tcx: TyCtxt<'tcx>,
         args: &'tcx List<GenericArg<'tcx>>,
-    ) -> impl Iterator<Item = (Ty<'tcx>, Ty<'tcx>, u32)> + '_ {
-        self.generic_restrictions
-            .iter()
-            .map(move |(&ty, eq_class)| (ty, self.instantiate_ty(tcx, ty, args), *eq_class))
+    ) -> impl Iterator<Item = (CallConcretizationResult, &'tcx List<GenericArg<'tcx>>)> + '_ {
+        self.calls.iter().filter_map(move |(def_id, called_args)| {
+            let args = tcx.mk_args_from_iter(
+                called_args
+                    .iter()
+                    .map(|arg| self.instantiate_arg(tcx, arg, args)),
+            );
+
+            match resolve_instance(tcx, *def_id, args) {
+                Ok(Some(instance)) => Some((
+                    CallConcretizationResult::Concrete(instance.def_id()),
+                    instance.args,
+                )),
+                Ok(None) => Some((CallConcretizationResult::Generic(*def_id), args)),
+                Err(_) => None,
+            }
+        })
     }
 
-    pub fn instantiate_simple_borrows(
+    pub fn instantiate_found_borrows(
         &self,
         tcx: TyCtxt<'tcx>,
         args: &'tcx List<GenericArg<'tcx>>,
     ) -> impl Iterator<Item = (Ty<'tcx>, Ty<'tcx>, &BorrowInfo)> + '_ {
-        self.borrows
+        self.found_borrows
             .iter()
-            .map(move |(&ty, borrow_info)| (ty, self.instantiate_ty(tcx, ty, args), borrow_info))
+            .map(move |(&ty, borrow_info)| (ty, self.instantiate_arg(tcx, ty, args), borrow_info))
     }
 
-    pub fn instantiate_set_borrows(
+    pub fn instantiate_borrow_sets(
         &self,
         tcx: TyCtxt<'tcx>,
         args: &'tcx List<GenericArg<'tcx>>,
-    ) -> impl Iterator<Item = (GenericSetInstanceResult<'tcx>, &BorrowInfo)> + '_ {
-        self.borrows.iter().map(move |(&ty, borrow_info)| {
-            let ty = self.instantiate_ty(tcx, ty, args);
-
-            (
-                match is_generic_ty(ty) {
-                    true => GenericSetInstanceResult::Concrete(ty),
-                    false => GenericSetInstanceResult::Generic(ty),
-                },
-                borrow_info,
-            )
-        })
+    ) -> impl Iterator<Item = (Ty<'tcx>, &BorrowInfo)> + '_ {
+        self.generic_borrow_sets
+            .iter()
+            .map(move |(&ty, borrow_info)| (self.instantiate_arg(tcx, ty, args), borrow_info))
     }
-
-    pub fn instantiate_generic_calls(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        args: &'tcx List<GenericArg<'tcx>>,
-    ) -> impl Iterator<Item = (DefId, &'tcx List<GenericArg<'tcx>>)> + '_ {
-        let instance = Instance::new(self.def_id, args);
-
-        self.generic_calls.keys().map(move |(def_id, args)| {
-            let args = tcx.mk_args_from_iter(args.iter().map(|arg| {
-                instance.instantiate_mir_and_normalize_erasing_regions(
-                    tcx,
-                    ParamEnv::reveal_all(),
-                    EarlyBinder::bind(arg),
-                )
-            }));
-
-            (*def_id, args)
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BorrowInfo {
-    /// The mutability of the borrow (or borrows if this is for a set).
-    pub mutability: Mutability,
-
-    /// The lifetimes of the fact's DefId to which this borrow is tied.
-    pub tied_to: FxHashSet<Symbol>,
 }
 
 #[derive(Debug, Copy, Clone)]
-pub enum GenericSetInstanceResult<'tcx> {
-    Concrete(Ty<'tcx>),
-    Generic(Ty<'tcx>),
+pub enum CallConcretizationResult {
+    Concrete(DefId),
+    Generic(DefId),
+}
+
+#[derive(Debug)]
+pub struct BorrowInfo {
+    pub mutability: Mutability,
+    pub tied_to: FxHashSet<Symbol>,
+}
+
+impl Default for BorrowInfo {
+    fn default() -> Self {
+        Self {
+            mutability: Mutability::Not,
+            tied_to: FxHashSet::default(),
+        }
+    }
+}
+
+impl BorrowInfo {
+    pub fn upgrade(&mut self, mutability: Mutability, tied_to: Option<Symbol>) {
+        self.mutability = self.mutability.max(mutability);
+
+        if let Some(tied_to) = tied_to {
+            self.tied_to.insert(tied_to);
+        }
+    }
+}
+
+rustc_index::newtype_index! {
+    pub struct AliasClass {}
+}
+
+// === FunctionFactExplorer === //
+
+#[derive(Debug, Default)]
+pub struct FunctionFactExplorer<'tcx> {
+    visit_set: FxHashSet<(DefId, &'tcx List<GenericArg<'tcx>>)>,
+}
+
+impl<'tcx> FunctionFactExplorer<'tcx> {
+    pub fn iter_reachable(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        facts: &FunctionFactStore<'tcx>,
+        def_id: DefId,
+        args: &'tcx List<GenericArg<'tcx>>,
+    ) -> impl Iterator<Item = (DefId, &'tcx List<GenericArg<'tcx>>)> + '_ {
+        self.visit_set.clear();
+        self.iter_reachable_inner(tcx, facts, def_id, args);
+        self.visit_set.iter().copied()
+    }
+
+    fn iter_reachable_inner(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        facts: &FunctionFactStore<'tcx>,
+        src_did: DefId,
+        src_args: &'tcx List<GenericArg<'tcx>>,
+    ) {
+        if !self.visit_set.insert((src_did, src_args)) {
+            return;
+        }
+
+        for (dest_did, dest_args) in facts.lookup(src_did).instantiate_calls(tcx, src_args) {
+            let CallConcretizationResult::Concrete(dest_did) = dest_did else {
+                continue;
+            };
+
+            self.iter_reachable_inner(tcx, facts, dest_did, dest_args);
+        }
+    }
 }
