@@ -37,3 +37,11 @@ impl<H: Default + hash::Hasher> hash::BuildHasher for ConstSafeBuildHasherDefaul
         H::default()
     }
 }
+
+pub const fn new_const_hash_map<K, V, H>() -> HashMap<K, V, ConstSafeBuildHasherDefault<H>> {
+    HashMap::with_hasher(ConstSafeBuildHasherDefault::new())
+}
+
+pub const fn new_const_hash_set<T, H>() -> HashSet<T, ConstSafeBuildHasherDefault<H>> {
+    HashSet::with_hasher(ConstSafeBuildHasherDefault::new())
+}
