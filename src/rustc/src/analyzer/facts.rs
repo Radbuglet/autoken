@@ -429,6 +429,7 @@ impl<'tcx, 'facts> ReachableFactExplorer<'tcx, 'facts> {
         args: ConcretizationArgs<'tcx>,
     ) -> ReachableFuncs<'_, 'tcx, 'facts> {
         self.concrete_visit_set.clear();
+        self.generic_visit_set.clear();
         self.iter_reachable_inner(tcx, facts, def_id, args);
 
         ReachableFuncs {

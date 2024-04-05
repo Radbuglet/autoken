@@ -45,10 +45,6 @@ fn gah_wrap2<F: FnOnce()>(f: F) {
     let _ = hehe;
 }
 
-fn hehe() {
-    let a = woo::<u32>();
-}
-
 fn woo<'a, T>() -> &'a () {
     autoken::tie!('a => mut T);
     &()
