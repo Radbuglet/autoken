@@ -10,14 +10,14 @@ use rustc_hir::{
 use rustc_middle::{
     mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
     ty::{
-        adjustment::PointerCoercion,
-        fold::{FnMutDelegate, RegionFolder},
-        EarlyBinder, GenericArg, Instance, List, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeAndMut,
-        TypeFoldable, VtblEntry,
+        adjustment::PointerCoercion, fold::FnMutDelegate, EarlyBinder, GenericArg, Instance,
+        ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut, VtblEntry,
     },
 };
-use rustc_span::{ErrorGuaranteed, Span, Symbol};
+use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
+
+use super::ty::ConcretizedFunc;
 
 // === Misc === //
 
@@ -47,34 +47,6 @@ pub fn iter_all_local_def_ids(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDefI
 
     (0..idx_count).map(|i| LocalDefId {
         local_def_index: DefIndex::from_usize(i),
-    })
-}
-
-// === `find_region_with_name` === //
-
-pub fn find_region_with_name<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    name: Symbol,
-) -> Result<Region<'tcx>, Vec<Symbol>> {
-    let mut found_region = None;
-
-    let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
-        if found_region.is_none() && region.get_name() == Some(name) {
-            found_region = Some(region);
-        }
-        region
-    }));
-
-    found_region.ok_or_else(|| {
-        let mut found = Vec::new();
-        let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
-            if let Some(name) = region.get_name() {
-                found.push(name);
-            }
-            region
-        }));
-        found
     })
 }
 
@@ -133,12 +105,12 @@ pub fn has_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
     is_func_kind && !tcx.is_foreign_item(did) && tcx.is_mir_available(did)
 }
 
-// === get_static_callee_from_terminator === //
+// === `get_static_callee_from_terminator` === //
 
 #[derive(Debug, Copy, Clone)]
 pub enum TerminalCallKind<'tcx> {
-    Static(Span, DefId, &'tcx List<GenericArg<'tcx>>),
-    Generic(Span, DefId, &'tcx List<GenericArg<'tcx>>),
+    Static(Span, ConcretizedFunc<'tcx>),
+    Generic(Span, ConcretizedFunc<'tcx>),
     Dynamic,
 }
 
@@ -173,15 +145,15 @@ pub fn get_static_callee_from_terminator<'tcx>(
                 return None;
             };
 
-            match resolve_instance(tcx, dest_did, dest_args) {
-                Ok(Some(dest_instance)) => Some(TerminalCallKind::Static(
-                    *fn_span,
-                    dest_instance.def_id(),
-                    dest_instance.args,
-                )),
+            let dest = ConcretizedFunc(dest_did, dest_args);
+
+            match dest.resolve_instance(tcx) {
+                Ok(Some(dest_instance)) => {
+                    Some(TerminalCallKind::Static(*fn_span, dest_instance.into()))
+                }
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
-                Ok(None) => Some(TerminalCallKind::Generic(*fn_span, dest_did, dest_args)),
+                Ok(None) => Some(TerminalCallKind::Generic(*fn_span, dest)),
 
                 // the `Instance` resolution process couldn't complete due to errors elsewhere
                 Err(_) => None,
@@ -200,14 +172,6 @@ pub fn get_static_callee_from_terminator<'tcx>(
         }
         _ => None,
     }
-}
-
-pub fn resolve_instance<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    did: DefId,
-    args: &'tcx List<GenericArg<'tcx>>,
-) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-    tcx.resolve_instance(tcx.erase_regions(ParamEnv::reveal_all().and((did, args))))
 }
 
 // === Unsizing Analysis === //

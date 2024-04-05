@@ -4,12 +4,14 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
     ty::{
-        self, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, Instance, List,
-        Mutability, ParamConst, ParamEnv, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder,
-        TypeSuperFoldable, TypeVisitableExt,
+        self, fold::RegionFolder, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind,
+        Instance, List, Mutability, ParamConst, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable,
+        TypeFolder, TypeSuperFoldable, TypeVisitableExt,
     },
 };
-use rustc_span::Symbol;
+use rustc_span::{ErrorGuaranteed, Symbol};
+
+// === Type Matching === //
 
 pub fn is_generic_ty(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), TyKind::Param(_) | TyKind::Alias(_, _))
@@ -32,6 +34,8 @@ pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
 
     true
 }
+
+// === Signature Parsing === //
 
 pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {
     match tcx.type_of(def_id).skip_binder().kind() {
@@ -56,6 +60,32 @@ pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<B
     }
 }
 
+pub fn find_region_with_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    name: Symbol,
+) -> Result<Region<'tcx>, Vec<Symbol>> {
+    let mut found_region = None;
+
+    let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
+        if found_region.is_none() && region.get_name() == Some(name) {
+            found_region = Some(region);
+        }
+        region
+    }));
+
+    found_region.ok_or_else(|| {
+        let mut found = Vec::new();
+        let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
+            if let Some(name) = region.get_name() {
+                found.push(name);
+            }
+            region
+        }));
+        found
+    })
+}
+
 // === Mutability === //
 
 pub trait MutabilityExt {
@@ -68,47 +98,128 @@ impl MutabilityExt for Mutability {
     }
 }
 
-// === ConcretizedFunc === //
+// === GenericTransformer === //
 
-pub type ConcretizationArgs<'tcx> = Option<&'tcx List<GenericArg<'tcx>>>;
-
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct ConcretizedFunc<'tcx>(pub DefId, pub ConcretizationArgs<'tcx>);
-
-impl<'tcx> ConcretizedFunc<'tcx> {
-    pub fn instantiate_arg<T>(&self, tcx: TyCtxt<'tcx>, ty: T) -> T
+pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
     where
-        T: TypeFoldable<TyCtxt<'tcx>>,
-    {
-        if let Some(args) = self.1 {
-            Instance::new(self.0, args).instantiate_mir_and_normalize_erasing_regions(
-                tcx,
-                ParamEnv::reveal_all(),
-                EarlyBinder::bind(ty),
-            )
-        } else {
-            ty
-        }
-    }
+        T: TypeFoldable<TyCtxt<'tcx>>;
 
-    pub fn instantiate_arg_iter<'a: 'tcx, T>(
-        &'a self,
+    fn instantiate_arg_iter<'a, T>(
+        self,
         tcx: TyCtxt<'tcx>,
         iter: impl IntoIterator<Item = T> + 'a,
     ) -> impl Iterator<Item = T> + 'a
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
+        'tcx: 'a,
     {
         iter.into_iter()
             .map(move |arg| self.instantiate_arg(tcx, arg))
     }
 
-    pub fn instantiate_args(
-        &self,
+    fn instantiate_args(
+        self,
         tcx: TyCtxt<'tcx>,
-        ty: &'tcx List<GenericArg<'tcx>>,
+        args: &'tcx List<GenericArg<'tcx>>,
     ) -> &'tcx List<GenericArg<'tcx>> {
-        tcx.mk_args_from_iter(ty.iter().map(|arg| self.instantiate_arg(tcx, arg)))
+        tcx.mk_args_from_iter(args.iter().map(|arg| self.instantiate_arg(tcx, arg)))
+    }
+
+    fn instantiate_func(
+        self,
+        tcx: TyCtxt<'tcx>,
+        func: ConcretizedFunc<'tcx>,
+    ) -> ConcretizedFunc<'tcx> {
+        ConcretizedFunc(func.def_id(), self.instantiate_args(tcx, func.args()))
+    }
+}
+
+// === ConcretizedFunc === //
+
+pub type ConcretizedArgs<'tcx> = &'tcx List<GenericArg<'tcx>>;
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+pub struct ConcretizedFunc<'tcx>(pub DefId, pub ConcretizedArgs<'tcx>);
+
+impl<'tcx> From<Instance<'tcx>> for ConcretizedFunc<'tcx> {
+    fn from(instance: Instance<'tcx>) -> Self {
+        Self(instance.def_id(), instance.args)
+    }
+}
+
+impl<'tcx> ConcretizedFunc<'tcx> {
+    pub fn def_id(self) -> DefId {
+        self.0
+    }
+
+    pub fn args(self) -> ConcretizedArgs<'tcx> {
+        self.1
+    }
+
+    pub fn resolve_instance(
+        self,
+        tcx: TyCtxt<'tcx>,
+    ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
+        tcx.resolve_instance(
+            tcx.erase_regions(ParamEnv::reveal_all().and((self.def_id(), self.args()))),
+        )
+    }
+}
+
+impl<'tcx> GenericTransformer<'tcx> for ConcretizedFunc<'tcx> {
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        Instance::new(self.0, self.1).instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            ParamEnv::reveal_all(),
+            EarlyBinder::bind(ty),
+        )
+    }
+}
+
+// === MaybeConcretizedArgs === //
+
+pub type MaybeConcretizedArgs<'tcx> = Option<ConcretizedArgs<'tcx>>;
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+pub struct MaybeConcretizedFunc<'tcx>(pub DefId, pub MaybeConcretizedArgs<'tcx>);
+
+impl<'tcx> From<ConcretizedFunc<'tcx>> for MaybeConcretizedFunc<'tcx> {
+    fn from(func: ConcretizedFunc<'tcx>) -> Self {
+        Self(func.def_id(), Some(func.args()))
+    }
+}
+
+impl<'tcx> MaybeConcretizedFunc<'tcx> {
+    pub fn def_id(self) -> DefId {
+        self.0
+    }
+
+    pub fn args(self) -> MaybeConcretizedArgs<'tcx> {
+        self.1
+    }
+
+    pub fn as_concretized(self) -> Option<ConcretizedFunc<'tcx>> {
+        match self {
+            MaybeConcretizedFunc(did, Some(args)) => Some(ConcretizedFunc(did, args)),
+            MaybeConcretizedFunc(_, None) => None,
+        }
+    }
+}
+
+impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        if let Some(concretized) = self.as_concretized() {
+            concretized.instantiate_arg(tcx, ty)
+        } else {
+            ty
+        }
     }
 }
 

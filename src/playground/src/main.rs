@@ -40,8 +40,8 @@ fn gah<F: FnOnce()>(f: F) {
 
 fn gah_wrap2<F: FnOnce()>(f: F) {
     let hehe = woo::<u32>();
-    // gah(f);
-    woo::<u32>();
+    gah(f);
+    // f();
     let _ = hehe;
 }
 

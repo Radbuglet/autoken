@@ -15,10 +15,10 @@ use crate::{
         },
         hash::FxHashSet,
         mir::{
-            find_region_with_name, get_static_callee_from_terminator, iter_all_local_def_ids,
+            get_static_callee_from_terminator, iter_all_local_def_ids,
             safeishly_grab_local_def_id_mir, TerminalCallKind,
         },
-        ty::get_fn_sig_maybe_closure,
+        ty::{find_region_with_name, get_fn_sig_maybe_closure, MaybeConcretizedFunc},
     },
 };
 
@@ -91,13 +91,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         // Define tokens for each key
         let all_keys: FxHashSet<_> = explorer
-            .iter_positive_borrows(orig_did.to_def_id(), None)
+            .iter_positive_borrows(MaybeConcretizedFunc(orig_did.to_def_id(), None))
             .keys()
             .copied()
             .collect();
 
         for (key, (_mutability, tied_to)) in
-            explorer.iter_positive_borrows(orig_did.to_def_id(), None)
+            explorer.iter_positive_borrows(MaybeConcretizedFunc(orig_did.to_def_id(), None))
         {
             for tied in *tied_to {
                 body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
@@ -110,7 +110,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             let bb = BasicBlock::from_usize(bb);
 
             // Fetch static callee
-            let Some(TerminalCallKind::Static(_target_span, target_did, target_args)) =
+            let Some(TerminalCallKind::Static(_target_span, target_func)) =
                 get_static_callee_from_terminator(
                     tcx,
                     &body_mutator.body().basic_blocks[bb].terminator,
@@ -123,14 +123,14 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             // Determine the set of tokens borrowed by this function.
             let mut ensure_not_borrowed = Vec::new();
 
-            match explorer.iter_borrows(target_did, Some(target_args)) {
+            match explorer.iter_borrows(target_func.into()) {
                 IterBorrowsResult::Only(borrows) => {
                     for (&ty, (mutability, tied_to)) in borrows {
                         ensure_not_borrowed.push((ty, *mutability, *tied_to));
                     }
                 }
                 IterBorrowsResult::Exclude(exceptions) => {
-                    // TODO: Handle tied sets (this breaks on a lot more than you'd expect!)
+                    // TODO: Handle tied sets
                     for &key in &all_keys {
                         if let Some(mutability) = exceptions.get(&key) {
                             if mutability.is_not() {
@@ -153,7 +153,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                         // N.B. we need to use the monomorphized ID since the non-monomorphized
                         //  ID could just be the parent trait function def, which won't have the
                         //  user's regions.
-                        get_fn_sig_maybe_closure(tcx, target_did)
+                        get_fn_sig_maybe_closure(tcx, target_func.def_id())
                             .skip_binder()
                             .skip_binder()
                             .output(),
