@@ -6,7 +6,7 @@ use rustc_middle::{
 use rustc_span::Symbol;
 
 use crate::{
-    analyzer::facts::{FactExplorer, EMPTY_TIED_SET},
+    analyzer::facts::{FactExplorer, IterBorrowsResult, EMPTY_TIED_SET},
     util::{
         feeder::{
             feed,
@@ -76,13 +76,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     let mut shadows = Vec::new();
 
-    for orig_id in iter_all_local_def_ids(tcx) {
-        if !has_facts(tcx, orig_id.to_def_id()) {
+    for orig_did in iter_all_local_def_ids(tcx) {
+        if !has_facts(tcx, orig_did.to_def_id()) {
             continue;
         }
 
         // Modify body
-        let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_id).cloned() else {
+        let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_did).cloned() else {
             // Some `DefIds` with facts are just shims—not functions with actual MIR.
             continue;
         };
@@ -90,16 +90,16 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
         // Define tokens for each key
-        let all_keys: FxHashSet<_> = facts
-            .lookup(orig_id.to_def_id())
-            .unwrap()
-            .found_borrows
+        let all_keys: FxHashSet<_> = explorer
+            .iter_positive_borrows(orig_did.to_def_id(), None)
             .keys()
             .copied()
             .collect();
 
-        for (key, info) in &facts.lookup(orig_id.to_def_id()).unwrap().found_borrows {
-            for tied in &info.tied_to {
+        for (key, (_mutability, tied_to)) in
+            explorer.iter_positive_borrows(orig_did.to_def_id(), None)
+        {
+            for tied in *tied_to {
                 body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
             }
         }
@@ -124,13 +124,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             let mut ensure_not_borrowed = Vec::new();
 
             match explorer.iter_borrows(target_did, Some(target_args)) {
-                facts::IterBorrowsResult::Only(borrows) => {
+                IterBorrowsResult::Only(borrows) => {
                     for (&ty, (mutability, tied_to)) in borrows {
                         ensure_not_borrowed.push((ty, *mutability, *tied_to));
                     }
                 }
-                facts::IterBorrowsResult::Exclude(exceptions) => {
-                    // TODO: Handle tied sets.
+                IterBorrowsResult::Exclude(exceptions) => {
+                    // TODO: Handle tied sets (this breaks on a lot more than you'd expect!)
                     for &key in &all_keys {
                         if let Some(mutability) = exceptions.get(&key) {
                             if mutability.is_not() {
@@ -171,12 +171,12 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         drop(body_mutator);
 
         // Feed the query system the shadow function's properties.
-        let shadow_kind = tcx.def_kind(orig_id);
+        let shadow_kind = tcx.def_kind(orig_did);
         let shadow_def = tcx.at(body.span).create_def(
-            tcx.local_parent(orig_id),
+            tcx.local_parent(orig_did),
             Symbol::intern(&format!(
                 "{}_autoken_shadow_{}",
-                tcx.opt_item_name(orig_id.to_def_id())
+                tcx.opt_item_name(orig_did.to_def_id())
                     .unwrap_or_else(|| sym::unnamed.get()),
                 shadows.len(),
             )),
@@ -184,11 +184,11 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         );
 
         feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
-        shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_id)));
-        shadow_def.visibility(tcx.visibility(orig_id));
+        shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_did)));
+        shadow_def.visibility(tcx.visibility(orig_did));
 
         if shadow_kind == DefKind::AssocFn {
-            shadow_def.associated_item(tcx.associated_item(orig_id));
+            shadow_def.associated_item(tcx.associated_item(orig_did));
         }
 
         // ...and queue it up for borrow checking!

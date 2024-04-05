@@ -39,9 +39,14 @@ fn gah<F: FnOnce()>(f: F) {
 }
 
 fn gah_wrap2<F: FnOnce()>(f: F) {
-    let foo = woo::<String>();
-    gah(f);
-    let _ = foo;
+    let hehe = woo::<u32>();
+    // gah(f);
+    woo::<u32>();
+    let _ = hehe;
+}
+
+fn hehe() {
+    let a = woo::<u32>();
 }
 
 fn woo<'a, T>() -> &'a () {

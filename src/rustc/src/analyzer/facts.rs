@@ -311,6 +311,51 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
         }
     }
 
+    fn iter_positive_borrows_inner(
+        tcx: TyCtxt<'tcx>,
+        facts: &'facts FunctionFactStore<'tcx>,
+        borrows: &mut FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>,
+        src_def_id: DefId,
+        reachable: ReachableFuncs<'_, 'tcx, 'facts>,
+    ) {
+        for ConcretizedFunc(def_id, args) in reachable.iter_concrete() {
+            for (_, ty, info) in facts
+                .lookup(def_id)
+                .unwrap() // iter_reachable only yields functions with facts
+                .instantiate_found_borrows(tcx, args)
+            {
+                let (mutability, set) = borrows
+                    .entry(ty)
+                    .or_insert((Mutability::Not, EMPTY_TIED_SET));
+
+                mutability.upgrade(info.mutability);
+
+                if def_id == src_def_id && !info.tied_to.is_empty() {
+                    *set = &info.tied_to;
+                }
+            }
+        }
+    }
+
+    pub fn iter_positive_borrows(
+        &mut self,
+        src_def_id: DefId,
+        args: ConcretizationArgs<'tcx>,
+    ) -> &FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)> {
+        self.borrows.clear();
+
+        Self::iter_positive_borrows_inner(
+            self.tcx,
+            self.facts,
+            &mut self.borrows,
+            src_def_id,
+            self.reachable
+                .iter_reachable(self.tcx, self.facts, src_def_id, args),
+        );
+
+        &self.borrows
+    }
+
     pub fn iter_borrows(
         &mut self,
         src_def_id: DefId,
@@ -355,25 +400,13 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
 
             IterBorrowsResult::Exclude(&self.negative_borrows)
         } else {
-            for ConcretizedFunc(def_id, args) in reachable.iter_concrete() {
-                for (_, ty, info) in self
-                    .facts
-                    .lookup(def_id)
-                    .unwrap() // iter_reachable only yields functions with facts
-                    .instantiate_found_borrows(self.tcx, args)
-                {
-                    let (mutability, set) = self
-                        .borrows
-                        .entry(ty)
-                        .or_insert((Mutability::Not, EMPTY_TIED_SET));
-
-                    mutability.upgrade(info.mutability);
-
-                    if def_id == src_def_id && !info.tied_to.is_empty() {
-                        *set = &info.tied_to;
-                    }
-                }
-            }
+            Self::iter_positive_borrows_inner(
+                self.tcx,
+                self.facts,
+                &mut self.borrows,
+                src_def_id,
+                reachable,
+            );
 
             IterBorrowsResult::Only(&self.borrows)
         }
