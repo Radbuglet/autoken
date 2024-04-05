@@ -4,8 +4,9 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
     ty::{
-        self, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamConst, Ty,
-        TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+        self, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, Instance, List,
+        ParamConst, ParamEnv, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
+        TypeVisitableExt,
     },
 };
 use rustc_span::Symbol;
@@ -54,6 +55,52 @@ pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<B
         _ => tcx.fn_sig(def_id),
     }
 }
+
+// === ConcretizedFunc === //
+
+pub type ConcretizationArgs<'tcx> = Option<&'tcx List<GenericArg<'tcx>>>;
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+pub struct ConcretizedFunc<'tcx>(pub DefId, pub ConcretizationArgs<'tcx>);
+
+impl<'tcx> ConcretizedFunc<'tcx> {
+    pub fn instantiate_arg<T>(&self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        if let Some(args) = self.1 {
+            Instance::new(self.0, args).instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                ParamEnv::reveal_all(),
+                EarlyBinder::bind(ty),
+            )
+        } else {
+            ty
+        }
+    }
+
+    pub fn instantiate_arg_iter<'a: 'tcx, T>(
+        &'a self,
+        tcx: TyCtxt<'tcx>,
+        iter: impl IntoIterator<Item = T> + 'a,
+    ) -> impl Iterator<Item = T> + 'a
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        iter.into_iter()
+            .map(move |arg| self.instantiate_arg(tcx, arg))
+    }
+
+    pub fn instantiate_args(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: &'tcx List<GenericArg<'tcx>>,
+    ) -> &'tcx List<GenericArg<'tcx>> {
+        tcx.mk_args_from_iter(ty.iter().map(|arg| self.instantiate_arg(tcx, arg)))
+    }
+}
+
+// === instantiate_ignoring_regions === //
 
 pub fn instantiate_ignoring_regions<'tcx>(
     tcx: TyCtxt<'tcx>,
