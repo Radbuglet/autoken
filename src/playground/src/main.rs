@@ -38,6 +38,12 @@ fn gah<F: FnOnce()>(f: F) {
     f();
 }
 
+fn gah_wrap2<F: FnOnce()>(f: F) {
+    let foo = woo::<String>();
+    gah(f);
+    let _ = foo;
+}
+
 fn woo<'a, T>() -> &'a () {
     autoken::tie!('a => mut T);
     &()

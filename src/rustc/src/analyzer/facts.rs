@@ -12,7 +12,7 @@ use crate::{
         mir::{
             get_static_callee_from_terminator, has_instance_mir, resolve_instance, TerminalCallKind,
         },
-        ty::{ConcretizationArgs, ConcretizedFunc},
+        ty::{ConcretizationArgs, ConcretizedFunc, MutabilityExt},
     },
 };
 
@@ -156,7 +156,7 @@ impl Default for BorrowInfo {
 
 impl BorrowInfo {
     pub fn upgrade(&mut self, mutability: Mutability, tied_to: Option<Symbol>) {
-        self.mutability = self.mutability.max(mutability);
+        self.mutability.upgrade(mutability);
 
         if let Some(tied_to) = tied_to {
             self.tied_to.insert(tied_to);
@@ -283,7 +283,13 @@ impl<'tcx> GenericCallInfo<'tcx> {
 
 // === Function Fact Exploration === //
 
-static EMPTY_TIED_SET: &FxHashSet<Symbol> = &new_const_hash_set();
+pub static EMPTY_TIED_SET: &FxHashSet<Symbol> = &new_const_hash_set();
+
+#[derive(Debug, Copy, Clone)]
+pub enum IterBorrowsResult<'a, 'tcx, 'facts> {
+    Only(&'a FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>),
+    Exclude(&'a FxHashMap<Ty<'tcx>, Mutability>),
+}
 
 pub struct FactExplorer<'tcx, 'facts> {
     pub tcx: TyCtxt<'tcx>,
@@ -309,7 +315,7 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
         &mut self,
         src_def_id: DefId,
         args: ConcretizationArgs<'tcx>,
-    ) -> &FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)> {
+    ) -> IterBorrowsResult<'_, 'tcx, 'facts> {
         self.borrows.clear();
         self.negative_borrows.clear();
 
@@ -318,9 +324,36 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
             .iter_reachable(self.tcx, self.facts, src_def_id, args);
 
         if reachable.has_generic_visits() {
+            // Collect negative borrows
             for (func, info) in reachable.iter_generic() {
-                // TODO
+                for (do_not_borrow, mutability) in info.instantiate_does_not_borrow(self.tcx, func)
+                {
+                    self.negative_borrows
+                        .entry(do_not_borrow)
+                        .or_insert(mutability)
+                        .upgrade(mutability);
+                }
             }
+
+            // Remove positive borrows
+            for ConcretizedFunc(def_id, args) in reachable.iter_concrete() {
+                for (_, ty, info) in self
+                    .facts
+                    .lookup(def_id)
+                    .unwrap() // iter_reachable only yields functions with facts
+                    .instantiate_found_borrows(self.tcx, args)
+                {
+                    if info.mutability == Mutability::Mut {
+                        self.negative_borrows.remove(&ty);
+                    } else {
+                        self.negative_borrows
+                            .entry(ty)
+                            .and_modify(|v| *v = Mutability::Not);
+                    }
+                }
+            }
+
+            IterBorrowsResult::Exclude(&self.negative_borrows)
         } else {
             for ConcretizedFunc(def_id, args) in reachable.iter_concrete() {
                 for (_, ty, info) in self
@@ -334,16 +367,16 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
                         .entry(ty)
                         .or_insert((Mutability::Not, EMPTY_TIED_SET));
 
-                    *mutability = (*mutability).max(info.mutability);
+                    mutability.upgrade(info.mutability);
 
                     if def_id == src_def_id && !info.tied_to.is_empty() {
                         *set = &info.tied_to;
                     }
                 }
             }
-        }
 
-        &self.borrows
+            IterBorrowsResult::Only(&self.borrows)
+        }
     }
 }
 
@@ -414,7 +447,7 @@ pub struct ReachableFuncs<'a, 'tcx, 'facts> {
 
 impl<'a, 'tcx, 'facts> ReachableFuncs<'a, 'tcx, 'facts> {
     pub fn has_generic_visits(self) -> bool {
-        self.generic_visit_set.is_empty()
+        !self.generic_visit_set.is_empty()
     }
 
     pub fn iter_concrete(self) -> impl Iterator<Item = ConcretizedFunc<'tcx>> + 'a {

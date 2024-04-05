@@ -5,8 +5,8 @@ use rustc_middle::{
     bug,
     ty::{
         self, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind, Instance, List,
-        ParamConst, ParamEnv, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
-        TypeVisitableExt,
+        Mutability, ParamConst, ParamEnv, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder,
+        TypeSuperFoldable, TypeVisitableExt,
     },
 };
 use rustc_span::Symbol;
@@ -53,6 +53,18 @@ pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<B
             }))
         }
         _ => tcx.fn_sig(def_id),
+    }
+}
+
+// === Mutability === //
+
+pub trait MutabilityExt {
+    fn upgrade(&mut self, other: Mutability);
+}
+
+impl MutabilityExt for Mutability {
+    fn upgrade(&mut self, other: Mutability) {
+        *self = (*self).max(other);
     }
 }
 

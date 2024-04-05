@@ -1,15 +1,19 @@
 use rustc_hir::def::DefKind;
-use rustc_middle::{mir::BasicBlock, ty::TyCtxt};
+use rustc_middle::{
+    mir::BasicBlock,
+    ty::{Mutability, TyCtxt},
+};
 use rustc_span::Symbol;
 
 use crate::{
-    analyzer::facts::FactExplorer,
+    analyzer::facts::{FactExplorer, EMPTY_TIED_SET},
     util::{
         feeder::{
             feed,
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
+        hash::FxHashSet,
         mir::{
             find_region_with_name, get_static_callee_from_terminator, iter_all_local_def_ids,
             safeishly_grab_local_def_id_mir, TerminalCallKind,
@@ -85,12 +89,22 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
+        // Define tokens for each key
+        let all_keys: FxHashSet<_> = facts
+            .lookup(orig_id.to_def_id())
+            .unwrap()
+            .found_borrows
+            .keys()
+            .copied()
+            .collect();
+
         for (key, info) in &facts.lookup(orig_id.to_def_id()).unwrap().found_borrows {
             for tied in &info.tied_to {
                 body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
             }
         }
 
+        // Instantiate basic block borrow stubs
         let bb_count = body_mutator.body().basic_blocks.len();
         for bb in 0..bb_count {
             let bb = BasicBlock::from_usize(bb);
@@ -109,9 +123,24 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             // Determine the set of tokens borrowed by this function.
             let mut ensure_not_borrowed = Vec::new();
 
-            for (&ty, (mutability, tied_to)) in explorer.iter_borrows(target_did, Some(target_args))
-            {
-                ensure_not_borrowed.push((ty, *mutability, *tied_to));
+            match explorer.iter_borrows(target_did, Some(target_args)) {
+                facts::IterBorrowsResult::Only(borrows) => {
+                    for (&ty, (mutability, tied_to)) in borrows {
+                        ensure_not_borrowed.push((ty, *mutability, *tied_to));
+                    }
+                }
+                facts::IterBorrowsResult::Exclude(exceptions) => {
+                    // TODO: Handle tied sets.
+                    for &key in &all_keys {
+                        if let Some(mutability) = exceptions.get(&key) {
+                            if mutability.is_not() {
+                                ensure_not_borrowed.push((key, Mutability::Not, EMPTY_TIED_SET));
+                            }
+                        } else {
+                            ensure_not_borrowed.push((key, Mutability::Mut, EMPTY_TIED_SET));
+                        }
+                    }
+                }
             }
 
             for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
