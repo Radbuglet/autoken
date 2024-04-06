@@ -9,7 +9,7 @@ use rustc_middle::{
 use rustc_span::Symbol;
 
 use crate::{
-    analyzer::facts::{AliasClass, FactExplorer, IterBorrowsResult, EMPTY_TIED_SET},
+    analyzer::facts::{AliasClass, IterBorrowsResult, EMPTY_TIED_SET},
     util::{
         feeder::{
             feed,
@@ -43,20 +43,19 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     }
 
     // Collect facts for every function
-    let mut facts = FunctionFactStore::default();
+    let mut facts = FunctionFactStore::new(tcx);
 
     for did in iter_all_local_def_ids(tcx) {
         let did = did.to_def_id();
 
         if has_facts(tcx, did) {
-            facts.collect(tcx, did);
+            facts.collect(did);
         }
     }
 
     facts.optimize();
 
     // Validate generic assumptions
-    let mut explorer = FactExplorer::new(tcx, &facts);
     let mut class_check_map = FxHashMap::<Ty<'_>, (AliasClass, Ty<'_>)>::default();
 
     for did in iter_all_local_def_ids(tcx) {
@@ -68,9 +67,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         // Ensure that types have no alias.
         // TODO: Give better spans at the exact violation site.
-        for called in explorer
-            .reachable
-            .iter_reachable(tcx, &facts, MaybeConcretizedFunc(did, None))
+        for called in facts
+            .iter_reachable(MaybeConcretizedFunc(did, None))
             .iter_concrete()
         {
             class_check_map.clear();
@@ -126,9 +124,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
         // Define tokens for each key
-        let tokens_getting_tied = explorer
-            .iter_used_with_ties(tcx, MaybeConcretizedFunc(orig_did.to_def_id(), None))
-            .clone();
+        let tokens_getting_tied =
+            facts.iter_used_with_ties(MaybeConcretizedFunc(orig_did.to_def_id(), None));
 
         for (key, info) in &facts.lookup(orig_did.to_def_id()).unwrap().found_borrows {
             for &tied in &info.tied_to {
@@ -150,15 +147,15 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 &body_mutator.body().local_decls,
             ) {
                 Some(TerminalCallKind::Static(_target_span, target_func)) => {
-                    match explorer.iter_borrows(target_func.into()) {
+                    match facts.iter_borrows(target_func.into()) {
                         IterBorrowsResult::Only(borrows) => {
-                            for (&ty, (mutability, tied_to)) in borrows {
+                            for (&ty, (mutability, tied_to)) in &*borrows {
                                 ensure_not_borrowed.push((ty, *mutability, *tied_to));
                             }
                         }
                         IterBorrowsResult::Exclude(exceptions) => {
                             // TODO: Handle tied sets
-                            for &key in &tokens_getting_tied {
+                            for &key in &*tokens_getting_tied {
                                 if let Some(mutability) = exceptions.get(&key) {
                                     if mutability.is_not() {
                                         ensure_not_borrowed.push((
@@ -181,13 +178,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                     target_func
                 }
                 Some(TerminalCallKind::Generic(_target_span, target_func)) => {
-                    let exceptions = explorer.iter_generic_exclusion(
+                    let exceptions = facts.iter_generic_exclusion(
                         facts.lookup(orig_did.to_def_id()).unwrap(),
                         target_func,
                     );
 
                     // TODO: Handle tied sets
-                    for &key in &tokens_getting_tied {
+                    for &key in &*tokens_getting_tied {
                         if let Some(mutability) = exceptions.get(&key) {
                             if mutability.is_not() {
                                 ensure_not_borrowed.push((key, Mutability::Not, EMPTY_TIED_SET));

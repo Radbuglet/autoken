@@ -145,6 +145,7 @@ macro_rules! pool {
                 let value = unsafe { &mut *pool.get() }.pop().unwrap_or_default();
 
                 unsafe {
+                    #[allow(clippy::useless_transmute)]
                     $crate::util::pool::pool_internals::Pooled::new(
                         // Ty<'static, 'static> -> Ty<'lt1, 'lt2>
                         $crate::util::pool::pool_internals::transmute::<Erased, $ty>(value),
