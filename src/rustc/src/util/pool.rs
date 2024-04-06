@@ -1,65 +1,65 @@
+#![allow(clippy::missing_safety_doc)]
+
 use std::{
-    cell::Cell,
+    collections::{HashMap, HashSet},
     fmt,
-    mem::ManuallyDrop,
+    mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
 };
 
-pub struct Pool<T> {
-    free: Cell<Vec<T>>,
+// === Resettable === //
+
+pub unsafe trait Resettable {
+    fn reset_erasing_temporaries(&mut self);
 }
 
-impl<T> fmt::Debug for Pool<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Pool").finish_non_exhaustive()
+unsafe impl<T> Resettable for Vec<T> {
+    fn reset_erasing_temporaries(&mut self) {
+        self.clear();
     }
 }
 
-impl<T> Default for Pool<T> {
-    fn default() -> Self {
-        Self::new()
+unsafe impl<T, S: 'static> Resettable for HashSet<T, S> {
+    fn reset_erasing_temporaries(&mut self) {
+        self.clear();
     }
 }
 
-impl<T> Pool<T> {
-    pub const fn new() -> Self {
-        Self {
-            free: Cell::new(Vec::new()),
-        }
-    }
-
-    pub fn grab(&self) -> PoolGuard<'_, T>
-    where
-        T: PoolElem,
-    {
-        let mut free = self.free.take();
-        if let Some(value) = free.pop() {
-            self.free.set(free);
-            PoolGuard {
-                pool: self,
-                value: ManuallyDrop::new(value),
-            }
-        } else {
-            self.free.set(free);
-
-            PoolGuard {
-                pool: self,
-                value: ManuallyDrop::new(T::default()),
-            }
-        }
+unsafe impl<K, V, S: 'static> Resettable for HashMap<K, V, S> {
+    fn reset_erasing_temporaries(&mut self) {
+        self.clear();
     }
 }
 
-pub trait PoolElem: Default {
-    fn reset(&mut self);
-}
+// === Pooled === //
 
-pub struct PoolGuard<'a, T: PoolElem> {
-    pool: &'a Pool<T>,
+pub struct Pooled<T> {
+    give_back: unsafe fn(*mut ()),
     value: ManuallyDrop<T>,
 }
 
-impl<T: PoolElem> Deref for PoolGuard<'_, T> {
+impl<T> fmt::Debug for Pooled<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pooled").finish_non_exhaustive()
+    }
+}
+
+impl<T> Pooled<T> {
+    pub const unsafe fn new(value: T, give_back: unsafe fn(*mut ())) -> Self {
+        Self {
+            give_back,
+            value: ManuallyDrop::new(value),
+        }
+    }
+
+    pub fn steal(mut me: Self) -> T {
+        let value = unsafe { ManuallyDrop::take(&mut me.value) };
+        mem::forget(me);
+        value
+    }
+}
+
+impl<T> Deref for Pooled<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -67,18 +67,105 @@ impl<T: PoolElem> Deref for PoolGuard<'_, T> {
     }
 }
 
-impl<T: PoolElem> DerefMut for PoolGuard<'_, T> {
+impl<T> DerefMut for Pooled<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
 }
 
-impl<T: PoolElem> Drop for PoolGuard<'_, T> {
+impl<T> Drop for Pooled<T> {
     fn drop(&mut self) {
-        self.value.reset();
-
-        let mut free = self.pool.free.take();
-        free.push(unsafe { ManuallyDrop::take(&mut self.value) });
-        self.pool.free.set(free);
+        unsafe { (self.give_back)(&mut self.value as *mut ManuallyDrop<T> as *mut ()) };
     }
 }
+
+// === Macros === //
+
+#[doc(hidden)]
+pub mod pool_internals {
+    pub use {
+        super::{Pooled, Resettable},
+        std::{
+            cell::UnsafeCell,
+            mem::{transmute, ManuallyDrop},
+            thread_local,
+            vec::Vec,
+        },
+    };
+
+    pub trait HrtbHelper<I> {
+        type Output;
+    }
+
+    pub type ChooseLeft<L, R> = <L as Id<R>>::Output;
+
+    pub trait Id<T: ?Sized> {
+        type Output: ?Sized;
+    }
+
+    impl<T: ?Sized, V: ?Sized> Id<V> for T {
+        type Output = T;
+    }
+}
+
+#[macro_export]
+macro_rules! pool {
+    ($(
+        $(#[$attr:meta])*
+        $vis:vis $name:ident $(<$($lt:lifetime),*$(,)?>)? => $ty:ty;
+    )*) => {$(
+        $(#[$attr])*
+        $vis fn $name$(<$($lt),*>)?() -> $crate::util::pool::pool_internals::Pooled<$ty> {
+            #[allow(unused)]
+            type Erased = <
+                // dyn for<'lt1, 'lt2, ...> HrtbHelper<(&'lt1 (), &'lt2 (), ...), Output = Ty<'lt1, 'lt2, ...>>
+                dyn $(for<$($lt,)*>)? $crate::util::pool::pool_internals::HrtbHelper<(
+                    $($(&$lt (),)*)?
+                ), Output = $ty>
+                as
+                // HrtbHelper<(&'static (), &'static (), ...)>
+                $crate::util::pool::pool_internals::HrtbHelper<($($(
+                    $crate::util::pool::pool_internals::ChooseLeft<&'static (), for<$lt> fn(&$lt ())>,
+                )*)?)>
+            >::Output;
+
+            $crate::util::pool::pool_internals::thread_local! {
+                static POOL
+                    : $crate::util::pool::pool_internals::UnsafeCell<
+                        $crate::util::pool::pool_internals::Vec<Erased>
+                    >
+                = const {
+                    $crate::util::pool::pool_internals::UnsafeCell::new(
+                        $crate::util::pool::pool_internals::Vec::new(),
+                    )
+                };
+            }
+
+            POOL.with(|pool| {
+                let value = unsafe { &mut *pool.get() }.pop().unwrap_or_default();
+
+                unsafe {
+                    $crate::util::pool::pool_internals::Pooled::new(
+                        // Ty<'static, 'static> -> Ty<'lt1, 'lt2>
+                        $crate::util::pool::pool_internals::transmute::<Erased, $ty>(value),
+                        |value| {
+                            let value = &mut *(
+                                value as *mut $crate::util::pool::pool_internals::ManuallyDrop<$ty>
+                                as *mut $crate::util::pool::pool_internals::ManuallyDrop<Erased>
+                            );
+                            let mut value = $crate::util::pool::pool_internals::ManuallyDrop::take(value);
+
+                            $crate::util::pool::pool_internals::Resettable::reset_erasing_temporaries(&mut value);
+
+                            POOL.with(|pool| {
+                                (&mut *pool.get()).push(value);
+                            });
+                        },
+                    )
+                }
+            })
+        }
+    )*};
+}
+
+pub use pool;
