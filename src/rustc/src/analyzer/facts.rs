@@ -52,8 +52,6 @@ impl<'tcx> FunctionFactStore<'tcx> {
                         if is_tie_func(tcx, called.def_id()) {
                             let tied_to = get_tie(tcx, called.args()[0].expect_ty());
 
-                            // TODO: Populate alias classes.
-
                             instantiate_set_proc(
                                 tcx,
                                 span,
@@ -91,6 +89,21 @@ impl<'tcx> FunctionFactStore<'tcx> {
                         // (ignored)
                     }
                 }
+            }
+        }
+
+        // Populate alias classes
+        // TODO: Clean this up
+        for func in self.facts.keys().copied().collect::<Vec<_>>() {
+            let used_in_ties = FactExplorer::new(tcx, self)
+                .iter_used_with_ties(tcx, MaybeConcretizedFunc(func, None))
+                .clone();
+
+            let alias_classes = &mut self.facts.get_mut(&func).unwrap().alias_classes;
+
+            for ty in used_in_ties {
+                let new_class = AliasClass::from_usize(alias_classes.len());
+                alias_classes.entry(ty).or_insert(new_class);
             }
         }
     }

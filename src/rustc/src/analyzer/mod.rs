@@ -1,12 +1,15 @@
+use std::collections::hash_map;
+
+use rustc_hash::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::BasicBlock,
-    ty::{Mutability, TyCtxt},
+    ty::{Mutability, Ty, TyCtxt},
 };
 use rustc_span::Symbol;
 
 use crate::{
-    analyzer::facts::{FactExplorer, IterBorrowsResult, EMPTY_TIED_SET},
+    analyzer::facts::{AliasClass, FactExplorer, IterBorrowsResult, EMPTY_TIED_SET},
     util::{
         feeder::{
             feed,
@@ -54,6 +57,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Validate generic assumptions
     let mut explorer = FactExplorer::new(tcx, &facts);
+    let mut class_check_map = FxHashMap::<Ty<'_>, (AliasClass, Ty<'_>)>::default();
 
     for did in iter_all_local_def_ids(tcx) {
         let did = did.to_def_id();
@@ -63,7 +67,39 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         }
 
         // Ensure that types have no alias.
-        // TODO
+        // TODO: Give better spans at the exact violation site.
+        for called in explorer
+            .reachable
+            .iter_reachable(tcx, &facts, MaybeConcretizedFunc(did, None))
+            .iter_concrete()
+        {
+            class_check_map.clear();
+
+            for (generic, concrete, class) in facts
+                .lookup(called.def_id())
+                .unwrap()
+                .instantiate_alias_classes(tcx, called.args())
+            {
+                match class_check_map.entry(concrete) {
+                    hash_map::Entry::Occupied(entry) => {
+                        let entry = entry.into_mut();
+                        if entry.0 != class {
+                            tcx.dcx().span_err(
+                                tcx.def_span(called.def_id()),
+                                format!(
+                                    "call instantiates generic types {} and {generic} to {concrete}, \
+                                     but the called function assumes that they don't alias",
+                                    entry.1,
+                                ),
+                            );
+                        }
+                    }
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert((class, generic));
+                    }
+                }
+            }
+        }
 
         // Ensure that provided functions don't borrow illegal objects.
         // TODO
