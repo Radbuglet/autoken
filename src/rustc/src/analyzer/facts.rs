@@ -287,6 +287,7 @@ pub struct FactExplorer<'tcx, 'facts> {
 
     borrows: FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>,
     negative_borrows: FxHashMap<Ty<'tcx>, Mutability>,
+    used_with_ties: FxHashSet<Ty<'tcx>>,
 }
 
 impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
@@ -297,51 +298,28 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
             reachable: ReachableFactExplorer::default(),
             borrows: FxHashMap::default(),
             negative_borrows: FxHashMap::default(),
+            used_with_ties: FxHashSet::default(),
         }
     }
 
-    fn iter_positive_borrows_inner(
+    pub fn iter_used_with_ties(
+        &mut self,
         tcx: TyCtxt<'tcx>,
-        facts: &'facts FunctionFactStore<'tcx>,
-        borrows: &mut FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>,
-        src_def_id: DefId,
-        reachable: ReachableFuncs<'_, 'tcx, 'facts>,
-    ) {
-        for MaybeConcretizedFunc(def_id, args) in reachable.iter_concrete() {
-            for (_, ty, info) in facts
-                .lookup(def_id)
-                .unwrap() // iter_reachable only yields functions with facts
-                .instantiate_found_borrows(tcx, args)
-            {
-                let (mutability, set) = borrows
-                    .entry(ty)
-                    .or_insert((Mutability::Not, EMPTY_TIED_SET));
+        func: MaybeConcretizedFunc<'tcx>,
+    ) -> &FxHashSet<Ty<'tcx>> {
+        self.used_with_ties.clear();
 
-                mutability.upgrade(info.mutability);
+        for &callee in &self.facts.lookup(func.def_id()).unwrap().known_calls {
+            let facts = self.facts.lookup(callee.def_id()).unwrap();
 
-                if def_id == src_def_id && !info.tied_to.is_empty() {
-                    *set = &info.tied_to;
+            for (_ty, ty, info) in facts.instantiate_found_borrows(tcx, Some(callee.args())) {
+                if !info.tied_to.is_empty() {
+                    self.used_with_ties.insert(ty);
                 }
             }
         }
-    }
 
-    pub fn iter_positive_borrows(
-        &mut self,
-        src_func: MaybeConcretizedFunc<'tcx>,
-    ) -> &FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)> {
-        self.borrows.clear();
-
-        Self::iter_positive_borrows_inner(
-            self.tcx,
-            self.facts,
-            &mut self.borrows,
-            src_func.def_id(),
-            self.reachable
-                .iter_reachable(self.tcx, self.facts, src_func),
-        );
-
-        &self.borrows
+        &self.used_with_ties
     }
 
     pub fn iter_borrows(
@@ -387,13 +365,25 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
 
             IterBorrowsResult::Exclude(&self.negative_borrows)
         } else {
-            Self::iter_positive_borrows_inner(
-                self.tcx,
-                self.facts,
-                &mut self.borrows,
-                src_func.def_id(),
-                reachable,
-            );
+            for MaybeConcretizedFunc(def_id, args) in reachable.iter_concrete() {
+                for (_, ty, info) in self
+                    .facts
+                    .lookup(def_id)
+                    .unwrap() // iter_reachable only yields functions with facts
+                    .instantiate_found_borrows(self.tcx, args)
+                {
+                    let (mutability, set) = self
+                        .borrows
+                        .entry(ty)
+                        .or_insert((Mutability::Not, EMPTY_TIED_SET));
+
+                    mutability.upgrade(info.mutability);
+
+                    if def_id == src_func.def_id() && !info.tied_to.is_empty() {
+                        *set = &info.tied_to;
+                    }
+                }
+            }
 
             IterBorrowsResult::Only(&self.borrows)
         }

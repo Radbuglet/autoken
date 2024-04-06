@@ -13,7 +13,6 @@ use crate::{
             feeders::{MirBuiltFeeder, MirBuiltStasher},
             read_feed,
         },
-        hash::FxHashSet,
         mir::{
             get_static_callee_from_terminator, iter_all_local_def_ids,
             safeishly_grab_local_def_id_mir, TerminalCallKind,
@@ -90,17 +89,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
         // Define tokens for each key
-        let all_keys: FxHashSet<_> = explorer
-            .iter_positive_borrows(MaybeConcretizedFunc(orig_did.to_def_id(), None))
-            .keys()
-            .copied()
-            .collect();
+        let tokens_getting_tied = explorer
+            .iter_used_with_ties(tcx, MaybeConcretizedFunc(orig_did.to_def_id(), None))
+            .clone();
 
-        for (key, (_mutability, tied_to)) in
-            explorer.iter_positive_borrows(MaybeConcretizedFunc(orig_did.to_def_id(), None))
-        {
-            for tied in *tied_to {
-                body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
+        for (key, info) in &facts.lookup(orig_did.to_def_id()).unwrap().found_borrows {
+            for &tied in &info.tied_to {
+                body_mutator.tie_token_to_my_return(TokenKey(*key), tied);
             }
         }
 
@@ -131,7 +126,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 }
                 IterBorrowsResult::Exclude(exceptions) => {
                     // TODO: Handle tied sets
-                    for &key in &all_keys {
+                    for &key in &tokens_getting_tied {
                         if let Some(mutability) = exceptions.get(&key) {
                             if mutability.is_not() {
                                 ensure_not_borrowed.push((key, Mutability::Not, EMPTY_TIED_SET));

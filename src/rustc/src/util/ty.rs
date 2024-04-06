@@ -223,6 +223,13 @@ impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
     }
 }
 
+// === `PossiblyGeneric` === //
+
+pub enum PossiblyGeneric<'tcx> {
+    Concrete(MaybeConcretizedFunc<'tcx>),
+    Generic(MaybeConcretizedFunc<'tcx>),
+}
+
 // === instantiate_ignoring_regions === //
 
 pub fn instantiate_ignoring_regions<'tcx>(
