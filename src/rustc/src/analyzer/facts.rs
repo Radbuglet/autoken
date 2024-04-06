@@ -388,6 +388,25 @@ impl<'tcx, 'facts> FactExplorer<'tcx, 'facts> {
             IterBorrowsResult::Only(&self.borrows)
         }
     }
+
+    pub fn iter_generic_exclusion(
+        &mut self,
+        facts: &'facts FunctionFacts<'tcx>,
+        func: ConcretizedFunc<'tcx>,
+    ) -> &'_ FxHashMap<Ty<'tcx>, Mutability> {
+        self.negative_borrows.clear();
+
+        for (do_not_borrow, mutability) in
+            facts.generic_calls[&func].instantiate_does_not_borrow(self.tcx, func.into())
+        {
+            self.negative_borrows
+                .entry(do_not_borrow)
+                .or_insert(mutability)
+                .upgrade(mutability);
+        }
+
+        &self.negative_borrows
+    }
 }
 
 // Reachability
