@@ -1,5 +1,3 @@
-// Adapted from rustc_middle/src/ty/generic_args.rs
-
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     bug,
@@ -223,14 +221,7 @@ impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
     }
 }
 
-// === `PossiblyGeneric` === //
-
-pub enum PossiblyGeneric<'tcx> {
-    Concrete(MaybeConcretizedFunc<'tcx>),
-    Generic(MaybeConcretizedFunc<'tcx>),
-}
-
-// === instantiate_ignoring_regions === //
+// === `instantiate_ignoring_regions` === //
 
 pub fn instantiate_ignoring_regions<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -244,6 +235,7 @@ pub fn instantiate_ignoring_regions<'tcx>(
     })
 }
 
+// Adapted from rustc_middle/src/ty/generic_args.rs
 struct ArgFolderIgnoreRegions<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     args: &'a [GenericArg<'tcx>],

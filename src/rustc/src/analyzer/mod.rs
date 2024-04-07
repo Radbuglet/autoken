@@ -4,12 +4,12 @@ use rustc_hash::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::BasicBlock,
-    ty::{Mutability, Ty, TyCtxt},
+    ty::{Ty, TyCtxt},
 };
 use rustc_span::Symbol;
 
 use crate::{
-    analyzer::facts::{AliasClass, IterBorrowsResult, EMPTY_TIED_SET},
+    analyzer::facts::AliasClass,
     util::{
         feeder::{
             feed,
@@ -67,10 +67,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         // Ensure that types have no alias.
         // TODO: Give better spans at the exact violation site.
-        for called in facts
-            .iter_reachable(MaybeConcretizedFunc(did, None))
-            .iter_concrete()
-        {
+        for &called in &*facts.iter_reachable(MaybeConcretizedFunc(did, None)) {
             class_check_map.clear();
 
             for (generic, concrete, class) in facts
@@ -108,7 +105,6 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     assert!(!tcx.untracked().definitions.is_frozen());
 
     let mut shadows = Vec::new();
-    let mut ensure_not_borrowed = Vec::new();
 
     for orig_did in iter_all_local_def_ids(tcx) {
         if !has_facts(tcx, orig_did.to_def_id()) {
@@ -124,9 +120,6 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
 
         // Define tokens for each key
-        let tokens_getting_tied =
-            facts.iter_used_with_ties(MaybeConcretizedFunc(orig_did.to_def_id(), None));
-
         for (key, info) in &facts.lookup(orig_did.to_def_id()).unwrap().found_borrows {
             for &tied in &info.tied_to {
                 body_mutator.tie_token_to_my_return(TokenKey(*key), tied);
@@ -138,68 +131,18 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         for bb in 0..bb_count {
             let bb = BasicBlock::from_usize(bb);
 
-            ensure_not_borrowed.clear();
-
             // Determine the set of tokens borrowed by this function.
-            let target_func = match get_static_callee_from_terminator(
-                tcx,
-                &body_mutator.body().basic_blocks[bb].terminator,
-                &body_mutator.body().local_decls,
-            ) {
-                Some(TerminalCallKind::Static(_target_span, target_func)) => {
-                    match facts.iter_borrows(target_func.into()) {
-                        IterBorrowsResult::Only(borrows) => {
-                            for (&ty, (mutability, tied_to)) in &*borrows {
-                                ensure_not_borrowed.push((ty, *mutability, *tied_to));
-                            }
-                        }
-                        IterBorrowsResult::Exclude(exceptions) => {
-                            // TODO: Handle tied sets
-                            for &key in &*tokens_getting_tied {
-                                if let Some(mutability) = exceptions.get(&key) {
-                                    if mutability.is_not() {
-                                        ensure_not_borrowed.push((
-                                            key,
-                                            Mutability::Not,
-                                            EMPTY_TIED_SET,
-                                        ));
-                                    }
-                                } else {
-                                    ensure_not_borrowed.push((
-                                        key,
-                                        Mutability::Mut,
-                                        EMPTY_TIED_SET,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    target_func
-                }
-                Some(TerminalCallKind::Generic(_target_span, target_func)) => {
-                    let exceptions = facts.iter_generic_exclusion(
-                        facts.lookup(orig_did.to_def_id()).unwrap(),
-                        target_func,
-                    );
-
-                    // TODO: Handle tied sets
-                    for &key in &*tokens_getting_tied {
-                        if let Some(mutability) = exceptions.get(&key) {
-                            if mutability.is_not() {
-                                ensure_not_borrowed.push((key, Mutability::Not, EMPTY_TIED_SET));
-                            }
-                        } else {
-                            ensure_not_borrowed.push((key, Mutability::Mut, EMPTY_TIED_SET));
-                        }
-                    }
-
-                    target_func
-                }
-                _ => continue,
+            let Some(TerminalCallKind::Static(_target_span, target_func)) =
+                get_static_callee_from_terminator(
+                    tcx,
+                    &body_mutator.body().basic_blocks[bb].terminator,
+                    &body_mutator.body().local_decls,
+                )
+            else {
+                continue;
             };
 
-            for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
+            for (&ty, &(mutability, tied)) in &*facts.iter_borrows(target_func.into()) {
                 body_mutator.ensure_not_borrowed_at(bb, TokenKey(ty), mutability);
 
                 for &tied in tied {

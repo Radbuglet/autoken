@@ -25,8 +25,6 @@ pool! {
     pub ty_set<'tcx> => FxHashSet<Ty<'tcx>>;
     pub borrows_map<'tcx, 'facts> => FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>;
     pub concrete_visit_set<'tcx> => FxHashSet<MaybeConcretizedFunc<'tcx>>;
-    pub generic_visit_set<'tcx, 'facts> => FxHashMap<MaybeConcretizedFunc<'tcx>, &'facts GenericCallInfo<'tcx>>;
-    pub ty_mut_set<'tcx> => FxHashMap<Ty<'tcx>, Mutability>;
 }
 
 // === Function Fact Store === //
@@ -96,11 +94,8 @@ impl<'tcx> FunctionFactStore<'tcx> {
                             collection_queue.push(called.def_id());
                         }
                     }
-                    Some(TerminalCallKind::Generic(_span, called)) => {
-                        entry
-                            .generic_calls
-                            .entry(called)
-                            .or_insert_with(GenericCallInfo::default);
+                    Some(TerminalCallKind::Generic(_span, _called)) => {
+                        // (ignored)
                     }
                     Some(TerminalCallKind::Dynamic) => {
                         // (ignored)
@@ -143,10 +138,6 @@ pub struct FunctionFacts<'tcx> {
     /// deep calls.
     pub known_calls: FxHashSet<ConcretizedFunc<'tcx>>,
 
-    /// The statically-resolved generic functions this function can call and their promises on what
-    /// they won't borrow without accounting for deep calls.
-    pub generic_calls: FxHashMap<ConcretizedFunc<'tcx>, GenericCallInfo<'tcx>>,
-
     /// The set of all concrete borrows for this function without accounting for deep calls.
     pub found_borrows: FxHashMap<Ty<'tcx>, BorrowInfo>,
 
@@ -163,7 +154,6 @@ impl<'tcx> FunctionFacts<'tcx> {
         Self {
             def_id,
             known_calls: FxHashSet::default(),
-            generic_calls: FxHashMap::default(),
             found_borrows: FxHashMap::default(),
             generic_borrow_sets: FxHashMap::default(),
             alias_classes: FxHashMap::default(),
@@ -196,22 +186,11 @@ impl BorrowInfo {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct GenericCallInfo<'tcx> {
-    pub does_not_borrow: FxHashMap<Ty<'tcx>, Mutability>,
-}
-
 rustc_index::newtype_index! {
     pub struct AliasClass {}
 }
 
 // === Function Fact Instantiation === //
-
-#[derive(Debug, Copy, Clone)]
-pub enum FactInstantiatedCall<'tcx, 'a> {
-    Concrete(ConcretizedFunc<'tcx>),
-    Generic(ConcretizedFunc<'tcx>, &'a GenericCallInfo<'tcx>),
-}
 
 impl<'tcx> FunctionFacts<'tcx> {
     pub fn func(&self, args: MaybeConcretizedArgs<'tcx>) -> MaybeConcretizedFunc<'tcx> {
@@ -226,36 +205,6 @@ impl<'tcx> FunctionFacts<'tcx> {
         self.known_calls
             .iter()
             .map(move |&called| self.func(args).instantiate_func(tcx, called))
-    }
-
-    pub fn instantiate_generic_calls(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        args: MaybeConcretizedArgs<'tcx>,
-    ) -> impl Iterator<Item = FactInstantiatedCall<'tcx, '_>> + '_ {
-        self.generic_calls
-            .iter()
-            .filter_map(move |(&called, info)| {
-                match self
-                    .func(args)
-                    .instantiate_func(tcx, called)
-                    .resolve_instance(tcx)
-                {
-                    Ok(Some(instance)) => Some(FactInstantiatedCall::Concrete(instance.into())),
-                    Ok(None) => Some(FactInstantiatedCall::Generic(called, info)),
-                    Err(_) => None,
-                }
-            })
-    }
-
-    pub fn instantiate_all_calls(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        args: MaybeConcretizedArgs<'tcx>,
-    ) -> impl Iterator<Item = FactInstantiatedCall<'tcx, '_>> + '_ {
-        self.instantiate_known_calls(tcx, args)
-            .map(FactInstantiatedCall::Concrete)
-            .chain(self.instantiate_generic_calls(tcx, args))
     }
 
     pub fn instantiate_found_borrows(
@@ -289,75 +238,25 @@ impl<'tcx> FunctionFacts<'tcx> {
     }
 }
 
-impl<'tcx> GenericCallInfo<'tcx> {
-    pub fn instantiate_does_not_borrow(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        func: MaybeConcretizedFunc<'tcx>,
-    ) -> impl Iterator<Item = (Ty<'tcx>, Mutability)> + '_ {
-        self.does_not_borrow
-            .iter()
-            .map(move |(ty, mutbl)| (func.instantiate_arg(tcx, *ty), *mutbl))
-    }
-}
-
 // === Function Fact Exploration === //
 
-pub static EMPTY_TIED_SET: &FxHashSet<Symbol> = &new_const_hash_set();
-
-#[derive(Debug)]
-pub enum IterBorrowsResult<'tcx, 'facts> {
-    Only(Pooled<FxHashMap<Ty<'tcx>, (Mutability, &'facts FxHashSet<Symbol>)>>),
-    Exclude(Pooled<FxHashMap<Ty<'tcx>, Mutability>>),
-}
-
-#[derive(Debug)]
-pub struct ReachableFuncs<'tcx, 'facts> {
-    pub concrete_visit_set: Pooled<FxHashSet<MaybeConcretizedFunc<'tcx>>>,
-    pub generic_visit_set:
-        Pooled<FxHashMap<MaybeConcretizedFunc<'tcx>, &'facts GenericCallInfo<'tcx>>>,
-}
-
-impl<'tcx, 'facts> ReachableFuncs<'tcx, 'facts> {
-    pub fn has_generic_visits(&self) -> bool {
-        !self.generic_visit_set.is_empty()
-    }
-
-    pub fn iter_concrete(&self) -> impl Iterator<Item = MaybeConcretizedFunc<'tcx>> + '_ {
-        self.concrete_visit_set.iter().copied()
-    }
-
-    pub fn iter_generic(
-        &self,
-    ) -> impl Iterator<Item = (MaybeConcretizedFunc<'tcx>, &'facts GenericCallInfo<'tcx>)> + '_
-    {
-        self.generic_visit_set.iter().map(|(&k, &v)| (k, v))
-    }
-}
+static EMPTY_TIED_SET: &FxHashSet<Symbol> = &new_const_hash_set();
 
 impl<'tcx> FunctionFactStore<'tcx> {
     pub fn iter_reachable<'facts>(
         &'facts self,
         func: MaybeConcretizedFunc<'tcx>,
-    ) -> ReachableFuncs<'tcx, 'facts> {
+    ) -> Pooled<FxHashSet<MaybeConcretizedFunc<'tcx>>> {
         let mut concrete_visit_set = concrete_visit_set();
-        let mut generic_visit_set = generic_visit_set();
 
-        self.iter_reachable_inner(&mut concrete_visit_set, &mut generic_visit_set, func);
+        self.iter_reachable_inner(&mut concrete_visit_set, func);
 
-        ReachableFuncs {
-            concrete_visit_set,
-            generic_visit_set,
-        }
+        concrete_visit_set
     }
 
     fn iter_reachable_inner<'facts>(
         &'facts self,
         concrete_visit_set: &mut FxHashSet<MaybeConcretizedFunc<'tcx>>,
-        generic_visit_set: &mut FxHashMap<
-            MaybeConcretizedFunc<'tcx>,
-            &'facts GenericCallInfo<'tcx>,
-        >,
         src_func: MaybeConcretizedFunc<'tcx>,
     ) {
         let Some(src_facts) = self.lookup(src_func.def_id()) else {
@@ -368,15 +267,8 @@ impl<'tcx> FunctionFactStore<'tcx> {
             return;
         }
 
-        for dest in src_facts.instantiate_all_calls(self.tcx, src_func.args()) {
-            match dest {
-                FactInstantiatedCall::Concrete(dest) => {
-                    self.iter_reachable_inner(concrete_visit_set, generic_visit_set, dest.into());
-                }
-                FactInstantiatedCall::Generic(dest, info) => {
-                    generic_visit_set.insert(dest.into(), info);
-                }
-            }
+        for dest in src_facts.instantiate_known_calls(self.tcx, src_func.args()) {
+            self.iter_reachable_inner(concrete_visit_set, dest.into());
         }
     }
 
@@ -402,82 +294,27 @@ impl<'tcx> FunctionFactStore<'tcx> {
     pub fn iter_borrows(
         &self,
         src_func: MaybeConcretizedFunc<'tcx>,
-    ) -> IterBorrowsResult<'tcx, '_> {
-        let reachable = self.iter_reachable(src_func);
+    ) -> Pooled<FxHashMap<Ty<'tcx>, (Mutability, &'_ FxHashSet<Symbol>)>> {
+        let mut borrows = borrows_map();
 
-        if reachable.has_generic_visits() {
-            let mut negative_borrows = ty_mut_set();
+        for MaybeConcretizedFunc(def_id, args) in &*self.iter_reachable(src_func) {
+            for (_, ty, info) in self
+                .lookup(*def_id)
+                .unwrap() // iter_reachable only yields functions with facts
+                .instantiate_found_borrows(self.tcx, *args)
+            {
+                let (mutability, set) = borrows
+                    .entry(ty)
+                    .or_insert((Mutability::Not, EMPTY_TIED_SET));
 
-            // Collect negative borrows
-            for (func, info) in reachable.iter_generic() {
-                for (do_not_borrow, mutability) in info.instantiate_does_not_borrow(self.tcx, func)
-                {
-                    negative_borrows
-                        .entry(do_not_borrow)
-                        .or_insert(mutability)
-                        .upgrade(mutability);
+                mutability.upgrade(info.mutability);
+
+                if *def_id == src_func.def_id() && !info.tied_to.is_empty() {
+                    *set = &info.tied_to;
                 }
             }
-
-            // Remove positive borrows
-            for MaybeConcretizedFunc(def_id, args) in reachable.iter_concrete() {
-                for (_, ty, info) in self
-                    .lookup(def_id)
-                    .unwrap() // iter_reachable only yields functions with facts
-                    .instantiate_found_borrows(self.tcx, args)
-                {
-                    if info.mutability == Mutability::Mut {
-                        negative_borrows.remove(&ty);
-                    } else {
-                        negative_borrows
-                            .entry(ty)
-                            .and_modify(|v| *v = Mutability::Not);
-                    }
-                }
-            }
-
-            IterBorrowsResult::Exclude(negative_borrows)
-        } else {
-            let mut borrows = borrows_map();
-
-            for MaybeConcretizedFunc(def_id, args) in reachable.iter_concrete() {
-                for (_, ty, info) in self
-                    .lookup(def_id)
-                    .unwrap() // iter_reachable only yields functions with facts
-                    .instantiate_found_borrows(self.tcx, args)
-                {
-                    let (mutability, set) = borrows
-                        .entry(ty)
-                        .or_insert((Mutability::Not, EMPTY_TIED_SET));
-
-                    mutability.upgrade(info.mutability);
-
-                    if def_id == src_func.def_id() && !info.tied_to.is_empty() {
-                        *set = &info.tied_to;
-                    }
-                }
-            }
-
-            IterBorrowsResult::Only(borrows)
-        }
-    }
-
-    pub fn iter_generic_exclusion(
-        &self,
-        facts: &FunctionFacts<'tcx>,
-        func: ConcretizedFunc<'tcx>,
-    ) -> Pooled<FxHashMap<Ty<'tcx>, Mutability>> {
-        let mut negative_borrows = ty_mut_set();
-
-        for (do_not_borrow, mutability) in
-            facts.generic_calls[&func].instantiate_does_not_borrow(self.tcx, func.into())
-        {
-            negative_borrows
-                .entry(do_not_borrow)
-                .or_insert(mutability)
-                .upgrade(mutability);
         }
 
-        negative_borrows
+        borrows
     }
 }
