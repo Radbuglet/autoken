@@ -1,4 +1,7 @@
-use std::collections::hash_map;
+use std::{
+    collections::hash_map,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rustc_hir::{
     def::DefKind,
@@ -45,6 +48,11 @@ struct FuncFacts<'tcx> {
 impl<'tcx> AnalysisDriver<'tcx> {
     pub fn analyze(&mut self, tcx: TyCtxt<'tcx>) {
         let id_count = tcx.untracked().definitions.read().def_index_count();
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
         // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
         //
@@ -222,7 +230,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let shadow_def = tcx.at(body.span).create_def(
                 tcx.local_parent(orig_id),
                 Symbol::intern(&format!(
-                    "{}_autoken_shadow_{}",
+                    "{}_autoken_shadow_{start_time}_{}",
                     tcx.opt_item_name(orig_id.to_def_id())
                         .unwrap_or_else(|| unnamed.get()),
                     self.id_gen,
