@@ -169,7 +169,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
                     continue;
                 };
 
-                // FIXME: Here too!
                 let Some(target_instance_mono) = get_static_callee_from_terminator(
                     tcx,
                     instance,
@@ -304,7 +303,6 @@ impl<'tcx> AnalysisDriver<'tcx> {
             let Some(target_instance) =
                 get_static_callee_from_terminator(tcx, &instance, &body.local_decls, callee)
             else {
-                // FIXME: Handle these as well.
                 continue;
             };
 
