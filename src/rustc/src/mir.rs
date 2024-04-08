@@ -397,6 +397,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
 
         // Remap these regions to inference variables.
         let mut var_assignments = FxHashMap::default();
+        let mut var_assignment_count = 1;
 
         let fn_result =
             callee_out.fold_with(&mut RegionFolder::new(self.tcx, &mut |region, index| {
@@ -407,11 +408,14 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                             let idx = if is_tied(region) {
                                 0
                             } else {
-                                var_assignments.len() as u32 + 1
+                                var_assignment_count
                             };
-                            let bound_var = *var_assignments
-                                .entry(region)
-                                .or_insert_with(|| BoundVar::from_u32(idx));
+
+                            let bound_var = *var_assignments.entry(region).or_insert_with(|| {
+                                let bv = BoundVar::from_u32(idx);
+                                var_assignment_count += 1;
+                                bv
+                            });
 
                             Region::new_bound(
                                 self.tcx,
@@ -425,6 +429,17 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                             region
                         }
                     }
+                    RegionKind::ReErased => {
+                        // TODO: Make this less pessimistic.
+                        Region::new_bound(
+                            self.tcx,
+                            DebruijnIndex::from_u32(0),
+                            BoundRegion {
+                                kind: BoundRegionKind::BrAnon,
+                                var: BoundVar::from_u32(0),
+                            },
+                        )
+                    }
 
                     // Unaffected regions
                     RegionKind::ReBound(_, _) => region,
@@ -433,7 +448,6 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     // Non-applicable regions
                     RegionKind::ReVar(_) => unreachable!(),
                     RegionKind::RePlaceholder(_) => unreachable!(),
-                    RegionKind::ReErased => unreachable!(),
                     RegionKind::ReError(_) => unreachable!(),
                 }
             }));
@@ -487,8 +501,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     value: UserType::Ty(tuple_binder),
                     max_universe: UniverseIndex::ROOT,
                     variables: self.tcx.mk_canonical_var_infos(
-                        &var_assignments
-                            .iter()
+                        &(0..var_assignment_count)
                             .map(|_| CanonicalVarInfo {
                                 kind: CanonicalVarKind::Region(UniverseIndex::ROOT),
                             })

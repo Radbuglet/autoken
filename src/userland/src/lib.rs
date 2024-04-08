@@ -63,22 +63,16 @@ macro_rules! cap {
                 &VALUE
             }
 
-            $vis fn get<'out $($(, $lt)*)?>() -> &'out $ty {
+            $vis fn get<'out, R: 'out>(f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out $ty) -> R) -> $crate::BindHelper<'out, R> {
                 $crate::tie!('out => ref $name);
-                // TODO: Use this
-                // $($( $crate::tie!($lt => ref $crate::CapInContext<$name>); )*)?
-                $($( $crate::tie!($lt => ref $name); )*)?
 
-                Self::tls().with(|ptr| unsafe { &*ptr.get().cast() })
+                $crate::BindHelper(f(Self::tls().with(|ptr| unsafe { &*ptr.get().cast() })), [])
             }
 
-            $vis fn get_mut<'out $($(, $lt)*)?>() -> &'out mut $ty {
+            $vis fn get_mut<'out, R: 'out>(f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out mut $ty) -> R) -> $crate::BindHelper<'out, R> {
                 $crate::tie!('out => mut $name);
-                // TODO: Use this
-                // $($( $crate::tie!($lt => ref $crate::CapInContext<$name>); )*)?
-                $($( $crate::tie!($lt => ref $name); )*)?
 
-                Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() })
+                $crate::BindHelper(f(Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() })), [])
             }
         }
 
@@ -114,7 +108,7 @@ macro_rules! cap {
     )*};
 }
 
-pub struct CapInContext<T>(PhantomData<fn(T) -> T>);
+pub struct BindHelper<'a, T>(pub T, pub [&'a (); 0]);
 
 // === TokenSet === //
 
@@ -264,7 +258,7 @@ macro_rules! tie {
         $crate::tie!($lt => set $crate::Ref<$ty>);
     };
     (set $ty:ty) => {{
-        $crate::__autoken_declare_tied::<(), $ty>();
+        $crate::tie_macro_internals::__autoken_declare_tied::<(), $ty>();
     }};
     (mut $ty:ty) => {
         $crate::tie!(set $crate::Mut<$ty>);
