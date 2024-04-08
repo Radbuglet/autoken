@@ -3,6 +3,7 @@ use std::collections::hash_map;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
+    LangItem,
 };
 
 use rustc_middle::{
@@ -116,17 +117,27 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             continue;
         };
 
-        for_each_unsized_func(tcx, instance, body, |instance| {
-            let Some(facts) = func_facts.get(&instance) else {
-                return;
-            };
+        if tcx.entry_fn(()).map(|(did, _)| did) == Some(instance.def_id()) {
+            ensure_no_borrow(tcx, &func_facts, instance, "use this main function");
+        }
 
-            if !facts.borrows.is_empty() {
-                tcx.sess.dcx().span_err(
-                    tcx.def_span(instance.def_id()),
-                    "cannot unsize this function as it accesses global tokens",
-                );
-            }
+        if tcx.def_kind(instance.def_id()) == DefKind::AssocFn
+            && tcx
+                .associated_item(instance.def_id())
+                .trait_item_def_id
+                .map(|method_did| tcx.parent(method_did))
+                == Some(tcx.require_lang_item(LangItem::Drop, None))
+        {
+            ensure_no_borrow(
+                tcx,
+                &func_facts,
+                instance,
+                "use this method as a destructor",
+            );
+        }
+
+        for_each_unsized_func(tcx, instance, body, |instance| {
+            ensure_no_borrow(tcx, &func_facts, instance, "unsize this function")
         });
     }
 
@@ -249,6 +260,32 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     for shadow in shadows {
         // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
         let _ = tcx.mir_borrowck(shadow.def_id());
+    }
+}
+
+fn ensure_no_borrow<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func_facts: &FxHashMap<Instance<'tcx>, FuncFacts<'tcx>>,
+    instance: Instance<'tcx>,
+    action: &str,
+) {
+    let Some(facts) = func_facts.get(&instance) else {
+        return;
+    };
+
+    if !facts.borrows.is_empty() {
+        tcx.sess.dcx().span_err(
+            tcx.def_span(instance.def_id()),
+            format!(
+                "cannot {action} because it borrows {}",
+                facts
+                    .borrows
+                    .keys()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
     }
 }
 

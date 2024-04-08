@@ -1,53 +1,120 @@
-#![no_std]
 #![allow(clippy::missing_safety_doc)]
 
-use core::{cell::UnsafeCell, fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData};
 
-// === TokenCell === //
+// === `cap!` === //
 
-pub struct TokenCell<T: ?Sized, L: ?Sized = T> {
-    _ty: PhantomData<fn(L) -> L>,
-    value: UnsafeCell<T>,
-}
+#[doc(hidden)]
+pub mod cap_macro_internals {
+    pub use std::{cell::Cell, ops::FnOnce, ptr::null_mut, thread::LocalKey, thread_local};
 
-unsafe impl<T: ?Sized + Send, L: ?Sized> Send for TokenCell<T, L> {}
-unsafe impl<T: ?Sized + Sync, L: ?Sized> Sync for TokenCell<T, L> {}
-
-impl<T: Default, L> Default for TokenCell<T, L> {
-    fn default() -> Self {
-        Self::new(T::default())
+    pub struct CxScope {
+        tls: &'static LocalKey<Cell<*mut ()>>,
+        prev: *mut (),
     }
-}
 
-impl<T: ?Sized, L> TokenCell<T, L> {
-    pub const fn new(value: T) -> Self
-    where
-        T: Sized,
-    {
-        Self {
-            _ty: PhantomData,
-            value: UnsafeCell::new(value),
+    impl CxScope {
+        pub fn new(tls: &'static LocalKey<Cell<*mut ()>>, new_ptr: *mut ()) -> Self {
+            tls.set(new_ptr);
+
+            Self {
+                tls,
+                prev: tls.get(),
+            }
         }
     }
 
-    pub fn get<'a>(&'a self) -> &'a T {
-        tie!('a => ref L);
-        unsafe { &*self.value.get() }
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    pub fn get_mut<'a>(&'a self) -> &'a mut T {
-        tie!('a => mut L);
-        unsafe { &mut *self.value.get() }
-    }
-
-    pub fn into_inner(self) -> T
-    where
-        T: Sized,
-    {
-        self.value.into_inner()
+    impl Drop for CxScope {
+        fn drop(&mut self) {
+            self.tls.set(self.prev);
+        }
     }
 }
+
+pub trait CapTarget<T> {
+    fn provide<R>(value: T, f: impl FnOnce() -> R) -> R;
+}
+
+#[macro_export]
+macro_rules! cap {
+    ( $($ty:ty: $expr:expr),*$(,)? => $($body:tt)* ) => {
+        let f = || { $($body)* };
+
+        $(let f = || <$ty as $crate::CapTarget<_>>::provide($expr, f);)*
+
+        f();
+    };
+    ($(
+        $(#[$attr:meta])*
+        $vis:vis $name:ident$(<$($lt:lifetime),* $(,)?>)? = $ty:ty;
+    )*) => {$(
+        $(#[$attr])*
+        #[non_exhaustive]
+        $vis struct $name;
+
+        impl $name {
+            fn tls() -> &'static $crate::cap_macro_internals::LocalKey<$crate::cap_macro_internals::Cell<*mut ()>> {
+                $crate::cap_macro_internals::thread_local! {
+                    static VALUE: $crate::cap_macro_internals::Cell<*mut ()> = const {
+                        $crate::cap_macro_internals::Cell::new($crate::cap_macro_internals::null_mut())
+                    };
+                }
+
+                &VALUE
+            }
+
+            $vis fn get<'out $($(, $lt)*)?>() -> &'out $ty {
+                $crate::tie!('out => ref $name);
+                // TODO: Use this
+                // $($( $crate::tie!($lt => ref $crate::CapInContext<$name>); )*)?
+                $($( $crate::tie!($lt => ref $name); )*)?
+
+                Self::tls().with(|ptr| unsafe { &*ptr.get().cast() })
+            }
+
+            $vis fn get_mut<'out $($(, $lt)*)?>() -> &'out mut $ty {
+                $crate::tie!('out => mut $name);
+                // TODO: Use this
+                // $($( $crate::tie!($lt => ref $crate::CapInContext<$name>); )*)?
+                $($( $crate::tie!($lt => ref $name); )*)?
+
+                Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() })
+            }
+        }
+
+        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out mut $ty> for $name {
+            fn provide<R>(value: &'out mut $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
+                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *mut $ty as *mut ());
+
+                unsafe {
+                    $crate::absorb::<$crate::Mut<Self>, R>(f)
+                }
+            }
+        }
+
+        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out $ty> for $name {
+            fn provide<R>(value: &'out $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
+                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *const $ty as *const () as *mut ());
+
+                fn tier<'a>() -> &'a () {
+                    $crate::tie!('a => mut $name);
+                    &()
+                }
+
+                unsafe {
+                    $crate::absorb::<$crate::Mut<Self>, R>(|| {
+                        let tier = tier();
+                        let res = $crate::absorb::<$crate::Ref<Self>, R>(f);
+                        let _ = tier;
+                        res
+                    })
+                }
+            }
+        }
+    )*};
+}
+
+pub struct CapInContext<T>(PhantomData<fn(T) -> T>);
 
 // === TokenSet === //
 
@@ -107,7 +174,7 @@ impl_union!(T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15 T16 T17 T18 T19 T
 
 // === Absorb === //
 
-pub unsafe fn absorb_only<T: TokenSet, R>(f: impl FnOnce() -> R) -> R {
+pub unsafe fn absorb<T: TokenSet, R>(f: impl FnOnce() -> R) -> R {
     #[doc(hidden)]
     #[allow(clippy::extra_unused_type_parameters)]
     pub fn __autoken_absorb_only<T: TokenSet, R>(f: impl FnOnce() -> R) -> R {
@@ -117,6 +184,7 @@ pub unsafe fn absorb_only<T: TokenSet, R>(f: impl FnOnce() -> R) -> R {
     __autoken_absorb_only::<T, R>(f)
 }
 
+// TODO: Inherit send + sync from tokens.
 pub struct BorrowsMut<'a, T: TokenSet> {
     _ty: PhantomData<fn() -> (&'a (), T)>,
 }
@@ -138,11 +206,11 @@ impl<'a, T: TokenSet> BorrowsMut<'a, T> {
     }
 
     pub fn absorb<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        unsafe { absorb_only::<T, R>(f) }
+        unsafe { absorb::<T, R>(f) }
     }
 
     pub fn absorb_ref<R>(&self, f: impl FnOnce() -> R) -> R {
-        unsafe { absorb_only::<DowngradeRef<T>, R>(f) }
+        unsafe { absorb::<DowngradeRef<T>, R>(f) }
     }
 }
 
@@ -167,14 +235,16 @@ impl<'a, T: TokenSet> BorrowsRef<'a, T> {
     }
 
     pub fn absorb<R>(&self, f: impl FnOnce() -> R) -> R {
-        unsafe { absorb_only::<DowngradeRef<T>, R>(f) }
+        unsafe { absorb::<DowngradeRef<T>, R>(f) }
     }
 }
 
 // === Tie === //
 
 #[doc(hidden)]
-pub fn __autoken_declare_tied<I, T: TokenSet>() {}
+pub mod tie_macro_internals {
+    pub fn __autoken_declare_tied<I, T: crate::TokenSet>() {}
+}
 
 #[macro_export]
 macro_rules! tie {
@@ -185,7 +255,7 @@ macro_rules! tie {
 
         let _: &$lt() = &();
 
-        $crate::__autoken_declare_tied::<AutokenLifetimeDefiner<'_>, $ty>();
+        $crate::tie_macro_internals::__autoken_declare_tied::<AutokenLifetimeDefiner<'_>, $ty>();
     }};
     ($lt:lifetime => mut $ty:ty) => {
         $crate::tie!($lt => set $crate::Mut<$ty>);
