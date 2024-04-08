@@ -383,7 +383,7 @@ impl<'tcx> AnalysisDriver<'tcx> {
                 }
             }
             hash_map::Entry::Vacant(entry) => {
-                entry.insert((Mutability::Mut, None));
+                entry.insert((mutability, None));
             }
         });
 
