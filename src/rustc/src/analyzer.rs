@@ -1,7 +1,4 @@
-use std::{
-    collections::hash_map,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::hash_map;
 
 use rustc_hir::{
     def::DefKind,
@@ -35,11 +32,6 @@ use crate::{
 
 pub fn analyze(tcx: TyCtxt<'_>) {
     let id_count = tcx.untracked().definitions.read().def_index_count();
-
-    let start_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
 
     let mut id_gen = 0;
 
@@ -233,7 +225,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let shadow_def = tcx.at(body.span).create_def(
             tcx.local_parent(orig_id),
             Symbol::intern(&format!(
-                "{}_autoken_shadow_{start_time}_{id_gen}",
+                "{}_autoken_shadow_{id_gen}",
                 tcx.opt_item_name(orig_id.to_def_id())
                     .unwrap_or_else(|| unnamed.get()),
             )),

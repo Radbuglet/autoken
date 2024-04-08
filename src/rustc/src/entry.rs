@@ -8,7 +8,7 @@ use rustc_driver::{
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_interface::{interface::Compiler, Queries};
-use rustc_middle::{mir::Body, ty::TyCtxt};
+use rustc_middle::{dep_graph::DepNodeIndex, mir::Body, ty::TyCtxt};
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
@@ -65,6 +65,7 @@ impl Callbacks for AnalyzeMirCallbacks {
 
                 query.mir_built = |tcx, id| {
                     if let Some(fed) = read_feed::<MirBuiltFeeder>(tcx, id) {
+                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
                         fed
                     } else {
                         let built = mir_built.get()(tcx, id);
