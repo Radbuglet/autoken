@@ -88,11 +88,14 @@ pub(crate) use define_feedable;
 
 pub mod feeders {
     use rustc_data_structures::steal::Steal;
-    use rustc_middle::mir::Body;
+    use rustc_hir::{def_id::DefId, HirId};
+    use rustc_middle::{mir::Body, ty::Visibility};
 
     super::define_feedable! {
         MirBuiltFeeder => &'tcx Steal<Body<'tcx>>,
         MirBuiltStasher => &'tcx Body<'tcx>,
+        OptLocalDefIdToHirIdFeeder => Option<HirId>,
+        VisibilityFeeder => Visibility<DefId>,
     }
 }
 

@@ -6,16 +6,23 @@ use rustc_driver::{
     RunCompiler,
 };
 
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{
+    def_id::{DefId, LocalDefId},
+    HirId,
+};
 use rustc_interface::{interface::Compiler, Queries};
-use rustc_middle::{dep_graph::DepNodeIndex, mir::Body, ty::TyCtxt};
+use rustc_middle::{
+    dep_graph::DepNodeIndex,
+    mir::Body,
+    ty::{TyCtxt, Visibility},
+};
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::{
     analyzer::analyze,
     util::feeder::{
         feed,
-        feeders::{MirBuiltFeeder, MirBuiltStasher},
+        feeders::{MirBuiltFeeder, MirBuiltStasher, OptLocalDefIdToHirIdFeeder, VisibilityFeeder},
         once_val, read_feed,
     },
 };
@@ -61,6 +68,8 @@ impl Callbacks for AnalyzeMirCallbacks {
                 // Feeders
                 once_val! {
                     mir_built: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>> = query.mir_built;
+                    opt_local_def_id_to_hir_id: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Option<HirId> = query.opt_local_def_id_to_hir_id;
+                    visibility: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Visibility<DefId> = query.visibility;
                 }
 
                 query.mir_built = |tcx, id| {
@@ -77,6 +86,24 @@ impl Callbacks for AnalyzeMirCallbacks {
                             );
                         }
                         built
+                    }
+                };
+
+                query.opt_local_def_id_to_hir_id = |tcx, id| {
+                    if let Some(fed) = read_feed::<OptLocalDefIdToHirIdFeeder>(tcx, id) {
+                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+                        fed
+                    } else {
+                        (opt_local_def_id_to_hir_id.get())(tcx, id)
+                    }
+                };
+
+                query.visibility = |tcx, id| {
+                    if let Some(fed) = read_feed::<VisibilityFeeder>(tcx, id) {
+                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+                        fed
+                    } else {
+                        (visibility.get())(tcx, id)
                     }
                 };
             });

@@ -18,7 +18,9 @@ use crate::{
     util::{
         feeder::{
             feed,
-            feeders::{MirBuiltFeeder, MirBuiltStasher},
+            feeders::{
+                MirBuiltFeeder, MirBuiltStasher, OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
+            },
             read_feed,
         },
         graph::{GraphPropagator, GraphPropagatorCx},
@@ -245,8 +247,12 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         id_gen += 1;
 
         feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
-        shadow_def.opt_local_def_id_to_hir_id(Some(tcx.local_def_id_to_hir_id(orig_id)));
-        shadow_def.visibility(tcx.visibility(orig_id));
+        feed::<OptLocalDefIdToHirIdFeeder>(
+            tcx,
+            shadow_def.def_id(),
+            Some(tcx.local_def_id_to_hir_id(orig_id)),
+        );
+        feed::<VisibilityFeeder>(tcx, shadow_def.def_id(), tcx.visibility(orig_id));
 
         if shadow_kind == DefKind::AssocFn {
             shadow_def.associated_item(tcx.associated_item(orig_id));
