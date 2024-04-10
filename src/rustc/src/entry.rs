@@ -7,6 +7,7 @@ use rustc_driver::{
 };
 
 use rustc_hir::{
+    def::DefKind,
     def_id::{DefId, LocalDefId},
     HirId,
 };
@@ -14,7 +15,7 @@ use rustc_interface::{interface::Compiler, Queries};
 use rustc_middle::{
     dep_graph::DepNodeIndex,
     mir::Body,
-    ty::{TyCtxt, Visibility},
+    ty::{AssocItem, TyCtxt, Visibility},
 };
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
@@ -22,7 +23,10 @@ use crate::{
     analyzer::analyze,
     util::feeder::{
         feed,
-        feeders::{MirBuiltFeeder, MirBuiltStasher, OptLocalDefIdToHirIdFeeder, VisibilityFeeder},
+        feeders::{
+            AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
+            OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
+        },
         once_val, read_feed,
     },
 };
@@ -70,11 +74,17 @@ impl Callbacks for AnalyzeMirCallbacks {
                     mir_built: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<Body<'tcx>> = query.mir_built;
                     opt_local_def_id_to_hir_id: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Option<HirId> = query.opt_local_def_id_to_hir_id;
                     visibility: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> Visibility<DefId> = query.visibility;
+                    associated_item: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> AssocItem = query.associated_item;
+                    def_kind: for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> DefKind = query.def_kind;
                 }
 
                 query.mir_built = |tcx, id| {
+                    // N.B. we have to force all reads of this query to be forever-red since,
+                    // otherwise, the user may mistake a previously unfed DefId for a fed DefId and
+                    // never update its contents.
+                    tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+
                     if let Some(fed) = read_feed::<MirBuiltFeeder>(tcx, id) {
-                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
                         fed
                     } else {
                         let built = mir_built.get()(tcx, id);
@@ -90,8 +100,10 @@ impl Callbacks for AnalyzeMirCallbacks {
                 };
 
                 query.opt_local_def_id_to_hir_id = |tcx, id| {
+                    // N.B. ibid
+                    tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+
                     if let Some(fed) = read_feed::<OptLocalDefIdToHirIdFeeder>(tcx, id) {
-                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
                         fed
                     } else {
                         (opt_local_def_id_to_hir_id.get())(tcx, id)
@@ -99,11 +111,35 @@ impl Callbacks for AnalyzeMirCallbacks {
                 };
 
                 query.visibility = |tcx, id| {
+                    // N.B. ibid
+                    tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+
                     if let Some(fed) = read_feed::<VisibilityFeeder>(tcx, id) {
-                        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
                         fed
                     } else {
                         (visibility.get())(tcx, id)
+                    }
+                };
+
+                query.associated_item = |tcx, id| {
+                    // N.B. ibid
+                    tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+
+                    if let Some(fed) = read_feed::<AssociatedItemFeeder>(tcx, id) {
+                        fed
+                    } else {
+                        (associated_item.get())(tcx, id)
+                    }
+                };
+
+                query.def_kind = |tcx, id| {
+                    // N.B. ibid
+                    tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+
+                    if let Some(fed) = read_feed::<DefKindFeeder>(tcx, id) {
+                        fed
+                    } else {
+                        (def_kind.get())(tcx, id)
                     }
                 };
             });

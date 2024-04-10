@@ -19,7 +19,8 @@ use crate::{
         feeder::{
             feed,
             feeders::{
-                MirBuiltFeeder, MirBuiltStasher, OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
+                AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
+                OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
             },
             read_feed,
         },
@@ -235,27 +236,30 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         // Feed the query system the shadow function's properties.
         let shadow_kind = tcx.def_kind(orig_id);
-        let shadow_def = tcx.at(body.span).create_def(
-            tcx.local_parent(orig_id),
-            Symbol::intern(&format!(
-                "{}_autoken_shadow_{id_gen}",
-                tcx.opt_item_name(orig_id.to_def_id())
-                    .unwrap_or_else(|| unnamed.get()),
-            )),
-            shadow_kind,
-        );
+        let shadow_def = tcx
+            .create_def(
+                tcx.local_parent(orig_id),
+                Symbol::intern(&format!(
+                    "{}_autoken_shadow_{id_gen}",
+                    tcx.opt_item_name(orig_id.to_def_id())
+                        .unwrap_or_else(|| unnamed.get()),
+                )),
+                shadow_kind,
+            )
+            .def_id();
         id_gen += 1;
 
-        feed::<MirBuiltFeeder>(tcx, shadow_def.def_id(), tcx.alloc_steal_mir(body));
+        feed::<DefKindFeeder>(tcx, shadow_def, shadow_kind);
+        feed::<MirBuiltFeeder>(tcx, shadow_def, tcx.alloc_steal_mir(body));
         feed::<OptLocalDefIdToHirIdFeeder>(
             tcx,
-            shadow_def.def_id(),
+            shadow_def,
             Some(tcx.local_def_id_to_hir_id(orig_id)),
         );
-        feed::<VisibilityFeeder>(tcx, shadow_def.def_id(), tcx.visibility(orig_id));
+        feed::<VisibilityFeeder>(tcx, shadow_def, tcx.visibility(orig_id));
 
         if shadow_kind == DefKind::AssocFn {
-            shadow_def.associated_item(tcx.associated_item(orig_id));
+            feed::<AssociatedItemFeeder>(tcx, shadow_def, tcx.associated_item(orig_id));
         }
 
         // ...and queue it up for borrow checking!
@@ -264,8 +268,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Finally, borrow check everything in a single go to avoid issues with stolen values.
     for shadow in shadows {
-        // dbg!(shadow.def_id(), tcx.mir_built(shadow.def_id()));
-        let _ = tcx.mir_borrowck(shadow.def_id());
+        let _ = tcx.mir_borrowck(shadow);
     }
 }
 
@@ -286,8 +289,8 @@ fn ensure_no_borrow<'tcx>(
                 "cannot {action} because it borrows {}",
                 facts
                     .borrows
-                    .keys()
-                    .map(|k| k.to_string())
+                    .iter()
+                    .map(|(k, (m, _))| format!("{k} {}", m.mutably_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -312,8 +315,6 @@ fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     )
 }
 
-// FIXME: Ensure that facts collected after a self-recursive function was analyzed are also
-//  propagated to it.
 fn analyze_fn_facts<'tcx>(
     cx: &mut GraphPropagatorCx<'_, '_, FnFactAnalysisCx<'tcx>, Instance<'tcx>, FuncFacts<'tcx>>,
     instance: Instance<'tcx>,
