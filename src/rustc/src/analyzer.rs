@@ -209,7 +209,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
                 if let Some(tied) = tied {
                     // Compute the type as which the function result is going to be bound.
-                    let mapped_region = find_region_with_name(
+                    let Ok(mapped_region) = find_region_with_name(
                         tcx,
                         // N.B. we need to use the monomorphized ID since the non-monomorphized
                         //  ID could just be the parent trait function def, which won't have the
@@ -219,8 +219,10 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                             .skip_binder()
                             .output(),
                         tied,
-                    )
-                    .unwrap();
+                    ) else {
+                        // TODO: Log here just in case.
+                        continue;
+                    };
 
                     body_mutator.tie_token_to_its_return(
                         bb,

@@ -37,13 +37,17 @@ pub trait CapTarget<T> {
 
 #[macro_export]
 macro_rules! cap {
-    ( $($ty:ty: $expr:expr),*$(,)? => $($body:tt)* ) => {
-        let f = || { $($body)* };
+    ( $($ty:ty: $expr:expr),*$(,)? => $($body:tt)* ) => {{
+        #[allow(unused_mut)]
+        let mut f = || { $($body)* };
 
-        $(let f = || <$ty as $crate::CapTarget<_>>::provide($expr, f);)*
+        $(
+            #[allow(unused_mut)]
+            let mut f = || <$ty as $crate::CapTarget<_>>::provide($expr, f);
+        )*
 
-        f();
-    };
+        f()
+    }};
     ($(
         $(#[$attr:meta])*
         $vis:vis $name:ident$(<$($lt:lifetime),* $(,)?>)? = $ty:ty;

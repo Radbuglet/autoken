@@ -18,7 +18,7 @@ use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
 
 use crate::util::{
-    mir::find_region_with_name,
+    mir::{err_failed_to_find_region, find_region_with_name},
     ty::{get_fn_sig_maybe_closure, instantiate_ignoring_regions},
 };
 
@@ -249,15 +249,20 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 );
 
                 for &tie in ties {
-                    let found_region = find_region_with_name(
+                    let found_region = match find_region_with_name(
                         self.tcx,
                         get_fn_sig_maybe_closure(self.tcx, self.body.source.def_id())
                             .skip_binder()
                             .skip_binder()
                             .output(),
                         tie,
-                    )
-                    .unwrap();
+                    ) {
+                        Ok(re) => re,
+                        Err(re) => {
+                            err_failed_to_find_region(self.tcx, self.body.span, tie, &re);
+                            continue;
+                        }
+                    };
 
                     // annotation => &'<found_region> mut ()
                     let annotation =

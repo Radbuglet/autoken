@@ -13,7 +13,7 @@ use rustc_middle::{
         TypeAndMut, TypeFoldable, VtblEntry,
     },
 };
-use rustc_span::Symbol;
+use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
 
 // === Misc === //
@@ -62,6 +62,27 @@ pub fn find_region_with_name<'tcx>(
         }));
         found
     })
+}
+
+pub fn err_failed_to_find_region(tcx: TyCtxt<'_>, span: Span, name: Symbol, symbols: &[Symbol]) {
+    tcx.dcx().span_err(
+        span,
+        format!(
+            "lifetime with name {name} not found in output of function{}",
+            if symbols.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; found {}",
+                    symbols
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        ),
+    );
 }
 
 // === `get_callee_from_terminator` === //
