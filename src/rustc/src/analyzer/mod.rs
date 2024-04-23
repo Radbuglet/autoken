@@ -151,7 +151,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         for (key, (_, tied)) in &facts.borrows {
             if let Some(tied) = tied {
-                body_mutator.tie_token_to_my_return(TokenKey::Ty(*key), *tied);
+                body_mutator.tie_token_to_my_return(TokenKey(*key), *tied);
             }
         }
 
@@ -192,7 +192,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             }
 
             for (ty, mutability, tied) in ensure_not_borrowed.iter().copied() {
-                body_mutator.ensure_not_borrowed_at(bb, TokenKey::Ty(ty), mutability);
+                body_mutator.ensure_not_borrowed_at(bb, TokenKey(ty), mutability);
 
                 if let Some(tied) = tied {
                     // Compute the type as which the function result is going to be bound.
@@ -211,12 +211,9 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                         continue;
                     };
 
-                    body_mutator.tie_token_to_its_return(
-                        bb,
-                        TokenKey::Ty(ty),
-                        mutability,
-                        |region| region == mapped_region,
-                    );
+                    body_mutator.tie_token_to_its_return(bb, TokenKey(ty), mutability, |region| {
+                        region == mapped_region
+                    });
                 }
             }
         }
