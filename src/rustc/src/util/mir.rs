@@ -2,19 +2,22 @@ use std::sync::OnceLock;
 
 use rustc_data_structures::steal::Steal;
 use rustc_hash::FxHashMap;
-use rustc_hir::{def_id::LocalDefId, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind};
-use rustc_index::IndexVec;
+use rustc_hir::{
+    def::DefKind,
+    def_id::{DefId, DefIndex, LocalDefId},
+    ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
+};
 use rustc_middle::{
-    mir::{Body, CastKind, Local, LocalDecl, Operand, Rvalue, StatementKind},
+    mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
     ty::{
-        adjustment::PointerCoercion,
-        fold::{FnMutDelegate, RegionFolder},
-        EarlyBinder, GenericArg, Instance, InstanceDef, ParamEnv, Region, Ty, TyCtxt, TyKind,
-        TypeAndMut, TypeFoldable, VtblEntry,
+        adjustment::PointerCoercion, fold::FnMutDelegate, EarlyBinder, GenericArg, Instance,
+        ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut, VtblEntry,
     },
 };
 use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
+
+use super::ty::ConcretizedFunc;
 
 // === Misc === //
 
@@ -36,85 +39,23 @@ impl CachedSymbol {
     }
 }
 
-// === `find_region_with_name` === //
+// === `iter_all_local_def_ids` === //
 
-pub fn find_region_with_name<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    name: Symbol,
-) -> Result<Region<'tcx>, Vec<Symbol>> {
-    let mut found_region = None;
+// N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
+pub fn iter_all_local_def_ids(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDefId> {
+    let idx_count = tcx.untracked().definitions.read().def_index_count();
 
-    let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
-        if found_region.is_none() && region.get_name() == Some(name) {
-            found_region = Some(region);
-        }
-        region
-    }));
-
-    found_region.ok_or_else(|| {
-        let mut found = Vec::new();
-        let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
-            if let Some(name) = region.get_name() {
-                found.push(name);
-            }
-            region
-        }));
-        found
+    (0..idx_count).map(|i| LocalDefId {
+        local_def_index: DefIndex::from_usize(i),
     })
-}
-
-pub fn err_failed_to_find_region(tcx: TyCtxt<'_>, span: Span, name: Symbol, symbols: &[Symbol]) {
-    tcx.dcx().span_err(
-        span,
-        format!(
-            "lifetime with name {name} not found in output of function{}",
-            if symbols.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; found {}",
-                    symbols
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        ),
-    );
-}
-
-// === `get_callee_from_terminator` === //
-
-pub fn get_static_callee_from_terminator<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: &Instance<'tcx>,
-    caller_local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-    callee: &Operand<'tcx>,
-) -> Option<Instance<'tcx>> {
-    let callee = callee.ty(caller_local_decls, tcx);
-    let callee = caller.instantiate_mir_and_normalize_erasing_regions(
-        tcx,
-        ParamEnv::reveal_all(),
-        EarlyBinder::bind(callee),
-    );
-
-    let TyKind::FnDef(callee_id, generics) = callee.kind() else {
-        return None;
-    };
-
-    Some(Instance::expect_resolve(
-        tcx,
-        ParamEnv::reveal_all(),
-        *callee_id,
-        generics,
-    ))
 }
 
 // === `safeishly_grab_def_id_mir` === //
 
-pub fn safeishly_grab_def_id_mir(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
+pub fn safeishly_grab_local_def_id_mir(
+    tcx: TyCtxt<'_>,
+    id: LocalDefId,
+) -> Option<&Steal<Body<'_>>> {
     // Copied from `rustc_hir_typecheck::primary_body_of`
     match tcx.hir_node_by_def_id(id) {
         Node::Item(item) => match item.kind {
@@ -153,61 +94,76 @@ pub fn safeishly_grab_def_id_mir(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Ste
     Some(tcx.mir_built(id))
 }
 
-// === `safeishly_grab_instance_mir` === //
+// === `has_instance_mir` === //
 
-#[derive(Debug)]
-pub enum MirGrabResult<'tcx> {
-    Found(&'tcx Body<'tcx>),
-    Dynamic,
-    BottomsOut,
+pub fn has_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    let is_func_kind = matches!(
+        tcx.def_kind(did),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    );
+
+    is_func_kind && !tcx.is_foreign_item(did) && tcx.is_mir_available(did)
 }
 
-pub fn safeishly_grab_instance_mir<'tcx>(
+// === `get_static_callee_from_terminator` === //
+
+#[derive(Debug, Copy, Clone)]
+pub enum TerminalCallKind<'tcx> {
+    Static(Span, ConcretizedFunc<'tcx>),
+    Generic(Span, ConcretizedFunc<'tcx>),
+    Dynamic,
+}
+
+pub fn get_static_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: InstanceDef<'tcx>,
-) -> MirGrabResult<'tcx> {
-    match instance {
-        // Items are defined by users and thus have MIR... even if they're from an external crate.
-        InstanceDef::Item(item) => {
-            // However, foreign items and lang-items don't have MIR
-            if !tcx.is_foreign_item(item) {
-                MirGrabResult::Found(tcx.instance_mir(instance))
-            } else {
-                MirGrabResult::BottomsOut
+    terminator: &Option<Terminator<'tcx>>,
+    local_decls: &LocalDecls<'tcx>,
+) -> Option<TerminalCallKind<'tcx>> {
+    match &terminator.as_ref()?.kind {
+        TerminatorKind::Call {
+            func: dest_func,
+            fn_span,
+            ..
+        } => {
+            // Get the type of the function local we're calling.
+            let dest_func = dest_func.ty(local_decls, tcx);
+
+            // Attempt to fetch a `DefId` and arguments for the callee.
+            let (dest_did, dest_args) = match dest_func.kind() {
+                TyKind::FnPtr(_) => {
+                    return Some(TerminalCallKind::Dynamic);
+                }
+                TyKind::FnDef(did, args) => (*did, *args),
+                TyKind::Closure(did, args) => (*did, args.as_closure().args),
+                _ => unreachable!(),
+            };
+
+            let Ok(dest_args) =
+                tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
+            else {
+                // TODO: What does it mean when this fails?
+                return None;
+            };
+
+            let dest = ConcretizedFunc(dest_did, dest_args);
+
+            match dest.resolve_instance(tcx) {
+                Ok(Some(dest_instance)) => {
+                    Some(TerminalCallKind::Static(*fn_span, dest_instance.into()))
+                }
+
+                // `Ok(None)` when the `GenericArgsRef` are still too generic
+                Ok(None) => Some(TerminalCallKind::Generic(*fn_span, dest)),
+
+                // the `Instance` resolution process couldn't complete due to errors elsewhere
+                Err(_) => None,
             }
         }
-
-        // This is a shim around `FnDef` (or maybe an `FnPtr`?) for `FnTrait::call_x`. We generate
-        // the shim MIR for it and let the regular instance body processing handle it.
-        InstanceDef::FnPtrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
-
-        // All the remaining things here require shims. We referenced...
-        //
-        // https://github.com/rust-lang/rust/blob/9c20ddd956426d577d77cb3f57a7db2227a3c6e9/compiler/rustc_mir_transform/src/shim.rs#L29
-        //
-        // ...to figure out which instance def types support this operation.
-
-        // These are always supported.
-        InstanceDef::ThreadLocalShim(_)
-        | InstanceDef::DropGlue(_, _)
-        | InstanceDef::ClosureOnceShim { .. }
-        | InstanceDef::CloneShim(_, _)
-        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
-
-        // These are never supported and will never return to the user.
-        InstanceDef::Intrinsic(_) => MirGrabResult::BottomsOut,
-
-        // These are dynamic dispatches and should not be analyzed since we analyze them in a
-        // different way.
-        InstanceDef::VTableShim(_) | InstanceDef::ReifyShim(_) | InstanceDef::Virtual(_, _) => {
-            MirGrabResult::Dynamic
-        }
-
-        // TODO: Handle these properly.
-        InstanceDef::ConstructCoroutineInClosureShim { .. }
-        | InstanceDef::CoroutineKindShim { .. } => MirGrabResult::Dynamic,
+        _ => None,
     }
 }
+
+// === Unsizing Analysis === //
 
 // Referenced from https://github.com/rust-lang/rust/blob/4b85902b438f791c5bfcb6b1c5b476d5b88e2bef/compiler/rustc_codegen_cranelift/src/unsize.rs#L62
 pub fn get_unsized_ty<'tcx>(

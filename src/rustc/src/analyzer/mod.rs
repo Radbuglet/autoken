@@ -1,10 +1,6 @@
 use std::collections::hash_map;
 
-use rustc_hir::{
-    def::DefKind,
-    def_id::{DefId, DefIndex, LocalDefId},
-    LangItem,
-};
+use rustc_hir::{def::DefKind, LangItem};
 
 use rustc_middle::{
     mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
@@ -12,42 +8,37 @@ use rustc_middle::{
 };
 use rustc_span::Symbol;
 
-use crate::{
-    analyzer::sym::unnamed,
-    mir::{TokenKey, TokenMirBuilder},
-    util::{
-        feeder::{
-            feed,
-            feeders::{
-                AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
-                OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
-            },
-            read_feed,
+use crate::util::{
+    feeder::{
+        feed,
+        feeders::{
+            AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
+            OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
         },
-        graph::{GraphPropagator, GraphPropagatorCx},
-        hash::FxHashMap,
-        mir::{
-            find_region_with_name, for_each_unsized_func, get_static_callee_from_terminator,
-            safeishly_grab_def_id_mir, safeishly_grab_instance_mir, MirGrabResult,
-        },
-        ty::{get_fn_sig_maybe_closure, is_annotated_ty},
+        read_feed,
     },
+    graph::{GraphPropagator, GraphPropagatorCx},
+    hash::FxHashMap,
+    mir::{for_each_unsized_func, iter_all_local_def_ids, safeishly_grab_local_def_id_mir},
+    mir_legacy::{get_static_callee_from_terminator, safeishly_grab_instance_mir, MirGrabResult},
+    ty::{find_region_with_name, get_fn_sig_maybe_closure},
 };
 
-pub fn analyze(tcx: TyCtxt<'_>) {
-    let id_count = tcx.untracked().definitions.read().def_index_count();
+use self::{
+    mir::{TokenKey, TokenMirBuilder},
+    sets::{instantiate_set, instantiate_set_proc, is_tie_func},
+};
 
+mod mir;
+mod sets;
+mod sym;
+
+pub fn analyze(tcx: TyCtxt<'_>) {
     let mut id_gen = 0;
 
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
-    //
-    // N.B. we use this instead of `iter_local_def_id` to avoid freezing the definition map.
-    for i in 0..id_count {
-        let local_def = LocalDefId {
-            local_def_index: DefIndex::from_usize(i),
-        };
-
-        if safeishly_grab_def_id_mir(tcx, local_def).is_some() {
+    for local_def in iter_all_local_def_ids(tcx) {
+        if safeishly_grab_local_def_id_mir(tcx, local_def).is_some() {
             assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
         }
     }
@@ -62,11 +53,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     );
     assert!(!tcx.untracked().definitions.is_frozen());
 
-    for i in 0..id_count {
-        let local_def = LocalDefId {
-            local_def_index: DefIndex::from_usize(i),
-        };
-
+    for local_def in iter_all_local_def_ids(tcx) {
         // Ensure that we're analyzing a function...
         if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
             continue;
@@ -244,7 +231,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 Symbol::intern(&format!(
                     "{}_autoken_shadow_{id_gen}",
                     tcx.opt_item_name(orig_id.to_def_id())
-                        .unwrap_or_else(|| unnamed.get()),
+                        .unwrap_or_else(|| sym::unnamed.get()),
                 )),
                 shadow_kind,
             )
@@ -418,112 +405,4 @@ fn analyze_fn_facts<'tcx>(
     }
 
     FuncFacts { borrows }
-}
-
-fn is_tie_func(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    tcx.opt_item_name(def_id) == Some(sym::__autoken_declare_tied.get())
-}
-
-fn instantiate_set<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-) -> FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)> {
-    let mut set = FxHashMap::<Ty<'tcx>, (Mutability, Option<Symbol>)>::default();
-
-    instantiate_set_proc(tcx, ty, &mut |ty, mutability| match set.entry(ty) {
-        hash_map::Entry::Occupied(entry) => {
-            if mutability.is_mut() {
-                entry.into_mut().0 = Mutability::Mut;
-            }
-        }
-        hash_map::Entry::Vacant(entry) => {
-            entry.insert((mutability, None));
-        }
-    });
-
-    set
-}
-
-fn instantiate_set_proc<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    add: &mut impl FnMut(Ty<'tcx>, Mutability),
-) {
-    match ty.kind() {
-        // Union
-        TyKind::Tuple(fields) => {
-            for field in fields.iter() {
-                instantiate_set_proc(tcx, field, add);
-            }
-        }
-        TyKind::Adt(def, generics) if is_annotated_ty(def, sym::__autoken_ref_ty_marker.get()) => {
-            add(generics[0].as_type().unwrap(), Mutability::Not);
-        }
-        TyKind::Adt(def, generics) if is_annotated_ty(def, sym::__autoken_mut_ty_marker.get()) => {
-            add(generics[0].as_type().unwrap(), Mutability::Mut);
-        }
-        TyKind::Adt(def, generics)
-            if is_annotated_ty(def, sym::__autoken_downgrade_ty_marker.get()) =>
-        {
-            let mut set = instantiate_set(tcx, generics[0].as_type().unwrap());
-
-            for (mutability, _) in set.values_mut() {
-                *mutability = Mutability::Not;
-            }
-
-            for (ty, (mutability, _)) in set {
-                add(ty, mutability);
-            }
-        }
-        TyKind::Adt(def, generics) if is_annotated_ty(def, sym::__autoken_diff_ty_marker.get()) => {
-            let mut set = instantiate_set(tcx, generics[0].as_type().unwrap());
-
-            fn remover_func<'set, 'tcx>(
-                set: &'set mut FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
-            ) -> impl FnMut(Ty<'tcx>, Mutability) + 'set {
-                |ty, mutability| match set.entry(ty) {
-                    hash_map::Entry::Occupied(entry) => {
-                        if mutability.is_mut() {
-                            entry.remove();
-                        } else {
-                            entry.into_mut().0 = Mutability::Not;
-                        }
-                    }
-                    hash_map::Entry::Vacant(_) => {}
-                }
-            }
-
-            instantiate_set_proc(
-                tcx,
-                generics[1].as_type().unwrap(),
-                &mut remover_func(&mut set),
-            );
-
-            for (ty, (mutability, _)) in set {
-                add(ty, mutability);
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
-#[allow(non_upper_case_globals)]
-mod sym {
-    use crate::util::mir::CachedSymbol;
-
-    pub static __autoken_declare_tied: CachedSymbol = CachedSymbol::new("__autoken_declare_tied");
-
-    pub static __autoken_absorb_only: CachedSymbol = CachedSymbol::new("__autoken_absorb_only");
-
-    pub static __autoken_mut_ty_marker: CachedSymbol = CachedSymbol::new("__autoken_mut_ty_marker");
-
-    pub static __autoken_ref_ty_marker: CachedSymbol = CachedSymbol::new("__autoken_ref_ty_marker");
-
-    pub static __autoken_downgrade_ty_marker: CachedSymbol =
-        CachedSymbol::new("__autoken_downgrade_ty_marker");
-
-    pub static __autoken_diff_ty_marker: CachedSymbol =
-        CachedSymbol::new("__autoken_diff_ty_marker");
-
-    pub static unnamed: CachedSymbol = CachedSymbol::new("unnamed");
 }

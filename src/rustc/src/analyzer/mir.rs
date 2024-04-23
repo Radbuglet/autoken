@@ -17,9 +17,9 @@ use rustc_middle::{
 use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
 
-use crate::util::{
-    mir::{err_failed_to_find_region, find_region_with_name},
-    ty::{get_fn_sig_maybe_closure, instantiate_ignoring_regions},
+use crate::util::ty::{
+    err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
+    instantiate_ignoring_regions,
 };
 
 type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
