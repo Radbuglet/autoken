@@ -10,14 +10,14 @@ use rustc_hir::{
 use rustc_middle::{
     mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
     ty::{
-        adjustment::PointerCoercion, fold::FnMutDelegate, EarlyBinder, GenericArg, Instance,
-        ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut, VtblEntry,
+        adjustment::PointerCoercion, fold::FnMutDelegate, GenericArg, ParamEnv, Ty, TyCtxt, TyKind,
+        TypeAndMut, VtblEntry,
     },
 };
 use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
 
-use super::ty::ConcretizedFunc;
+use super::ty::{ConcretizedFunc, GenericTransformer, MaybeConcretizedFunc};
 
 // === Misc === //
 
@@ -50,12 +50,9 @@ pub fn iter_all_local_def_ids(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDefI
     })
 }
 
-// === `safeishly_grab_def_id_mir` === //
+// === `try_grab_body_of_def_id` === //
 
-pub fn safeishly_grab_local_def_id_mir(
-    tcx: TyCtxt<'_>,
-    id: LocalDefId,
-) -> Option<&Steal<Body<'_>>> {
+pub fn try_grab_mir_body_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
     // Copied from `rustc_hir_typecheck::primary_body_of`
     match tcx.hir_node_by_def_id(id) {
         Node::Item(item) => match item.kind {
@@ -94,9 +91,9 @@ pub fn safeishly_grab_local_def_id_mir(
     Some(tcx.mir_built(id))
 }
 
-// === `has_instance_mir` === //
+// === `has_optimized_mir` === //
 
-pub fn has_instance_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
+pub fn has_optimized_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
     let is_func_kind = matches!(
         tcx.def_kind(did),
         DefKind::Fn | DefKind::AssocFn | DefKind::Closure
@@ -114,8 +111,9 @@ pub enum TerminalCallKind<'tcx> {
     Dynamic,
 }
 
-pub fn get_static_callee_from_terminator<'tcx>(
+pub fn get_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
+    instance: MaybeConcretizedFunc<'tcx>,
     terminator: &Option<Terminator<'tcx>>,
     local_decls: &LocalDecls<'tcx>,
 ) -> Option<TerminalCallKind<'tcx>> {
@@ -145,12 +143,10 @@ pub fn get_static_callee_from_terminator<'tcx>(
                 return None;
             };
 
-            let dest = ConcretizedFunc(dest_did, dest_args);
+            let dest = instance.instantiate_func(tcx, ConcretizedFunc(dest_did, dest_args));
 
-            match dest.resolve_instance(tcx) {
-                Ok(Some(dest_instance)) => {
-                    Some(TerminalCallKind::Static(*fn_span, dest_instance.into()))
-                }
+            match dest.resolve(tcx) {
+                Ok(Some(dest)) => Some(TerminalCallKind::Static(*fn_span, dest)),
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
                 Ok(None) => Some(TerminalCallKind::Generic(*fn_span, dest)),
@@ -205,11 +201,11 @@ pub fn get_unsized_ty<'tcx>(
     }
 }
 
-pub fn for_each_unsized_func<'tcx>(
+pub fn for_each_concrete_unsized_func<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
+    instance: MaybeConcretizedFunc<'tcx>,
     body: &Body<'tcx>,
-    mut f: impl FnMut(Instance<'tcx>),
+    mut f: impl FnMut(ConcretizedFunc<'tcx>),
 ) {
     for bb in body.basic_blocks.iter() {
         for stmt in bb.statements.iter() {
@@ -222,17 +218,8 @@ pub fn for_each_unsized_func<'tcx>(
                 continue;
             };
 
-            let from_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                tcx,
-                ParamEnv::reveal_all(),
-                EarlyBinder::bind(from_op.ty(&body.local_decls, tcx)),
-            );
-
-            let to_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                tcx,
-                ParamEnv::reveal_all(),
-                EarlyBinder::bind(*to_ty),
-            );
+            let from_ty = instance.instantiate_arg(tcx, from_op.ty(&body.local_decls, tcx));
+            let to_ty = instance.instantiate_arg(tcx, *to_ty);
 
             match kind {
                 PointerCoercion::ReifyFnPointer => {
@@ -240,24 +227,18 @@ pub fn for_each_unsized_func<'tcx>(
                         unreachable!()
                     };
 
-                    f(Instance::expect_resolve(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        *def,
-                        generics,
-                    ));
+                    if let Ok(Some(func)) = ConcretizedFunc(*def, generics).resolve(tcx) {
+                        f(func);
+                    }
                 }
                 PointerCoercion::ClosureFnPointer(_) => {
                     let TyKind::Closure(def, generics) = from_ty.kind() else {
                         unreachable!()
                     };
 
-                    f(Instance::expect_resolve(
-                        tcx,
-                        ParamEnv::reveal_all(),
-                        *def,
-                        generics,
-                    ));
+                    if let Ok(Some(func)) = ConcretizedFunc(*def, generics).resolve(tcx) {
+                        f(func);
+                    }
                 }
                 PointerCoercion::Unsize => {
                     // Finds the type the coercion actually changed.
@@ -303,9 +284,7 @@ pub fn for_each_unsized_func<'tcx>(
                         let method_trait = tcx.trait_of_item(vtbl_method.def_id()).unwrap();
                         let method_trait = &super_trait_def_id_to_trait_ref[&method_trait];
 
-                        f(Instance::expect_resolve(
-                            tcx,
-                            ParamEnv::reveal_all(),
+                        if let Ok(Some(func)) = ConcretizedFunc(
                             vtbl_method.def_id(),
                             tcx.mk_args(
                                 [GenericArg::from(from_ty)]
@@ -314,7 +293,11 @@ pub fn for_each_unsized_func<'tcx>(
                                     .collect::<Vec<_>>()
                                     .as_slice(),
                             ),
-                        ));
+                        )
+                        .resolve(tcx)
+                        {
+                            f(func);
+                        }
                     }
                 }
                 _ => {}

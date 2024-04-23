@@ -12,6 +12,10 @@ pub fn is_tie_func(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.opt_item_name(def_id) == Some(sym::__autoken_declare_tied.get())
 }
 
+pub fn is_absorb_func(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.opt_item_name(def_id) == Some(sym::__autoken_absorb_only.get())
+}
+
 pub fn instantiate_set<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,

@@ -3,15 +3,16 @@ use rustc_middle::{
     bug,
     ty::{
         self, fold::RegionFolder, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind,
-        Instance, List, Mutability, ParamConst, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable,
-        TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+        GenericArgs, GenericArgsRef, GenericParamDefKind, Instance, List, Mutability, ParamConst,
+        ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
+        TypeVisitableExt,
     },
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 
 // === Type Matching === //
 
-pub fn is_generic_ty(ty: Ty<'_>) -> bool {
+pub fn is_generic_ty_param(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), TyKind::Param(_) | TyKind::Alias(_, _))
 }
 
@@ -56,6 +57,36 @@ pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<B
         }
         _ => tcx.fn_sig(def_id),
     }
+}
+
+pub fn try_resolve_mono_args_for_func(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+) -> Option<GenericArgsRef<'_>> {
+    let mut args_wf = true;
+    let args =
+        // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
+        // over the generic arguments of the parent.
+        GenericArgs::for_item(tcx, def_id, |param, _| match param.kind {
+            // We can handle these
+            GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+            GenericParamDefKind::Const {
+                is_host_effect: true,
+                ..
+            } => tcx.consts.true_.into(),
+
+            // We can't handle these; return a dummy value and set the `args_wf` flag.
+            GenericParamDefKind::Type { .. } => {
+                args_wf = false;
+                tcx.types.unit.into()
+            }
+            GenericParamDefKind::Const { .. } => {
+                args_wf = false;
+                tcx.consts.true_.into()
+            }
+        });
+
+    args_wf.then_some(args)
 }
 
 // === `find_region_with_name` === //
@@ -185,6 +216,13 @@ impl<'tcx> ConcretizedFunc<'tcx> {
         tcx.resolve_instance(
             tcx.erase_regions(ParamEnv::reveal_all().and((self.def_id(), self.args()))),
         )
+    }
+
+    pub fn resolve(
+        self,
+        tcx: TyCtxt<'tcx>,
+    ) -> Result<Option<ConcretizedFunc<'tcx>>, ErrorGuaranteed> {
+        self.resolve_instance(tcx).map(|v| v.map(|v| v.into()))
     }
 }
 

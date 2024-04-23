@@ -3,8 +3,8 @@ use std::collections::hash_map;
 use rustc_hir::{def::DefKind, LangItem};
 
 use rustc_middle::{
-    mir::{BasicBlock, Mutability, Terminator, TerminatorKind},
-    ty::{GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt, TyKind},
+    mir::{BasicBlock, Mutability},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
 
@@ -19,14 +19,19 @@ use crate::util::{
     },
     graph::{GraphPropagator, GraphPropagatorCx},
     hash::FxHashMap,
-    mir::{for_each_unsized_func, iter_all_local_def_ids, safeishly_grab_local_def_id_mir},
-    mir_legacy::{get_static_callee_from_terminator, safeishly_grab_instance_mir, MirGrabResult},
-    ty::{find_region_with_name, get_fn_sig_maybe_closure},
+    mir::{
+        for_each_concrete_unsized_func, get_callee_from_terminator, has_optimized_mir,
+        iter_all_local_def_ids, try_grab_mir_body_of_def_id, TerminalCallKind,
+    },
+    ty::{
+        find_region_with_name, get_fn_sig_maybe_closure, try_resolve_mono_args_for_func,
+        MaybeConcretizedFunc,
+    },
 };
 
 use self::{
     mir::{TokenKey, TokenMirBuilder},
-    sets::{instantiate_set, instantiate_set_proc, is_tie_func},
+    sets::{instantiate_set, instantiate_set_proc, is_absorb_func, is_tie_func},
 };
 
 mod mir;
@@ -38,7 +43,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
     for local_def in iter_all_local_def_ids(tcx) {
-        if safeishly_grab_local_def_id_mir(tcx, local_def).is_some() {
+        if try_grab_mir_body_of_def_id(tcx, local_def).is_some() {
             assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
         }
     }
@@ -53,46 +58,14 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     );
     assert!(!tcx.untracked().definitions.is_frozen());
 
-    for local_def in iter_all_local_def_ids(tcx) {
-        // Ensure that we're analyzing a function...
-        if !matches!(tcx.def_kind(local_def), DefKind::Fn | DefKind::AssocFn) {
-            continue;
+    for did in iter_all_local_def_ids(tcx) {
+        let func = MaybeConcretizedFunc(did.to_def_id(), None);
+
+        if try_resolve_mono_args_for_func(tcx, did.to_def_id()).is_some()
+            && should_analyze(tcx, func)
+        {
+            func_facts.context_mut().analysis_queue.push(func);
         }
-
-        // ...which can be properly monomorphized.
-        let mut args_wf = true;
-        let args =
-            // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
-            // over the generic arguments of the parent.
-            GenericArgs::for_item(tcx, local_def.to_def_id(), |param, _| match param.kind {
-                // We can handle these
-                GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
-                GenericParamDefKind::Const {
-                    is_host_effect: true,
-                    ..
-                } => tcx.consts.true_.into(),
-
-                // We can't handle these; return a dummy value and set the `args_wf` flag.
-                GenericParamDefKind::Type { .. } => {
-                    args_wf = false;
-                    tcx.types.unit.into()
-                }
-                GenericParamDefKind::Const { .. } => {
-                    args_wf = false;
-                    tcx.consts.true_.into()
-                }
-            });
-
-        if !args_wf {
-            continue;
-        }
-
-        let instance = Instance::new(local_def.to_def_id(), args);
-        if !should_analyze(tcx, instance) {
-            continue;
-        }
-
-        func_facts.context_mut().analysis_queue.push(instance);
     }
 
     while let Some(instance) = func_facts.context_mut().analysis_queue.pop() {
@@ -103,9 +76,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Check for undeclared unsizing.
     for instance in func_facts.keys().copied() {
-        let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-            continue;
-        };
+        let body = tcx.optimized_mir(instance.def_id());
 
         if tcx.entry_fn(()).map(|(did, _)| did) == Some(instance.def_id()) {
             ensure_no_borrow(tcx, &func_facts, instance, "use this main function");
@@ -126,8 +97,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             );
         }
 
-        for_each_unsized_func(tcx, instance, body, |instance| {
-            ensure_no_borrow(tcx, &func_facts, instance, "unsize this function")
+        for_each_concrete_unsized_func(tcx, instance, body, |instance| {
+            ensure_no_borrow(tcx, &func_facts, instance.into(), "unsize this function")
         });
     }
 
@@ -160,22 +131,17 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             let bb = BasicBlock::from_usize(bb);
 
             // If it has a concrete callee...
-            let Some(Terminator {
-                kind: TerminatorKind::Call { func: callee, .. },
-                ..
-            }) = &body_mutator.body().basic_blocks[bb].terminator
+            let Some(TerminalCallKind::Static(_, target_instance_mono)) =
+                get_callee_from_terminator(
+                    tcx,
+                    *instance,
+                    &body_mutator.body().basic_blocks[bb].terminator,
+                    &body_mutator.body().local_decls,
+                )
             else {
                 continue;
             };
-
-            let Some(target_instance_mono) = get_static_callee_from_terminator(
-                tcx,
-                instance,
-                &body_mutator.body().local_decls,
-                callee,
-            ) else {
-                continue;
-            };
+            let target_instance_mono = MaybeConcretizedFunc::from(target_instance_mono);
 
             // Determine what it borrows
             let Some(callee_borrows) = &func_facts.get(&target_instance_mono) else {
@@ -260,8 +226,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
 fn ensure_no_borrow<'tcx>(
     tcx: TyCtxt<'tcx>,
-    func_facts: &FxHashMap<Instance<'tcx>, FuncFacts<'tcx>>,
-    instance: Instance<'tcx>,
+    func_facts: &FxHashMap<MaybeConcretizedFunc<'tcx>, FuncFacts<'tcx>>,
+    instance: MaybeConcretizedFunc<'tcx>,
     action: &str,
 ) {
     let Some(facts) = func_facts.get(&instance) else {
@@ -291,37 +257,46 @@ struct FuncFacts<'tcx> {
 
 struct FnFactAnalysisCx<'tcx> {
     tcx: TyCtxt<'tcx>,
-    analysis_queue: Vec<Instance<'tcx>>,
+    analysis_queue: Vec<MaybeConcretizedFunc<'tcx>>,
 }
 
-fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    matches!(
-        safeishly_grab_instance_mir(tcx, instance.def),
-        MirGrabResult::Found(_)
-    )
+fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: MaybeConcretizedFunc<'tcx>) -> bool {
+    if is_tie_func(tcx, instance.def_id()) || is_absorb_func(tcx, instance.def_id()) {
+        instance.args().is_some()
+    } else {
+        has_optimized_mir(tcx, instance.def_id())
+    }
 }
 
 fn analyze_fn_facts<'tcx>(
-    cx: &mut GraphPropagatorCx<'_, '_, FnFactAnalysisCx<'tcx>, Instance<'tcx>, FuncFacts<'tcx>>,
-    instance: Instance<'tcx>,
+    cx: &mut GraphPropagatorCx<
+        '_,
+        '_,
+        FnFactAnalysisCx<'tcx>,
+        MaybeConcretizedFunc<'tcx>,
+        FuncFacts<'tcx>,
+    >,
+    instance: MaybeConcretizedFunc<'tcx>,
 ) -> FuncFacts<'tcx> {
     let tcx = cx.context_mut().tcx;
+
+    assert!(should_analyze(tcx, instance));
 
     // If this function has a hardcoded fact set, use those.
     if is_tie_func(tcx, instance.def_id()) {
         return FuncFacts {
-            borrows: instantiate_set(tcx, instance.args[1].as_type().unwrap()),
+            borrows: instantiate_set(tcx, instance.args().unwrap()[1].as_type().unwrap()),
         };
     };
 
     // Acquire the function body.
-    let MirGrabResult::Found(body) = safeishly_grab_instance_mir(tcx, instance.def) else {
-        unreachable!();
-    };
+    let body = tcx.optimized_mir(instance.def_id());
 
     // Ensure that we analyze the facts of each unsized function since unsize-checking depends
     // on this information being available.
-    for_each_unsized_func(tcx, instance, body, |instance| {
+    for_each_concrete_unsized_func(tcx, instance, body, |instance| {
+        let instance = instance.into();
+
         if should_analyze(tcx, instance) {
             cx.context_mut().analysis_queue.push(instance);
         }
@@ -332,19 +307,12 @@ fn analyze_fn_facts<'tcx>(
 
     for bb in body.basic_blocks.iter() {
         // If the terminator is a call terminator.
-        let Some(Terminator {
-            kind: TerminatorKind::Call { func: callee, .. },
-            ..
-        }) = &bb.terminator
+        let Some(TerminalCallKind::Static(_, target_instance)) =
+            get_callee_from_terminator(tcx, instance, &bb.terminator, &body.local_decls)
         else {
             continue;
         };
-
-        let Some(target_instance) =
-            get_static_callee_from_terminator(tcx, &instance, &body.local_decls, callee)
-        else {
-            continue;
-        };
+        let target_instance = target_instance.into();
 
         // Recurse into its callee.
         if !should_analyze(tcx, target_instance) {
@@ -356,7 +324,7 @@ fn analyze_fn_facts<'tcx>(
         };
 
         let lt_id = is_tie_func(tcx, target_instance.def_id()).then(|| {
-            let param = target_instance.args[0].as_type().unwrap();
+            let param = target_instance.args().unwrap()[0].as_type().unwrap();
             if param.is_unit() {
                 return None;
             }
@@ -386,10 +354,10 @@ fn analyze_fn_facts<'tcx>(
     }
 
     // Now, apply the absorption rules.
-    if tcx.opt_item_name(instance.def_id()) == Some(sym::__autoken_absorb_only.get()) {
+    if is_absorb_func(tcx, instance.def_id()) {
         instantiate_set_proc(
             tcx,
-            instance.args[0].as_type().unwrap(),
+            instance.args().unwrap()[0].as_type().unwrap(),
             &mut |ty, mutability| match borrows.entry(ty) {
                 hash_map::Entry::Occupied(entry) => {
                     if mutability.is_mut() || entry.get().0 == Mutability::Not {
