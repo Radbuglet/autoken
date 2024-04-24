@@ -182,6 +182,7 @@ pub fn get_callee_from_terminator<'tcx>(
         } => {
             // Get the type of the function local we're calling.
             let dest_func = dest_func.ty(local_decls, tcx);
+            let dest_func = instance.instantiate_arg(tcx, dest_func);
 
             // Attempt to fetch a `DefId` and arguments for the callee.
             let (dest_did, dest_args) = match dest_func.kind() {
@@ -200,7 +201,7 @@ pub fn get_callee_from_terminator<'tcx>(
                 return None;
             };
 
-            let dest = instance.instantiate_instance(tcx, Instance::new(dest_did, dest_args));
+            let dest = Instance::new(dest_did, dest_args);
 
             match try_resolve_instance(tcx, dest) {
                 Ok(Some(dest)) => Some(TerminalCallKind::Static(*fn_span, dest)),
