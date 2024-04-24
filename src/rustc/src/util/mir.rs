@@ -3,21 +3,20 @@ use std::sync::OnceLock;
 use rustc_data_structures::steal::Steal;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    def::DefKind,
-    def_id::{DefId, DefIndex, LocalDefId},
+    def_id::{DefIndex, LocalDefId},
     ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::{
     mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
     ty::{
-        adjustment::PointerCoercion, fold::FnMutDelegate, GenericArg, ParamEnv, Ty, TyCtxt, TyKind,
-        TypeAndMut, VtblEntry,
+        adjustment::PointerCoercion, fold::FnMutDelegate, GenericArg, Instance, InstanceDef,
+        ParamEnv, Ty, TyCtxt, TyKind, TypeAndMut, VtblEntry,
     },
 };
 use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::supertraits;
 
-use super::ty::{ConcretizedFunc, GenericTransformer, MaybeConcretizedFunc};
+use super::ty::{try_resolve_instance, GenericTransformer, MaybeConcretizedFunc};
 
 // === Misc === //
 
@@ -50,9 +49,9 @@ pub fn iter_all_local_def_ids(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDefI
     })
 }
 
-// === `try_grab_body_of_def_id` === //
+// === `try_grab_base_mir_of_def_id` === //
 
-pub fn try_grab_mir_body_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
+pub fn try_grab_base_mir_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&Steal<Body<'_>>> {
     // Copied from `rustc_hir_typecheck::primary_body_of`
     match tcx.hir_node_by_def_id(id) {
         Node::Item(item) => match item.kind {
@@ -91,23 +90,81 @@ pub fn try_grab_mir_body_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&S
     Some(tcx.mir_built(id))
 }
 
-// === `has_optimized_mir` === //
+// === `try_grab_optimized_mir_of_instance` === //
 
-pub fn has_optimized_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
-    let is_func_kind = matches!(
-        tcx.def_kind(did),
-        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
-    );
+#[derive(Debug, Copy, Clone)]
+pub enum MirGrabResult<'tcx> {
+    Found(&'tcx Body<'tcx>),
+    Dynamic,
+    BottomsOut,
+}
 
-    is_func_kind && !tcx.is_foreign_item(did) && tcx.is_mir_available(did)
+impl<'tcx> MirGrabResult<'tcx> {
+    pub fn is_found(self) -> bool {
+        matches!(self, Self::Found(_))
+    }
+
+    pub fn unwrap(self) -> &'tcx Body<'tcx> {
+        match self {
+            MirGrabResult::Found(body) => body,
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub fn try_grab_optimized_mir_of_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: InstanceDef<'tcx>,
+) -> MirGrabResult<'tcx> {
+    match instance {
+        // Items are defined by users and thus have MIR... even if they're from an external crate.
+        InstanceDef::Item(item) => {
+            // However, foreign items and lang-items don't have MIR
+            if !tcx.is_foreign_item(item) {
+                MirGrabResult::Found(tcx.instance_mir(instance))
+            } else {
+                MirGrabResult::BottomsOut
+            }
+        }
+
+        // This is a shim around `FnDef` (or maybe an `FnPtr`?) for `FnTrait::call_x`. We generate
+        // the shim MIR for it and let the regular instance body processing handle it.
+        InstanceDef::FnPtrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
+
+        // All the remaining things here require shims. We referenced...
+        //
+        // https://github.com/rust-lang/rust/blob/9c20ddd956426d577d77cb3f57a7db2227a3c6e9/compiler/rustc_mir_transform/src/shim.rs#L29
+        //
+        // ...to figure out which instance def types support this operation.
+
+        // These are always supported.
+        InstanceDef::ThreadLocalShim(_)
+        | InstanceDef::DropGlue(_, _)
+        | InstanceDef::ClosureOnceShim { .. }
+        | InstanceDef::CloneShim(_, _)
+        | InstanceDef::FnPtrAddrShim(_, _) => MirGrabResult::Found(tcx.instance_mir(instance)),
+
+        // These are never supported and will never return to the user.
+        InstanceDef::Intrinsic(_) => MirGrabResult::BottomsOut,
+
+        // These are dynamic dispatches and should not be analyzed since we analyze them in a
+        // different way.
+        InstanceDef::VTableShim(_) | InstanceDef::ReifyShim(_) | InstanceDef::Virtual(_, _) => {
+            MirGrabResult::Dynamic
+        }
+
+        // TODO: Handle these properly.
+        InstanceDef::ConstructCoroutineInClosureShim { .. }
+        | InstanceDef::CoroutineKindShim { .. } => MirGrabResult::Dynamic,
+    }
 }
 
 // === `get_static_callee_from_terminator` === //
 
 #[derive(Debug, Copy, Clone)]
 pub enum TerminalCallKind<'tcx> {
-    Static(Span, ConcretizedFunc<'tcx>),
-    Generic(Span, ConcretizedFunc<'tcx>),
+    Static(Span, Instance<'tcx>),
+    Generic(Span, Instance<'tcx>),
     Dynamic,
 }
 
@@ -143,9 +200,9 @@ pub fn get_callee_from_terminator<'tcx>(
                 return None;
             };
 
-            let dest = instance.instantiate_func(tcx, ConcretizedFunc(dest_did, dest_args));
+            let dest = instance.instantiate_instance(tcx, Instance::new(dest_did, dest_args));
 
-            match dest.resolve(tcx) {
+            match try_resolve_instance(tcx, dest) {
                 Ok(Some(dest)) => Some(TerminalCallKind::Static(*fn_span, dest)),
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
@@ -205,7 +262,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: MaybeConcretizedFunc<'tcx>,
     body: &Body<'tcx>,
-    mut f: impl FnMut(ConcretizedFunc<'tcx>),
+    mut f: impl FnMut(Instance<'tcx>),
 ) {
     for bb in body.basic_blocks.iter() {
         for stmt in bb.statements.iter() {
@@ -227,7 +284,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                         unreachable!()
                     };
 
-                    if let Ok(Some(func)) = ConcretizedFunc(*def, generics).resolve(tcx) {
+                    if let Ok(Some(func)) = try_resolve_instance(tcx, Instance::new(*def, generics))
+                    {
                         f(func);
                     }
                 }
@@ -236,7 +294,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                         unreachable!()
                     };
 
-                    if let Ok(Some(func)) = ConcretizedFunc(*def, generics).resolve(tcx) {
+                    if let Ok(Some(func)) = try_resolve_instance(tcx, Instance::new(*def, generics))
+                    {
                         f(func);
                     }
                 }
@@ -284,18 +343,19 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                         let method_trait = tcx.trait_of_item(vtbl_method.def_id()).unwrap();
                         let method_trait = &super_trait_def_id_to_trait_ref[&method_trait];
 
-                        if let Ok(Some(func)) = ConcretizedFunc(
-                            vtbl_method.def_id(),
-                            tcx.mk_args(
-                                [GenericArg::from(from_ty)]
-                                    .into_iter()
-                                    .chain(method_trait.args.iter().skip(1))
-                                    .collect::<Vec<_>>()
-                                    .as_slice(),
-                            ),
-                        )
-                        .resolve(tcx)
-                        {
+                        if let Ok(Some(func)) = try_resolve_instance(
+                            tcx,
+                            Instance {
+                                def: vtbl_method.def,
+                                args: tcx.mk_args(
+                                    [GenericArg::from(from_ty)]
+                                        .into_iter()
+                                        .chain(method_trait.args.iter().skip(1))
+                                        .collect::<Vec<_>>()
+                                        .as_slice(),
+                                ),
+                            },
+                        ) {
                             f(func);
                         }
                     }

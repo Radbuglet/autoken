@@ -3,9 +3,9 @@ use rustc_middle::{
     bug,
     ty::{
         self, fold::RegionFolder, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind,
-        GenericArgs, GenericArgsRef, GenericParamDefKind, Instance, List, Mutability, ParamConst,
-        ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
-        TypeVisitableExt,
+        GenericArgs, GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability,
+        ParamConst, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder,
+        TypeSuperFoldable, TypeVisitableExt,
     },
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
@@ -178,60 +178,22 @@ pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
         tcx.mk_args_from_iter(args.iter().map(|arg| self.instantiate_arg(tcx, arg)))
     }
 
-    fn instantiate_func(
-        self,
-        tcx: TyCtxt<'tcx>,
-        func: ConcretizedFunc<'tcx>,
-    ) -> ConcretizedFunc<'tcx> {
-        ConcretizedFunc(func.def_id(), self.instantiate_args(tcx, func.args()))
+    fn instantiate_instance(self, tcx: TyCtxt<'tcx>, func: Instance<'tcx>) -> Instance<'tcx> {
+        Instance {
+            def: func.def,
+            args: self.instantiate_args(tcx, func.args),
+        }
     }
 }
 
-// === ConcretizedFunc === //
+// === Instance === //
 
-pub type ConcretizedArgs<'tcx> = &'tcx List<GenericArg<'tcx>>;
-
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct ConcretizedFunc<'tcx>(pub DefId, pub ConcretizedArgs<'tcx>);
-
-impl<'tcx> From<Instance<'tcx>> for ConcretizedFunc<'tcx> {
-    fn from(instance: Instance<'tcx>) -> Self {
-        Self(instance.def_id(), instance.args)
-    }
-}
-
-impl<'tcx> ConcretizedFunc<'tcx> {
-    pub fn def_id(self) -> DefId {
-        self.0
-    }
-
-    pub fn args(self) -> ConcretizedArgs<'tcx> {
-        self.1
-    }
-
-    pub fn resolve_instance(
-        self,
-        tcx: TyCtxt<'tcx>,
-    ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-        tcx.resolve_instance(
-            tcx.erase_regions(ParamEnv::reveal_all().and((self.def_id(), self.args()))),
-        )
-    }
-
-    pub fn resolve(
-        self,
-        tcx: TyCtxt<'tcx>,
-    ) -> Result<Option<ConcretizedFunc<'tcx>>, ErrorGuaranteed> {
-        self.resolve_instance(tcx).map(|v| v.map(|v| v.into()))
-    }
-}
-
-impl<'tcx> GenericTransformer<'tcx> for ConcretizedFunc<'tcx> {
+impl<'tcx> GenericTransformer<'tcx> for Instance<'tcx> {
     fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        Instance::new(self.0, self.1).instantiate_mir_and_normalize_erasing_regions(
+        self.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             ParamEnv::reveal_all(),
             EarlyBinder::bind(ty),
@@ -239,33 +201,47 @@ impl<'tcx> GenericTransformer<'tcx> for ConcretizedFunc<'tcx> {
     }
 }
 
-// === MaybeConcretizedArgs === //
+pub fn try_resolve_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
+    Instance::resolve(
+        tcx,
+        ParamEnv::reveal_all(),
+        instance.def_id(),
+        instance.args,
+    )
+}
 
-pub type MaybeConcretizedArgs<'tcx> = Option<ConcretizedArgs<'tcx>>;
+// === MaybeConcretizedFunc === //
+
+pub type MaybeConcretizedArgs<'tcx> = Option<GenericArgsRef<'tcx>>;
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct MaybeConcretizedFunc<'tcx>(pub DefId, pub MaybeConcretizedArgs<'tcx>);
+pub struct MaybeConcretizedFunc<'tcx> {
+    pub def: InstanceDef<'tcx>,
+    pub args: MaybeConcretizedArgs<'tcx>,
+}
 
-impl<'tcx> From<ConcretizedFunc<'tcx>> for MaybeConcretizedFunc<'tcx> {
-    fn from(func: ConcretizedFunc<'tcx>) -> Self {
-        Self(func.def_id(), Some(func.args()))
+impl<'tcx> From<Instance<'tcx>> for MaybeConcretizedFunc<'tcx> {
+    fn from(func: Instance<'tcx>) -> Self {
+        Self {
+            def: func.def,
+            args: Some(func.args),
+        }
     }
 }
 
 impl<'tcx> MaybeConcretizedFunc<'tcx> {
     pub fn def_id(self) -> DefId {
-        self.0
+        self.def.def_id()
     }
 
-    pub fn args(self) -> MaybeConcretizedArgs<'tcx> {
-        self.1
-    }
-
-    pub fn as_concretized(self) -> Option<ConcretizedFunc<'tcx>> {
-        match self {
-            MaybeConcretizedFunc(did, Some(args)) => Some(ConcretizedFunc(did, args)),
-            MaybeConcretizedFunc(_, None) => None,
-        }
+    pub fn as_concretized(self) -> Option<Instance<'tcx>> {
+        Some(Instance {
+            def: self.def,
+            args: self.args?,
+        })
     }
 }
 

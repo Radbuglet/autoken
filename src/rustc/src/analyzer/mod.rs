@@ -4,7 +4,7 @@ use rustc_hir::{def::DefKind, LangItem};
 
 use rustc_middle::{
     mir::{BasicBlock, Mutability},
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{InstanceDef, Ty, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
 
@@ -20,8 +20,8 @@ use crate::util::{
     graph::{GraphPropagator, GraphPropagatorCx},
     hash::FxHashMap,
     mir::{
-        for_each_concrete_unsized_func, get_callee_from_terminator, has_optimized_mir,
-        iter_all_local_def_ids, try_grab_mir_body_of_def_id, TerminalCallKind,
+        for_each_concrete_unsized_func, get_callee_from_terminator, iter_all_local_def_ids,
+        try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance, TerminalCallKind,
     },
     ty::{
         find_region_with_name, get_fn_sig_maybe_closure, try_resolve_mono_args_for_func,
@@ -43,7 +43,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
     for local_def in iter_all_local_def_ids(tcx) {
-        if try_grab_mir_body_of_def_id(tcx, local_def).is_some() {
+        if try_grab_base_mir_of_def_id(tcx, local_def).is_some() {
             assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
         }
     }
@@ -59,7 +59,16 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     assert!(!tcx.untracked().definitions.is_frozen());
 
     for did in iter_all_local_def_ids(tcx) {
-        let func = MaybeConcretizedFunc(did.to_def_id(), None);
+        // Ensure that we're analyzing a function...
+        if !matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) {
+            continue;
+        }
+
+        // If it is a function, analyze it.
+        let func = MaybeConcretizedFunc {
+            def: InstanceDef::Item(did.to_def_id()),
+            args: None,
+        };
 
         if try_resolve_mono_args_for_func(tcx, did.to_def_id()).is_some()
             && should_analyze(tcx, func)
@@ -76,7 +85,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Check for undeclared unsizing.
     for instance in func_facts.keys().copied() {
-        let body = tcx.optimized_mir(instance.def_id());
+        let body = try_grab_optimized_mir_of_instance(tcx, instance.def).unwrap();
 
         if tcx.entry_fn(()).map(|(did, _)| did) == Some(instance.def_id()) {
             ensure_no_borrow(tcx, &func_facts, instance, "use this main function");
@@ -262,9 +271,9 @@ struct FnFactAnalysisCx<'tcx> {
 
 fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: MaybeConcretizedFunc<'tcx>) -> bool {
     if is_tie_func(tcx, instance.def_id()) || is_absorb_func(tcx, instance.def_id()) {
-        instance.args().is_some()
+        instance.args.is_some()
     } else {
-        has_optimized_mir(tcx, instance.def_id())
+        try_grab_optimized_mir_of_instance(tcx, instance.def).is_found()
     }
 }
 
@@ -285,12 +294,12 @@ fn analyze_fn_facts<'tcx>(
     // If this function has a hardcoded fact set, use those.
     if is_tie_func(tcx, instance.def_id()) {
         return FuncFacts {
-            borrows: instantiate_set(tcx, instance.args().unwrap()[1].as_type().unwrap()),
+            borrows: instantiate_set(tcx, instance.args.unwrap()[1].as_type().unwrap()),
         };
     };
 
     // Acquire the function body.
-    let body = tcx.optimized_mir(instance.def_id());
+    let body = try_grab_optimized_mir_of_instance(tcx, instance.def).unwrap();
 
     // Ensure that we analyze the facts of each unsized function since unsize-checking depends
     // on this information being available.
@@ -324,7 +333,7 @@ fn analyze_fn_facts<'tcx>(
         };
 
         let lt_id = is_tie_func(tcx, target_instance.def_id()).then(|| {
-            let param = target_instance.args().unwrap()[0].as_type().unwrap();
+            let param = target_instance.args.unwrap()[0].as_type().unwrap();
             if param.is_unit() {
                 return None;
             }
@@ -357,7 +366,7 @@ fn analyze_fn_facts<'tcx>(
     if is_absorb_func(tcx, instance.def_id()) {
         instantiate_set_proc(
             tcx,
-            instance.args().unwrap()[0].as_type().unwrap(),
+            instance.args.unwrap()[0].as_type().unwrap(),
             &mut |ty, mutability| match borrows.entry(ty) {
                 hash_map::Entry::Occupied(entry) => {
                     if mutability.is_mut() || entry.get().0 == Mutability::Not {
