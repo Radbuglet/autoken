@@ -346,8 +346,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
 
                     // Get the actual methods which make up the trait's vtable since those are
                     // the things we can actually call.
-                    // BUG: This crashes because of normalization issues.
-                    let vtable_entries = tcx.vtable_entries(base_binder);
+                    let vtable_entries =
+                        adapted::maybe_generic_vtable_entries(tcx, param_env, base_binder);
 
                     for vtable_entry in vtable_entries {
                         let VtblEntry::Method(vtbl_method) = vtable_entry else {
@@ -378,5 +378,93 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                 _ => {}
             }
         }
+    }
+}
+
+mod adapted {
+    use std::ops::ControlFlow;
+
+    use rustc_middle::ty::{
+        ExistentialTraitRef, GenericArgs, GenericParamDefKind, Instance, ParamEnv, PolyTraitRef,
+        TyCtxt, VtblEntry,
+    };
+    use rustc_trait_selection::traits::{
+        impossible_predicates,
+        vtable::{prepare_vtable_segments, VtblSegment},
+    };
+
+    // Adapted from `vtable_entries` in `compiler/rustc_trait_selection/src/traits/vtable.rs`.
+    pub fn maybe_generic_vtable_entries<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
+        trait_ref: PolyTraitRef<'tcx>,
+    ) -> &'tcx [VtblEntry<'tcx>] {
+        let mut entries = vec![];
+
+        let vtable_segment_callback = |segment| -> ControlFlow<()> {
+            match segment {
+                VtblSegment::MetadataDSA => {
+                    entries.extend(TyCtxt::COMMON_VTABLE_ENTRIES);
+                }
+                VtblSegment::TraitOwnEntries {
+                    trait_ref,
+                    emit_vptr,
+                } => {
+                    let existential_trait_ref = trait_ref
+                        .map_bound(|trait_ref| ExistentialTraitRef::erase_self_ty(tcx, trait_ref));
+
+                    // Lookup the shape of vtable for the trait.
+                    let own_existential_entries =
+                        tcx.own_existential_vtable_entries(existential_trait_ref.def_id());
+
+                    let own_entries = own_existential_entries.iter().copied().map(|def_id| {
+                        // The method may have some early-bound lifetimes; add regions for those.
+                        let args = trait_ref.map_bound(|trait_ref| {
+                            GenericArgs::for_item(tcx, def_id, |param, _| match param.kind {
+                                GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+                                GenericParamDefKind::Type { .. }
+                                | GenericParamDefKind::Const { .. } => {
+                                    trait_ref.args[param.index as usize]
+                                }
+                            })
+                        });
+
+                        // The trait type may have higher-ranked lifetimes in it;
+                        // erase them if they appear, so that we get the type
+                        // at some particular call site.
+                        let args = tcx.normalize_erasing_late_bound_regions(param_env, args);
+
+                        // It's possible that the method relies on where-clauses that
+                        // do not hold for this particular set of type parameters.
+                        // Note that this method could then never be called, so we
+                        // do not want to try and codegen it, in that case (see #23435).
+                        let predicates = tcx.predicates_of(def_id).instantiate_own(tcx, args);
+                        if impossible_predicates(
+                            tcx,
+                            predicates.map(|(predicate, _)| predicate).collect(),
+                        ) {
+                            return VtblEntry::Vacant;
+                        }
+
+                        let instance = Instance::resolve_for_vtable(tcx, param_env, def_id, args)
+                            .expect("resolution failed during building vtable representation");
+
+                        VtblEntry::Method(instance)
+                    });
+
+                    entries.extend(own_entries);
+
+                    if emit_vptr {
+                        entries.push(VtblEntry::TraitVPtr(trait_ref));
+                    }
+                }
+            }
+
+            ControlFlow::Continue(())
+        };
+
+        let _ = prepare_vtable_segments(tcx, trait_ref, vtable_segment_callback);
+
+        tcx.arena.alloc_from_iter(entries)
     }
 }
