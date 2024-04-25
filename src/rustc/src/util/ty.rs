@@ -3,9 +3,8 @@ use rustc_middle::{
     bug,
     ty::{
         self, fold::RegionFolder, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgKind,
-        GenericArgs, GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability,
-        ParamConst, ParamEnv, Region, Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder,
-        TypeSuperFoldable, TypeVisitableExt,
+        GenericArgsRef, Instance, InstanceDef, List, Mutability, ParamConst, ParamEnv, Region, Ty,
+        TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
     },
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
@@ -34,7 +33,7 @@ pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
     true
 }
 
-// === Signature Parsing === //
+// === `Signature` Parsing === //
 
 pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {
     match tcx.type_of(def_id).skip_binder().kind() {
@@ -58,38 +57,6 @@ pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<B
         _ => tcx.fn_sig(def_id),
     }
 }
-
-pub fn try_resolve_mono_args_for_func(
-    tcx: TyCtxt<'_>,
-    def_id: DefId,
-) -> Option<GenericArgsRef<'_>> {
-    let mut args_wf = true;
-    let args =
-        // N.B. we use `for_item` instead of `tcx.generics_of` to ensure that we also iterate
-        // over the generic arguments of the parent.
-        GenericArgs::for_item(tcx, def_id, |param, _| match param.kind {
-            // We can handle these
-            GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
-            GenericParamDefKind::Const {
-                is_host_effect: true,
-                ..
-            } => tcx.consts.true_.into(),
-
-            // We can't handle these; return a dummy value and set the `args_wf` flag.
-            GenericParamDefKind::Type { .. } => {
-                args_wf = false;
-                tcx.types.unit.into()
-            }
-            GenericParamDefKind::Const { .. } => {
-                args_wf = false;
-                tcx.consts.true_.into()
-            }
-        });
-
-    args_wf.then_some(args)
-}
-
-// === `find_region_with_name` === //
 
 pub fn find_region_with_name<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -153,13 +120,14 @@ impl MutabilityExt for Mutability {
 // === GenericTransformer === //
 
 pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
-    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>;
 
     fn instantiate_arg_iter<'a, T>(
         self,
         tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
         iter: impl IntoIterator<Item = T> + 'a,
     ) -> impl Iterator<Item = T> + 'a
     where
@@ -167,21 +135,30 @@ pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
         'tcx: 'a,
     {
         iter.into_iter()
-            .map(move |arg| self.instantiate_arg(tcx, arg))
+            .map(move |arg| self.instantiate_arg(tcx, param_env, arg))
     }
 
     fn instantiate_args(
         self,
         tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
         args: &'tcx List<GenericArg<'tcx>>,
     ) -> &'tcx List<GenericArg<'tcx>> {
-        tcx.mk_args_from_iter(args.iter().map(|arg| self.instantiate_arg(tcx, arg)))
+        tcx.mk_args_from_iter(
+            args.iter()
+                .map(|arg| self.instantiate_arg(tcx, param_env, arg)),
+        )
     }
 
-    fn instantiate_instance(self, tcx: TyCtxt<'tcx>, func: Instance<'tcx>) -> Instance<'tcx> {
+    fn instantiate_instance(
+        self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
+        func: Instance<'tcx>,
+    ) -> Instance<'tcx> {
         Instance {
             def: func.def,
-            args: self.instantiate_args(tcx, func.args),
+            args: self.instantiate_args(tcx, param_env, func.args),
         }
     }
 }
@@ -189,28 +166,20 @@ pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
 // === Instance === //
 
 impl<'tcx> GenericTransformer<'tcx> for Instance<'tcx> {
-    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        self.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            ParamEnv::reveal_all(),
-            EarlyBinder::bind(ty),
-        )
+        self.instantiate_mir_and_normalize_erasing_regions(tcx, param_env, EarlyBinder::bind(ty))
     }
 }
 
 pub fn try_resolve_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
     instance: Instance<'tcx>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-    Instance::resolve(
-        tcx,
-        ParamEnv::reveal_all(),
-        instance.def_id(),
-        instance.args,
-    )
+    Instance::resolve(tcx, param_env, instance.def_id(), instance.args)
 }
 
 // === MaybeConcretizedFunc === //
@@ -246,12 +215,12 @@ impl<'tcx> MaybeConcretizedFunc<'tcx> {
 }
 
 impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
-    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, ty: T) -> T
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
         if let Some(concretized) = self.as_concretized() {
-            concretized.instantiate_arg(tcx, ty)
+            concretized.instantiate_arg(tcx, param_env, ty)
         } else {
             ty
         }

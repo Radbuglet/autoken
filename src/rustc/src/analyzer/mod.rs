@@ -1,10 +1,10 @@
-use std::collections::hash_map;
+use std::{borrow::Borrow, collections::hash_map, hash};
 
 use rustc_hir::{def::DefKind, LangItem};
 
 use rustc_middle::{
     mir::{BasicBlock, Mutability},
-    ty::{InstanceDef, Ty, TyCtxt, TyKind},
+    ty::{InstanceDef, ParamEnv, Ty, TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
 
@@ -20,13 +20,12 @@ use crate::util::{
     graph::{GraphPropagator, GraphPropagatorCx},
     hash::FxHashMap,
     mir::{
-        for_each_concrete_unsized_func, get_callee_from_terminator, iter_all_local_def_ids,
-        try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance, TerminalCallKind,
+        for_each_concrete_unsized_func, get_callee_from_terminator, has_optimized_mir,
+        iter_all_local_def_ids, try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance,
+        TerminalCallKind,
     },
-    ty::{
-        find_region_with_name, get_fn_sig_maybe_closure, try_resolve_mono_args_for_func,
-        MaybeConcretizedFunc,
-    },
+    ty::{find_region_with_name, get_fn_sig_maybe_closure, MaybeConcretizedFunc},
+    ty_legacy::try_resolve_mono_args_for_func,
 };
 
 use self::{
@@ -59,21 +58,21 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     assert!(!tcx.untracked().definitions.is_frozen());
 
     for did in iter_all_local_def_ids(tcx) {
-        // Ensure that we're analyzing a function...
-        if !matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) {
-            continue;
-        }
+        let did = did.to_def_id();
 
-        // If it is a function, analyze it.
         let func = MaybeConcretizedFunc {
-            def: InstanceDef::Item(did.to_def_id()),
+            def: InstanceDef::Item(did),
             args: None,
         };
 
-        if try_resolve_mono_args_for_func(tcx, did.to_def_id()).is_some()
+        if has_optimized_mir(tcx, did)
+            && try_resolve_mono_args_for_func(tcx, did).is_some()
             && should_analyze(tcx, func)
         {
-            func_facts.context_mut().analysis_queue.push(func);
+            func_facts.context_mut().analysis_queue.push(FuncKey {
+                instance: func,
+                param_env: tcx.param_env_reveal_all_normalized(did),
+            });
         }
     }
 
@@ -84,7 +83,11 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     let func_facts = func_facts.into_fact_map();
 
     // Check for undeclared unsizing.
-    for instance in func_facts.keys().copied() {
+    for &FuncKey {
+        instance,
+        param_env,
+    } in func_facts.keys()
+    {
         let body = try_grab_optimized_mir_of_instance(tcx, instance.def).unwrap();
 
         if tcx.entry_fn(()).map(|(did, _)| did) == Some(instance.def_id()) {
@@ -106,7 +109,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             );
         }
 
-        for_each_concrete_unsized_func(tcx, instance, body, |instance| {
+        for_each_concrete_unsized_func(tcx, param_env, instance, body, |instance| {
             ensure_no_borrow(tcx, &func_facts, instance.into(), "unsize this function")
         });
     }
@@ -116,7 +119,14 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     let mut shadows = Vec::new();
 
-    for (instance, facts) in &func_facts {
+    for (
+        &FuncKey {
+            instance,
+            param_env,
+        },
+        facts,
+    ) in &func_facts
+    {
         let Some(orig_id) = instance.def_id().as_local() else {
             continue;
         };
@@ -143,7 +153,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             let Some(TerminalCallKind::Static(_, target_instance_mono)) =
                 get_callee_from_terminator(
                     tcx,
-                    *instance,
+                    param_env,
+                    instance,
                     &body_mutator.body().basic_blocks[bb].terminator,
                     &body_mutator.body().local_decls,
                 )
@@ -235,7 +246,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
 fn ensure_no_borrow<'tcx>(
     tcx: TyCtxt<'tcx>,
-    func_facts: &FxHashMap<MaybeConcretizedFunc<'tcx>, FuncFacts<'tcx>>,
+    func_facts: &FxHashMap<FuncKey<'tcx>, FuncFacts<'tcx>>,
     instance: MaybeConcretizedFunc<'tcx>,
     action: &str,
 ) {
@@ -266,7 +277,33 @@ struct FuncFacts<'tcx> {
 
 struct FnFactAnalysisCx<'tcx> {
     tcx: TyCtxt<'tcx>,
-    analysis_queue: Vec<MaybeConcretizedFunc<'tcx>>,
+    analysis_queue: Vec<FuncKey<'tcx>>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct FuncKey<'tcx> {
+    pub instance: MaybeConcretizedFunc<'tcx>,
+    pub param_env: ParamEnv<'tcx>,
+}
+
+impl<'tcx> Borrow<MaybeConcretizedFunc<'tcx>> for FuncKey<'tcx> {
+    fn borrow(&self) -> &MaybeConcretizedFunc<'tcx> {
+        &self.instance
+    }
+}
+
+impl hash::Hash for FuncKey<'_> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.instance.hash(state);
+    }
+}
+
+impl Eq for FuncKey<'_> {}
+
+impl PartialEq for FuncKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.instance == other.instance
+    }
 }
 
 fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: MaybeConcretizedFunc<'tcx>) -> bool {
@@ -278,14 +315,11 @@ fn should_analyze<'tcx>(tcx: TyCtxt<'tcx>, instance: MaybeConcretizedFunc<'tcx>)
 }
 
 fn analyze_fn_facts<'tcx>(
-    cx: &mut GraphPropagatorCx<
-        '_,
-        '_,
-        FnFactAnalysisCx<'tcx>,
-        MaybeConcretizedFunc<'tcx>,
-        FuncFacts<'tcx>,
-    >,
-    instance: MaybeConcretizedFunc<'tcx>,
+    cx: &mut GraphPropagatorCx<'_, '_, FnFactAnalysisCx<'tcx>, FuncKey<'tcx>, FuncFacts<'tcx>>,
+    FuncKey {
+        instance,
+        param_env,
+    }: FuncKey<'tcx>,
 ) -> FuncFacts<'tcx> {
     let tcx = cx.context_mut().tcx;
 
@@ -303,11 +337,14 @@ fn analyze_fn_facts<'tcx>(
 
     // Ensure that we analyze the facts of each unsized function since unsize-checking depends
     // on this information being available.
-    for_each_concrete_unsized_func(tcx, instance, body, |instance| {
+    for_each_concrete_unsized_func(tcx, param_env, instance, body, |instance| {
         let instance = instance.into();
 
         if should_analyze(tcx, instance) {
-            cx.context_mut().analysis_queue.push(instance);
+            cx.context_mut().analysis_queue.push(FuncKey {
+                instance,
+                param_env,
+            });
         }
     });
 
@@ -317,7 +354,7 @@ fn analyze_fn_facts<'tcx>(
     for bb in body.basic_blocks.iter() {
         // If the terminator is a call terminator.
         let Some(TerminalCallKind::Static(_, target_instance)) =
-            get_callee_from_terminator(tcx, instance, &bb.terminator, &body.local_decls)
+            get_callee_from_terminator(tcx, param_env, instance, &bb.terminator, &body.local_decls)
         else {
             continue;
         };
@@ -328,7 +365,10 @@ fn analyze_fn_facts<'tcx>(
             continue;
         }
 
-        let Some(target_facts) = cx.analyze(target_instance) else {
+        let Some(target_facts) = cx.analyze(FuncKey {
+            instance: target_instance,
+            param_env,
+        }) else {
             continue;
         };
 

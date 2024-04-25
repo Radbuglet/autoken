@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 use rustc_data_structures::steal::Steal;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    def_id::{DefIndex, LocalDefId},
+    def::DefKind,
+    def_id::{DefId, DefIndex, LocalDefId},
     ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::{
@@ -90,6 +91,17 @@ pub fn try_grab_base_mir_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&S
     Some(tcx.mir_built(id))
 }
 
+// === `has_optimized_mir` === //
+
+pub fn has_optimized_mir(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    let is_func_kind = matches!(
+        tcx.def_kind(did),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    );
+
+    is_func_kind && !tcx.is_foreign_item(did) && tcx.is_mir_available(did)
+}
+
 // === `try_grab_optimized_mir_of_instance` === //
 
 #[derive(Debug, Copy, Clone)]
@@ -170,6 +182,7 @@ pub enum TerminalCallKind<'tcx> {
 
 pub fn get_callee_from_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
     instance: MaybeConcretizedFunc<'tcx>,
     terminator: &Option<Terminator<'tcx>>,
     local_decls: &LocalDecls<'tcx>,
@@ -182,7 +195,7 @@ pub fn get_callee_from_terminator<'tcx>(
         } => {
             // Get the type of the function local we're calling.
             let dest_func = dest_func.ty(local_decls, tcx);
-            let dest_func = instance.instantiate_arg(tcx, dest_func);
+            let dest_func = instance.instantiate_arg(tcx, param_env, dest_func);
 
             // Attempt to fetch a `DefId` and arguments for the callee.
             let (dest_did, dest_args) = match dest_func.kind() {
@@ -194,16 +207,10 @@ pub fn get_callee_from_terminator<'tcx>(
                 _ => unreachable!(),
             };
 
-            let Ok(dest_args) =
-                tcx.try_normalize_erasing_regions(ParamEnv::reveal_all(), dest_args)
-            else {
-                // TODO: What does it mean when this fails?
-                return None;
-            };
-
+            let dest_args = tcx.normalize_erasing_regions(param_env, dest_args);
             let dest = Instance::new(dest_did, dest_args);
 
-            match try_resolve_instance(tcx, dest) {
+            match try_resolve_instance(tcx, param_env, dest) {
                 Ok(Some(dest)) => Some(TerminalCallKind::Static(*fn_span, dest)),
 
                 // `Ok(None)` when the `GenericArgsRef` are still too generic
@@ -261,6 +268,7 @@ pub fn get_unsized_ty<'tcx>(
 
 pub fn for_each_concrete_unsized_func<'tcx>(
     tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
     instance: MaybeConcretizedFunc<'tcx>,
     body: &Body<'tcx>,
     mut f: impl FnMut(Instance<'tcx>),
@@ -276,8 +284,9 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                 continue;
             };
 
-            let from_ty = instance.instantiate_arg(tcx, from_op.ty(&body.local_decls, tcx));
-            let to_ty = instance.instantiate_arg(tcx, *to_ty);
+            let from_ty = from_op.ty(&body.local_decls, tcx);
+            let from_ty = instance.instantiate_arg(tcx, param_env, from_ty);
+            let to_ty = instance.instantiate_arg(tcx, param_env, *to_ty);
 
             match kind {
                 PointerCoercion::ReifyFnPointer => {
@@ -285,7 +294,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                         unreachable!()
                     };
 
-                    if let Ok(Some(func)) = try_resolve_instance(tcx, Instance::new(*def, generics))
+                    if let Ok(Some(func)) =
+                        try_resolve_instance(tcx, param_env, Instance::new(*def, generics))
                     {
                         f(func);
                     }
@@ -295,7 +305,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                         unreachable!()
                     };
 
-                    if let Ok(Some(func)) = try_resolve_instance(tcx, Instance::new(*def, generics))
+                    if let Ok(Some(func)) =
+                        try_resolve_instance(tcx, param_env, Instance::new(*def, generics))
                     {
                         f(func);
                     }
@@ -315,7 +326,8 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                     };
 
                     // Do some magic with binders... I guess.
-                    let base_binder = tcx.erase_regions(binder.with_self_ty(tcx, to_ty));
+                    let base_binder =
+                        tcx.normalize_erasing_regions(param_env, binder.with_self_ty(tcx, to_ty));
 
                     let mut super_trait_def_id_to_trait_ref = FxHashMap::default();
 
@@ -334,6 +346,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
 
                     // Get the actual methods which make up the trait's vtable since those are
                     // the things we can actually call.
+                    // BUG: This crashes because of normalization issues.
                     let vtable_entries = tcx.vtable_entries(base_binder);
 
                     for vtable_entry in vtable_entries {
@@ -346,6 +359,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
 
                         if let Ok(Some(func)) = try_resolve_instance(
                             tcx,
+                            param_env,
                             Instance {
                                 def: vtbl_method.def,
                                 args: tcx.mk_args(
