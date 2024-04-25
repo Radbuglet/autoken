@@ -29,7 +29,7 @@ pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
     true
 }
 
-// === `Signature` Parsing === //
+// === Signature Parsing === //
 
 pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> EarlyBinder<Binder<FnSig<'_>>> {
     match tcx.type_of(def_id).skip_binder().kind() {
