@@ -34,11 +34,11 @@ use self::{
 };
 
 mod mir;
-mod mir_overlap;
+mod overlap;
 mod sets;
 mod sym;
 
-pub use self::mir_overlap::analyze_borrow_overlap;
+pub use self::overlap::analyze_ensure_no_overlap;
 
 pub fn analyze(tcx: TyCtxt<'_>) {
     let mut id_gen = 0;
