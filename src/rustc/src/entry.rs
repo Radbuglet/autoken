@@ -17,18 +17,18 @@ use rustc_middle::{
     mir::Body,
     ty::{AssocItem, TyCtxt, Visibility},
 };
-use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
+use rustc_session::{
+    config::{ErrorOutputType, Polonius},
+    EarlyDiagCtxt,
+};
 
-use crate::{
-    analyzer::analyze,
-    util::feeder::{
-        feed,
-        feeders::{
-            AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
-            OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
-        },
-        once_val, read_feed,
+use crate::util::feeder::{
+    feed,
+    feeders::{
+        AssociatedItemFeeder, DefKindFeeder, MirBuiltFeeder, MirBuiltStasher,
+        OptLocalDefIdToHirIdFeeder, VisibilityFeeder,
     },
+    once_val, read_feed,
 };
 
 const ICE_URL: &str = "https://www.github.com/Radbuglet/autoken/issues";
@@ -61,6 +61,7 @@ impl Callbacks for AnalyzeMirCallbacks {
         // break with clever `#[no_mangle]` hacks. Luckily, this analysis also only looks at functions
         // which are reachable from the main function so this is an okay limitation.
         config.opts.unstable_opts.always_encode_mir = true;
+        config.opts.unstable_opts.polonius = Polonius::Legacy;
 
         // We also have to hack in a little environment variable to override the sysroot.
         if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {
@@ -152,7 +153,10 @@ impl Callbacks for AnalyzeMirCallbacks {
         queries: &'tcx Queries<'tcx>,
     ) -> Compilation {
         if should_run_analysis() {
-            queries.global_ctxt().unwrap().enter(|tcx| analyze(tcx));
+            queries
+                .global_ctxt()
+                .unwrap()
+                .enter(|tcx| crate::analyzer::analyze_borrow_overlap(tcx));
         }
 
         Compilation::Continue
