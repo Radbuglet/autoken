@@ -1,3 +1,5 @@
+use std::collections::hash_map;
+
 use rustc_borrowck::{
     borrow_set::BorrowData,
     consumers::{
@@ -6,86 +8,137 @@ use rustc_borrowck::{
     },
 };
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{BasicBlock, Body, CallReturnPlaces, Location, Statement, Terminator, TerminatorEdges},
-    ty::TyCtxt,
+    mir::{
+        BasicBlock, Body, BorrowKind, CallReturnPlaces, Local, Location, Mutability, Statement,
+        Terminator, TerminatorEdges,
+    },
+    ty::{ParamEnv, Ty, TyCtxt},
 };
 use rustc_mir_dataflow::{
     fmt::DebugWithContext, Analysis, AnalysisDomain, Forward, GenKill, GenKillAnalysis,
 };
+use rustc_span::Span;
 
-pub fn analyze_ensure_no_overlap(tcx: TyCtxt<'_>) {
-    let Some((main, _)) = tcx.entry_fn(()) else {
-        return;
-    };
+use crate::util::ty::{GenericTransformer, MaybeConcretizedFunc, MutabilityExt};
 
-    let Some(main) = main.as_local() else {
-        return;
-    };
+// === Analysis === //
 
-    let facts = get_body_with_borrowck_facts(tcx, main, ConsumerOptions::RegionInferenceContext);
-    let start_map = &facts.borrow_set.location_map;
-    let end_map = calculate_borrows_out_of_scope_at_location(
-        &facts.body,
-        &facts.region_inference_context,
-        &facts.borrow_set,
-    );
+#[derive(Debug, Clone)]
+pub struct BodyOverlapFacts<'tcx> {
+    pub overlaps: Vec<OverlapPlace<'tcx>>,
+}
 
-    //     eprintln!("Starts:");
-    //     for (loc, borrow) in &facts.borrow_set.location_map {
-    //         let local = borrow.borrowed_place.local;
-    //         eprintln!("- {loc:?}: {:?}", facts.body.local_decls[local].ty);
-    //     }
-    //
-    //     eprintln!("Ends:");
-    //     for (loc, borrow) in end_map.iter() {
-    //         for borrow in borrow {
-    //             eprintln!(
-    //                 "- {:?} -> {loc:?}",
-    //                 facts
-    //                     .borrow_set
-    //                     .location_map
-    //                     .get_index(borrow.as_usize())
-    //                     .unwrap()
-    //                     .0,
-    //             );
-    //         }
-    //     }
+#[derive(Debug, Clone)]
+pub struct OverlapPlace<'tcx> {
+    pub span: Span,
+    pub active: Vec<(Ty<'tcx>, Mutability)>,
+}
 
-    let mut results = RegionAwareLiveness {
-        start_map,
-        end_map: &end_map,
+impl<'tcx> BodyOverlapFacts<'tcx> {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        did: LocalDefId,
+        mut local_key: impl FnMut(Local) -> Option<Ty<'tcx>>,
+    ) -> Self {
+        // Determine the start and end locations of our borrows.
+        let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
+        let start_map = &facts.borrow_set.location_map;
+        let end_map = calculate_borrows_out_of_scope_at_location(
+            &facts.body,
+            &facts.region_inference_context,
+            &facts.borrow_set,
+        );
+
+        // Run fix-point analysis to figure out which sections of code have which borrows.
+        let mut results = RegionAwareLiveness {
+            start_map,
+            end_map: &end_map,
+        }
+        .into_engine(tcx, &facts.body)
+        .iterate_to_fixpoint()
+        .into_results_cursor(&facts.body);
+
+        // Determine overlap sets.
+        let mut overlaps = Vec::new();
+
+        for (bb_loc, bb) in facts.body.basic_blocks.iter_enumerated() {
+            for (stmt_loc, stmt) in bb.statements.iter().enumerate() {
+                let loc = Location {
+                    block: bb_loc,
+                    statement_index: stmt_loc,
+                };
+
+                results.seek_before_primary_effect(loc);
+                let state = results.get();
+
+                let mut active = Vec::new();
+
+                for borrow in state.iter() {
+                    let borrow = start_map.get_index(borrow.as_usize()).unwrap().1;
+                    let local = borrow.borrowed_place.local;
+                    let Some(local_key) = local_key(local) else {
+                        continue;
+                    };
+
+                    let mutability = match borrow.kind {
+                        BorrowKind::Shared => Mutability::Not,
+                        BorrowKind::Fake => unreachable!(),
+                        BorrowKind::Mut { .. } => Mutability::Mut,
+                    };
+
+                    active.push((local_key, mutability));
+                }
+
+                overlaps.push(OverlapPlace {
+                    span: stmt.source_info.span,
+                    active,
+                });
+            }
+        }
+
+        Self { overlaps }
     }
-    .into_engine(tcx, &facts.body)
-    .iterate_to_fixpoint()
-    .into_results_cursor(&facts.body);
 
-    for (bb_loc, bb) in facts.body.basic_blocks.iter_enumerated() {
-        for (stmt_loc, _) in bb.statements.iter().enumerate() {
-            let loc = Location {
-                block: bb_loc,
-                statement_index: stmt_loc,
-            };
+    pub fn validate(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
+        instance: MaybeConcretizedFunc<'tcx>,
+    ) {
+        let mut borrows = FxHashMap::default();
 
-            results.seek_before_primary_effect(loc);
-            let state = results.get();
+        for overlap in &self.overlaps {
+            borrows.clear();
 
-            eprintln!("{loc:?}:");
-            for borrow in state.iter() {
-                let local = start_map
-                    .get_index(borrow.as_usize())
-                    .unwrap()
-                    .1
-                    .borrowed_place
-                    .local;
+            for &(key, mutability) in &overlap.active {
+                let key = instance.instantiate_arg(tcx, param_env, key);
 
-                eprintln!("- {:?}", facts.body.local_decls[local].ty);
+                match borrows.entry(key) {
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert(mutability);
+                    }
+                    hash_map::Entry::Occupied(entry) => {
+                        let entry = entry.into_mut();
+                        if entry.is_mut() || mutability.is_mut() {
+                            tcx.dcx().span_err(
+                                overlap.span,
+                                format!("AuToken token {key} is borrowed mutably twice here"),
+                            );
+                        }
+
+                        entry.upgrade(mutability);
+                    }
+                }
             }
         }
     }
 }
+
+// === Dataflow Analyzer === //
 
 pub struct RegionAwareLiveness<'tcx, 'a> {
     start_map: &'a FxIndexMap<Location, BorrowData<'tcx>>,

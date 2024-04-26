@@ -156,7 +156,7 @@ impl Callbacks for AnalyzeMirCallbacks {
             queries
                 .global_ctxt()
                 .unwrap()
-                .enter(|tcx| crate::analyzer::analyze_ensure_no_overlap(tcx));
+                .enter(|tcx| crate::analyzer::analyze(tcx));
         }
 
         Compilation::Continue

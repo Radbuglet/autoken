@@ -38,8 +38,6 @@ mod overlap;
 mod sets;
 mod sym;
 
-pub use self::overlap::analyze_ensure_no_overlap;
-
 pub fn analyze(tcx: TyCtxt<'_>) {
     let mut id_gen = 0;
 
