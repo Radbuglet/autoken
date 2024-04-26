@@ -63,15 +63,34 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .into_results_cursor(&facts.body);
 
         // Determine overlap sets.
+        // TODO: Think about the actual ordering of effects in dataflow.
         let mut overlaps = Vec::new();
 
         for (bb_loc, bb) in facts.body.basic_blocks.iter_enumerated() {
-            for (stmt_loc, stmt) in bb.statements.iter().enumerate() {
-                let loc = Location {
-                    block: bb_loc,
-                    statement_index: stmt_loc,
-                };
+            let locs = bb
+                .statements
+                .iter()
+                .enumerate()
+                .map(|(stmt_loc, stmt)| {
+                    (
+                        Location {
+                            block: bb_loc,
+                            statement_index: stmt_loc,
+                        },
+                        stmt.source_info.span,
+                    )
+                })
+                .chain(bb.terminator.as_ref().into_iter().map(|terminator| {
+                    (
+                        Location {
+                            block: bb_loc,
+                            statement_index: bb.statements.len(),
+                        },
+                        terminator.source_info.span,
+                    )
+                }));
 
+            for (loc, span) in locs {
                 results.seek_before_primary_effect(loc);
                 let state = results.get();
 
@@ -93,10 +112,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     active.push((local_key, mutability));
                 }
 
-                overlaps.push(OverlapPlace {
-                    span: stmt.source_info.span,
-                    active,
-                });
+                overlaps.push(OverlapPlace { span, active });
             }
         }
 
@@ -126,7 +142,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                         if entry.is_mut() || mutability.is_mut() {
                             tcx.dcx().span_err(
                                 overlap.span,
-                                format!("AuToken token {key} is borrowed mutably twice here"),
+                                format!("conflicting borrows on token {key} at this point"),
                             );
                         }
 
