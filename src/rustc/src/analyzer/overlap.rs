@@ -63,7 +63,6 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .into_results_cursor(&facts.body);
 
         // Determine overlap sets.
-        // TODO: Think about the actual ordering of effects in dataflow.
         let mut overlaps = Vec::new();
 
         for (bb_loc, bb) in facts.body.basic_blocks.iter_enumerated() {
@@ -112,6 +111,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     active.push((local_key, mutability));
                 }
 
+                // TODO: Optimize representation
                 overlaps.push(OverlapPlace { span, active });
             }
         }
@@ -140,6 +140,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     hash_map::Entry::Occupied(entry) => {
                         let entry = entry.into_mut();
                         if entry.is_mut() || mutability.is_mut() {
+                            // TODO: Improve diagnostics
                             tcx.dcx().span_err(
                                 overlap.span,
                                 format!("conflicting borrows on token {key} at this point"),
@@ -168,29 +169,27 @@ impl<'tcx, 'a> AnalysisDomain<'tcx> for RegionAwareLiveness<'tcx, 'a> {
     type Domain = BitSet<BorrowIndex>;
     type Direction = Forward;
 
-    const NAME: &'static str = "RegionAwareLiveness";
+    const NAME: &'static str = "region_aware_liveness";
 
-    fn bottom_value(&self, body: &Body<'tcx>) -> Self::Domain {
-        BitSet::new_empty(body.local_decls.len())
+    fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
+        BitSet::new_empty(self.start_map.len())
     }
 
-    fn initialize_start_block(&self, _body: &Body<'tcx>, _state: &mut Self::Domain) {}
+    fn initialize_start_block(&self, _body: &Body<'tcx>, _state: &mut Self::Domain) {
+        // (no locals are live on function entry)
+    }
 }
 
 impl<'tcx, 'a> RegionAwareLiveness<'tcx, 'a> {
-    fn handle_loc(&self, trans: &mut impl GenKill<BorrowIndex>, location: Location) {
-        match (
-            self.start_map.get_index_of(&location),
-            self.end_map.get(&location),
-        ) {
-            (Some(borrow), None) => {
-                trans.gen(BorrowIndex::from_usize(borrow));
-            }
-            (None, Some(borrows)) => {
-                trans.kill_all(borrows.iter().copied());
-            }
-            (Some(_), Some(_)) => unreachable!(),
-            (None, None) => {}
+    fn handle_start_loc(&self, trans: &mut impl GenKill<BorrowIndex>, location: Location) {
+        if let Some(borrow) = self.start_map.get_index_of(&location) {
+            trans.gen(BorrowIndex::from_usize(borrow));
+        }
+    }
+
+    fn handle_end_loc(&self, trans: &mut impl GenKill<BorrowIndex>, location: Location) {
+        if let Some(borrows) = self.end_map.get(&location) {
+            trans.kill_all(borrows.iter().copied());
         }
     }
 }
@@ -198,8 +197,8 @@ impl<'tcx, 'a> RegionAwareLiveness<'tcx, 'a> {
 impl<'tcx, 'a> GenKillAnalysis<'tcx> for RegionAwareLiveness<'tcx, 'a> {
     type Idx = BorrowIndex;
 
-    fn domain_size(&self, body: &Body<'tcx>) -> usize {
-        body.basic_blocks.iter().map(|bb| bb.statements.len()).sum()
+    fn domain_size(&self, _body: &Body<'tcx>) -> usize {
+        self.start_map.len()
     }
 
     fn statement_effect(
@@ -208,7 +207,16 @@ impl<'tcx, 'a> GenKillAnalysis<'tcx> for RegionAwareLiveness<'tcx, 'a> {
         _statement: &Statement<'tcx>,
         location: Location,
     ) {
-        self.handle_loc(trans, location);
+        self.handle_end_loc(trans, location);
+    }
+
+    fn before_statement_effect(
+        &mut self,
+        trans: &mut impl GenKill<Self::Idx>,
+        _statement: &Statement<'tcx>,
+        location: Location,
+    ) {
+        self.handle_start_loc(trans, location);
     }
 
     fn terminator_effect<'mir>(
@@ -217,8 +225,17 @@ impl<'tcx, 'a> GenKillAnalysis<'tcx> for RegionAwareLiveness<'tcx, 'a> {
         terminator: &'mir Terminator<'tcx>,
         location: Location,
     ) -> TerminatorEdges<'mir, 'tcx> {
-        self.handle_loc(trans, location);
+        self.handle_end_loc(trans, location);
         terminator.edges()
+    }
+
+    fn before_terminator_effect(
+        &mut self,
+        trans: &mut Self::Domain,
+        _terminator: &Terminator<'tcx>,
+        location: Location,
+    ) {
+        self.handle_start_loc(trans, location);
     }
 
     fn call_return_effect(
