@@ -17,10 +17,7 @@ use rustc_middle::{
     mir::Body,
     ty::{AssocItem, TyCtxt, Visibility},
 };
-use rustc_session::{
-    config::{ErrorOutputType, Polonius},
-    EarlyDiagCtxt,
-};
+use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 
 use crate::util::feeder::{
     feed,
@@ -61,7 +58,6 @@ impl Callbacks for AnalyzeMirCallbacks {
         // break with clever `#[no_mangle]` hacks. Luckily, this analysis also only looks at functions
         // which are reachable from the main function so this is an okay limitation.
         config.opts.unstable_opts.always_encode_mir = true;
-        config.opts.unstable_opts.polonius = Polonius::Legacy;
 
         // We also have to hack in a little environment variable to override the sysroot.
         if let Ok(ovr) = std::env::var("AUTOKEN_OVERRIDE_SYSROOT") {

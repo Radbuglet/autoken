@@ -1,19 +1,30 @@
-use core::marker::PhantomData;
-
-struct Token<T: ?Sized>(PhantomData<fn(T) -> T>);
-
-struct A;
-struct B;
+use autoken::Mut;
 
 fn main() {
-    let mut a_src = Token::<A>(PhantomData);
-    let mut b_src = Token::<B>(PhantomData);
+    unsafe {
+        autoken::absorb::<Mut<()>, _>(|| {
+            what(&());
+        });
+    }
+}
 
-    let a = dummy(&mut a_src);
-    let b = dummy(&mut b_src);
+fn what(foo: impl Foo) {
+    let a = foo.what();
+    let _ = foo.what();
     let _ = a;
 }
 
-fn dummy<'a, T: ?Sized>(_token: &'a mut Token<T>) -> &'a () {
-    &()
+trait Foo {
+    type Output;
+
+    fn what(&self) -> Self::Output;
+}
+
+impl<'a> Foo for &'a () {
+    type Output = &'a ();
+
+    fn what(&self) -> Self {
+        autoken::tie!('a => mut ());
+        &&()
+    }
 }

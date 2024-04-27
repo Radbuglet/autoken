@@ -42,7 +42,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
         did: LocalDefId,
-        mut local_key: impl FnMut(Local) -> Option<Ty<'tcx>>,
+        mut local_key: impl FnMut(Local) -> Vec<Ty<'tcx>>,
     ) -> Self {
         // Determine the start and end locations of our borrows.
         let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
@@ -98,17 +98,16 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 for borrow in state.iter() {
                     let borrow = start_map.get_index(borrow.as_usize()).unwrap().1;
                     let local = borrow.borrowed_place.local;
-                    let Some(local_key) = local_key(local) else {
-                        continue;
-                    };
 
-                    let mutability = match borrow.kind {
-                        BorrowKind::Shared => Mutability::Not,
-                        BorrowKind::Fake => unreachable!(),
-                        BorrowKind::Mut { .. } => Mutability::Mut,
-                    };
+                    for local_key in local_key(local) {
+                        let mutability = match borrow.kind {
+                            BorrowKind::Shared => Mutability::Not,
+                            BorrowKind::Fake => unreachable!(),
+                            BorrowKind::Mut { .. } => Mutability::Mut,
+                        };
 
-                    active.push((local_key, mutability));
+                        active.push((local_key, mutability));
+                    }
                 }
 
                 // TODO: Optimize representation
