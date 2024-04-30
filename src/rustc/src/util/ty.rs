@@ -1,9 +1,12 @@
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
-    fold::RegionFolder, AdtDef, Binder, EarlyBinder, FnSig, GenericArg, GenericArgsRef, Instance,
-    InstanceDef, List, Mutability, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, DebruijnIndex,
+    EarlyBinder, FnSig, GenericArg, GenericArgsRef, Instance, InstanceDef, List, Mutability,
+    ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
+
+use crate::util::hash::FxHashMap;
 
 // === Type Matching === //
 
@@ -229,9 +232,8 @@ impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
 
 #[derive(Debug, Copy, Clone)]
 pub struct BindableRegions<'tcx> {
-    pub output: Ty<'tcx>,
-    pub early_count: u32,
-    pub late_count: u32,
+    pub generalized: Ty<'tcx>,
+    pub param_count: u32,
 }
 
 impl<'tcx> BindableRegions<'tcx> {
@@ -249,20 +251,35 @@ impl<'tcx> BindableRegions<'tcx> {
         // Now, we have two types of free regions to handle: `ReBoundEarly` for early-bound regions
         // and `ReParam` for late-bound regions. Each of these can be mapped individually so let's
         // count them.
-        let mut early_count = 0;
-        let mut late_count = 0;
+        #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+        enum ReParam {
+            Early(u32),
+            Late(u32),
+        }
 
-        let _ = sig.fold_with(&mut RegionFolder::new(tcx, &mut |re, _| {
+        let mut param_map = FxHashMap::default();
+
+        let mut map_region = |debrujin: DebruijnIndex, idx: ReParam| -> Region<'tcx> {
+            let param_count = BoundVar::from_usize(param_map.len());
+            let param = *param_map.entry(idx).or_insert(param_count);
+
+            Region::new_bound(
+                tcx,
+                debrujin,
+                BoundRegion {
+                    kind: BoundRegionKind::BrAnon,
+                    var: param,
+                },
+            )
+        };
+
+        let _ = sig.fold_with(&mut RegionFolder::new(tcx, &mut |re, debrujin| {
             match &*re {
-                RegionKind::ReEarlyParam(re) => {
-                    early_count = early_count.max(re.index);
-                }
-                RegionKind::ReBound(_, re) => {
-                    late_count = late_count.max(re.var.as_u32());
-                }
+                RegionKind::ReEarlyParam(re) => map_region(debrujin, ReParam::Early(re.index)),
+                RegionKind::ReBound(_, re) => map_region(debrujin, ReParam::Late(re.var.as_u32())),
 
                 // These can just be ignored since they can only take on one value.
-                RegionKind::ReStatic => {}
+                RegionKind::ReStatic => re,
 
                 // These are impossible.
                 // TODO: Justify
@@ -274,19 +291,17 @@ impl<'tcx> BindableRegions<'tcx> {
                 }
 
                 // Just ignore these—the crate will already not compile.
-                RegionKind::ReError(_) => {}
+                RegionKind::ReError(_) => re,
             }
-            re
         }));
 
         Self {
-            output: sig,
-            early_count,
-            late_count,
+            generalized: sig,
+            param_count: param_map.len() as u32,
         }
     }
 
-    pub fn var_count(&self) -> u32 {
-        self.early_count + self.late_count
+    pub fn get_linked(&self, name: Symbol) -> Option<BoundVar> {
+        todo!();
     }
 }
