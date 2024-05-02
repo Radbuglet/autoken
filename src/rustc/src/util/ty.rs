@@ -1,10 +1,12 @@
 use rustc_hir::def_id::DefId;
+use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, DebruijnIndex,
     EarlyBinder, FnSig, GenericArg, GenericArgsRef, Instance, InstanceDef, List, Mutability,
     ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
+use rustc_trait_selection::traits::ObligationCtxt;
 
 use crate::util::hash::FxHashMap;
 
@@ -228,6 +230,47 @@ impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
     }
 }
 
+// === `normalize_preserving_regions` === //
+
+pub fn normalize_preserving_regions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
+    ty: Ty<'tcx>,
+) -> Ty<'tcx> {
+    // In case you're wondering, we have an `infcx` here since normalization has a lot of special
+    // superpowers in the type-inference scenario. If we're normalizing types without inference
+    // variables, this should just perform normalization logic similar to what `normalize_erasing_regions`
+    // gives us.
+    //
+    // N.B. this doesn't exercise the same code paths as `normalize_erasing_regions`...
+    //
+    // - `TyCtxt::try_normalize_erasing_regions`:
+    //   - `TyCtxt::erase_regions`
+    //   - `Ty::try_fold_with::<TryNormalizeAfterErasingRegionsFolder>`
+    //     - For each type and constant...
+    //       - `TyCtxt::try_normalize_generic_arg_after_erasing_regions`
+    //         - `InferCtxt's At::query_normalize()`
+    //           - If new solver: `rustc_trait_selection::solve::normalize::deeply_normalize_with_skipped_universes`
+    //           - If old solver: `Ty::try_fold_with::<QueryNormalizer>`
+    //         - `InferCtxt::resolve_vars_if_possible`
+    //         - `TyCtxt::erase_regions`
+    //
+    //
+    // Meanwhile, we do:
+    //
+    // - `ObligationCtxt::deeply_normalize`
+    //   - `NormalizeExt::deeply_normalize`
+    //     - If new solver: `rustc_trait_selection::solve::normalize::deeply_normalize_with_skipped_universes`
+    //     - If old solver:
+    //       - `NormalizeExt::normalize`
+    //         - TODO
+    //       - TODO
+    //
+    ObligationCtxt::new(&tcx.infer_ctxt().build())
+        .deeply_normalize(&ObligationCause::dummy(), param_env, ty)
+        .unwrap()
+}
+
 // === BindableRegions === //
 
 #[derive(Debug, Copy, Clone)]
@@ -301,7 +344,12 @@ impl<'tcx> BindableRegions<'tcx> {
         }
     }
 
-    pub fn get_linked(&self, name: Symbol) -> Option<BoundVar> {
+    pub fn get_linked(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
+        name: Symbol,
+    ) -> Option<BoundVar> {
         todo!();
     }
 }
