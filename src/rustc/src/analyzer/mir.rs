@@ -17,9 +17,9 @@ use rustc_middle::{
 use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
 
-use crate::util::{
-    ty::{err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure},
-    ty_legacy::instantiate_ignoring_regions,
+use crate::util::ty::{
+    err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
+    instantiate_preserving_regions,
 };
 
 type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
@@ -388,7 +388,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         };
 
         // Figure out its return type with all our body's generic parameters substituted in.
-        let callee_out = instantiate_ignoring_regions(
+        let callee_out = instantiate_preserving_regions(
             self.tcx,
             get_fn_sig_maybe_closure(self.tcx, *callee_id)
                 .skip_binder()
