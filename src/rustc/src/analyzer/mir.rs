@@ -19,7 +19,7 @@ use rustc_target::abi::FieldIdx;
 
 use crate::util::ty::{
     err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
-    instantiate_preserving_regions, BindableRegions,
+    instantiate_preserving_regions, BindableRegions, MaybeConcretizedArgs,
 };
 
 type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
@@ -360,6 +360,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         bb: BasicBlock,
         key: TokenKey<'tcx>,
         mutability: Mutability,
+        temp_args: MaybeConcretizedArgs<'tcx>,
         mut is_tied: impl FnMut(Region<'tcx>) -> bool,
     ) {
         // Determine where the function call's return type is stored and the name of the basic block
@@ -398,18 +399,15 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         );
 
         // TODO:
-        eprintln!(
-            "{:?}",
-            BindableRegions::new(
-                self.tcx,
-                ParamEnv::reveal_all(),
-                Instance {
-                    def: InstanceDef::Item(*callee_id),
-                    args: callee_generics,
-                },
-            )
-            .generalized
-        );
+        BindableRegions::new(
+            self.tcx,
+            ParamEnv::reveal_all(),
+            Instance {
+                def: InstanceDef::Item(*callee_id),
+                args: callee_generics,
+            },
+        )
+        .get_linked(self.tcx, temp_args, super::sym::unnamed.get());
 
         // Remap these regions to inference variables.
         let mut var_assignments = FxHashMap::default();

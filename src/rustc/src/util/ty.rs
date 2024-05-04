@@ -564,7 +564,7 @@ impl<'tcx> BindableRegions<'tcx> {
                 | RegionKind::ReVar(_)
                 | RegionKind::RePlaceholder(_)
                 | RegionKind::ReErased => {
-                    unreachable!()
+                    unreachable!();
                 }
 
                 // Just ignore these—the crate will already not compile.
@@ -596,6 +596,8 @@ impl<'tcx> BindableRegions<'tcx> {
         args: MaybeConcretizedArgs<'tcx>,
         name: Symbol,
     ) -> Option<BoundVar> {
+        eprintln!("generalized = {:?}", self.generalized);
+
         // Instantiate our generic signature with the instance's information.
         let trait_sig = instantiate_ty_and_normalize_preserving_regions(
             tcx,
@@ -617,7 +619,6 @@ impl<'tcx> BindableRegions<'tcx> {
 
         // Now, get our impl's concrete signature and instantiate it too.
         let concrete_sig = get_fn_sig_maybe_closure(tcx, concrete.def_id())
-            .skip_binder()
             .skip_binder()
             .output();
 

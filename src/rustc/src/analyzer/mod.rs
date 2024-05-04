@@ -198,9 +198,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                         continue;
                     };
 
-                    body_mutator.tie_token_to_its_return(bb, TokenKey(ty), mutability, |region| {
-                        region == mapped_region
-                    });
+                    body_mutator.tie_token_to_its_return(
+                        bb,
+                        TokenKey(ty),
+                        mutability,
+                        instance.args,
+                        |region| region == mapped_region,
+                    );
                 }
             }
         }

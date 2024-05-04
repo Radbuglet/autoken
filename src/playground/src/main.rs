@@ -3,28 +3,26 @@ use autoken::Mut;
 fn main() {
     unsafe {
         autoken::absorb::<Mut<()>, _>(|| {
-            what(&());
+            what(());
         });
     }
 }
 
 fn what(foo: impl Foo) {
-    let a = foo.what();
-    let _ = foo.what();
-    let _ = a;
+    foo.what();
 }
 
-trait Foo {
-    type Output;
+trait Foo: 'static {
+    type Output<'a>;
 
-    fn what(&self) -> Self::Output;
+    fn what<'a, 'b>(&'a self) -> &'b Self::Output<'a>;
 }
 
-impl<'a> Foo for &'a () {
-    type Output = &'a ();
+impl Foo for () {
+    type Output<'b> = &'b ();
 
-    fn what(&self) -> Self {
-        autoken::tie!('a => mut ());
+    fn what<'b, 'c>(&'b self) -> &'c &'b () {
+        autoken::tie!('b => mut ());
         &&()
     }
 }
