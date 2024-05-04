@@ -2,13 +2,15 @@ use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
-    DebruijnIndex, EarlyBinder, FnSig, GenericArgsRef, Instance, InstanceDef, Mutability, ParamEnv,
-    Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    DebruijnIndex, EarlyBinder, FnSig, GenericArg, GenericArgKind, GenericArgsRef, Instance,
+    InstanceDef, List, Mutability, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
 
 use crate::util::hash::FxHashMap;
+
+use super::hash::FxHashSet;
 
 // === Type Matching === //
 
@@ -595,7 +597,8 @@ impl<'tcx> BindableRegions<'tcx> {
         tcx: TyCtxt<'tcx>,
         args: MaybeConcretizedArgs<'tcx>,
         name: Symbol,
-    ) -> Option<BoundVar> {
+    ) -> Option<FxHashSet<BoundVar>> {
+        eprintln!("name = {name:?}");
         eprintln!("generalized = {:?}", self.generalized);
 
         // Instantiate our generic signature with the instance's information.
@@ -631,6 +634,159 @@ impl<'tcx> BindableRegions<'tcx> {
 
         eprintln!("concrete_sig = {concrete_sig:?}");
 
-        Some(BoundVar::from_u32(0))
+        // Figure out the types' correspondences.
+        let mut cx = LinkTraversalCx {
+            _tcx: tcx,
+            tied: Some(FxHashSet::default()),
+            scan_name: name,
+            passed_binders: 0,
+        };
+        cx.traverse_types(concrete_sig.skip_binder(), trait_sig.skip_binder());
+
+        let result = cx.tied.filter(|s| !s.is_empty());
+        eprintln!("result = {result:?}");
+        result
+    }
+}
+
+struct LinkTraversalCx<'tcx> {
+    _tcx: TyCtxt<'tcx>,
+    tied: Option<FxHashSet<BoundVar>>,
+    scan_name: Symbol,
+    passed_binders: u32,
+}
+
+impl<'tcx> LinkTraversalCx<'tcx> {
+    fn traverse(&mut self, left: GenericArgKind<'tcx>, right: GenericArgKind<'tcx>) {
+        match (left, right) {
+            (GenericArgKind::Lifetime(left), GenericArgKind::Lifetime(right)) => {
+                self.traverse_lifetimes(left, right);
+            }
+            (GenericArgKind::Type(left), GenericArgKind::Type(right)) => {
+                self.traverse_types(left, right);
+            }
+
+            // Ignored: constants don't affect linked regions
+            (GenericArgKind::Const(_), GenericArgKind::Const(_)) => {}
+            _ => unreachable!(),
+        }
+    }
+
+    fn traverse_lists(
+        &mut self,
+        left: impl IntoIterator<Item = GenericArgKind<'tcx>>,
+        right: impl IntoIterator<Item = GenericArgKind<'tcx>>,
+    ) {
+        for (left, right) in left.into_iter().zip(right.into_iter()) {
+            self.traverse(left, right);
+        }
+    }
+
+    fn traverse_types(&mut self, left: Ty<'tcx>, right: Ty<'tcx>) {
+        match (*left.kind(), *right.kind()) {
+            (TyKind::Adt(_, left), TyKind::Adt(_, right)) => {
+                self.traverse_generics(left, right);
+            }
+            (TyKind::Array(left, _), TyKind::Array(right, _)) => {
+                self.traverse_types(left, right);
+            }
+            (TyKind::Slice(left), TyKind::Slice(right)) => {
+                self.traverse_types(left, right);
+            }
+            (TyKind::RawPtr(left), TyKind::RawPtr(right)) => {
+                self.traverse_types(left.ty, right.ty);
+            }
+            (TyKind::Ref(left_re, left_ty, _), TyKind::Ref(right_re, right_ty, _)) => {
+                self.traverse_lifetimes(left_re, right_re);
+                self.traverse_types(left_ty, right_ty);
+            }
+            (TyKind::FnDef(_, left), TyKind::FnDef(_, right)) => {
+                self.traverse_generics(left, right);
+            }
+            (TyKind::FnPtr(left), TyKind::FnPtr(right)) => {
+                self.passed_binders += 1;
+                self.traverse_type_lists(
+                    left.skip_binder().inputs_and_output,
+                    right.skip_binder().inputs_and_output,
+                );
+                self.passed_binders -= 1;
+            }
+            (TyKind::Dynamic(_left_ty, left_re, _), TyKind::Dynamic(_right_ty, right_re, _)) => {
+                self.traverse_lifetimes(left_re, right_re);
+                // TODO: Handle type traversals
+            }
+            (TyKind::Closure(_, left), TyKind::Closure(_, right)) => {
+                self.traverse_generics(left, right);
+            }
+            (TyKind::Tuple(left), TyKind::Tuple(right)) => {
+                self.traverse_type_lists(left, right);
+            }
+
+            // Unsupported.
+            (TyKind::CoroutineClosure(..), TyKind::CoroutineClosure(..)) => todo!(),
+            (TyKind::Coroutine(..), TyKind::Coroutine(..)) => todo!(),
+            (TyKind::CoroutineWitness(..), TyKind::CoroutineWitness(..)) => todo!(),
+
+            // All these types are dead ends.
+            (TyKind::Bool, TyKind::Bool) => {}
+            (TyKind::Char, TyKind::Char) => {}
+            (TyKind::Int(..), TyKind::Int(..)) => {}
+            (TyKind::Uint(..), TyKind::Uint(..)) => {}
+            (TyKind::Float(..), TyKind::Float(..)) => {}
+            (TyKind::Foreign(..), TyKind::Foreign(..)) => {}
+            (TyKind::Str, TyKind::Str) => {}
+            (TyKind::Never, TyKind::Never) => {}
+
+            // We just ignore errors since this crate is already rejected and
+            // we have to do something sensible.
+            (TyKind::Error(..), TyKind::Error(..)) => {}
+
+            // Non-applicable.
+            (TyKind::Infer(..), TyKind::Infer(..)) => unreachable!(),
+            (TyKind::Placeholder(..), TyKind::Placeholder(..)) => unreachable!(),
+            (TyKind::Param(..), TyKind::Param(..)) => unreachable!(),
+            (TyKind::Alias(..), TyKind::Alias(..)) => unreachable!(),
+            (TyKind::Bound(..), TyKind::Bound(..)) => unreachable!(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn traverse_lifetimes(&mut self, left: Region<'tcx>, right: Region<'tcx>) {
+        eprintln!("traverse_lifetimes({left:?}, {right:?})");
+
+        // Ensure that this is the left region we're trying to bind.
+        // TODO: We might need more validation.
+        if left.get_name() != Some(self.scan_name) {
+            return;
+        }
+
+        // If this is a bindable region...
+        match right.kind() {
+            RegionKind::ReBound(debrujin, right) if debrujin.as_u32() == self.passed_binders => {
+                // ...add it.
+                if let Some(tied) = &mut self.tied {
+                    tied.insert(right.var);
+                }
+            }
+
+            // Otherwise, invalidate the operation.
+            _ => {
+                self.tied = None;
+            }
+        }
+    }
+
+    fn traverse_generics(&mut self, left: GenericArgsRef<'tcx>, right: GenericArgsRef<'tcx>) {
+        self.traverse_lists(
+            left.iter().map(GenericArg::unpack),
+            right.iter().map(GenericArg::unpack),
+        );
+    }
+
+    fn traverse_type_lists(&mut self, left: &'tcx List<Ty<'tcx>>, right: &'tcx List<Ty<'tcx>>) {
+        self.traverse_lists(
+            left.iter().map(GenericArgKind::Type),
+            right.iter().map(GenericArgKind::Type),
+        )
     }
 }

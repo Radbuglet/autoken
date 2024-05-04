@@ -19,10 +19,10 @@ trait Foo: 'static {
 }
 
 impl Foo for () {
-    type Output<'b> = &'b ();
+    type Output<'b> = fn() -> &'b ();
 
-    fn what<'b, 'c>(&'b self) -> &'c &'b () {
+    fn what<'b, 'c>(&'b self) -> &'c Self::Output<'b> {
         autoken::tie!('b => mut ());
-        &&()
+        todo!();
     }
 }

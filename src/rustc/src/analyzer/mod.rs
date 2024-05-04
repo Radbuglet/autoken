@@ -203,6 +203,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                         TokenKey(ty),
                         mutability,
                         instance.args,
+                        tied,
                         |region| region == mapped_region,
                     );
                 }

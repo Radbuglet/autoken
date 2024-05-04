@@ -361,6 +361,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         key: TokenKey<'tcx>,
         mutability: Mutability,
         temp_args: MaybeConcretizedArgs<'tcx>,
+        temp_name: Symbol,
         mut is_tied: impl FnMut(Region<'tcx>) -> bool,
     ) {
         // Determine where the function call's return type is stored and the name of the basic block
@@ -407,7 +408,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 args: callee_generics,
             },
         )
-        .get_linked(self.tcx, temp_args, super::sym::unnamed.get());
+        .get_linked(self.tcx, temp_args, temp_name);
 
         // Remap these regions to inference variables.
         let mut var_assignments = FxHashMap::default();
