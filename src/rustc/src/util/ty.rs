@@ -2,8 +2,8 @@ use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
-    DebruijnIndex, EarlyBinder, FnSig, GenericArg, GenericArgsRef, Instance, InstanceDef, List,
-    Mutability, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    DebruijnIndex, EarlyBinder, FnSig, GenericArgsRef, Instance, InstanceDef, Mutability, ParamEnv,
+    Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
@@ -140,34 +140,23 @@ pub trait GenericTransformer<'tcx>: Sized + Copy + 'tcx {
         iter.into_iter()
             .map(move |arg| self.instantiate_arg(tcx, param_env, arg))
     }
-
-    fn instantiate_args(
-        self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-        args: &'tcx List<GenericArg<'tcx>>,
-    ) -> &'tcx List<GenericArg<'tcx>> {
-        self.instantiate_arg(tcx, param_env, args)
-    }
-
-    fn instantiate_instance(
-        self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-        func: Instance<'tcx>,
-    ) -> Instance<'tcx> {
-        self.instantiate_arg(tcx, param_env, func)
-    }
 }
 
-// === Instance === //
+impl<'tcx> GenericTransformer<'tcx> for GenericArgsRef<'tcx> {
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        tcx.instantiate_and_normalize_erasing_regions(self, param_env, EarlyBinder::bind(ty))
+    }
+}
 
 impl<'tcx> GenericTransformer<'tcx> for Instance<'tcx> {
     fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        self.instantiate_mir_and_normalize_erasing_regions(tcx, param_env, EarlyBinder::bind(ty))
+        self.args.instantiate_arg(tcx, param_env, ty)
     }
 }
 
@@ -211,6 +200,19 @@ impl<'tcx> MaybeConcretizedFunc<'tcx> {
     }
 }
 
+impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedArgs<'tcx> {
+    fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        if let Some(concretized) = self {
+            concretized.instantiate_arg(tcx, param_env, ty)
+        } else {
+            ty
+        }
+    }
+}
+
 impl<'tcx> GenericTransformer<'tcx> for MaybeConcretizedFunc<'tcx> {
     fn instantiate_arg<T>(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: T) -> T
     where
@@ -230,7 +232,7 @@ pub fn instantiate_ty_and_normalize_preserving_regions<'tcx, F>(
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
     ty: F,
-    args: &[GenericArg<'tcx>],
+    args: MaybeConcretizedArgs<'tcx>,
 ) -> F
 where
     F: TypeFoldable<TyCtxt<'tcx>>,
@@ -245,18 +247,22 @@ where
 pub fn instantiate_preserving_regions<'tcx, F>(
     tcx: TyCtxt<'tcx>,
     ty: F,
-    args: &[GenericArg<'tcx>],
+    args: MaybeConcretizedArgs<'tcx>,
 ) -> F
 where
     F: TypeFoldable<TyCtxt<'tcx>>,
 {
-    ty.fold_with(
-        &mut instantiate_preserving_regions_util::ArgFolderIgnoreRegions {
-            tcx,
-            args,
-            binders_passed: 0,
-        },
-    )
+    if let Some(args) = args {
+        ty.fold_with(
+            &mut instantiate_preserving_regions_util::ArgFolderIgnoreRegions {
+                tcx,
+                args,
+                binders_passed: 0,
+            },
+        )
+    } else {
+        ty
+    }
 }
 
 mod instantiate_preserving_regions_util {
@@ -507,13 +513,13 @@ pub struct BindableRegions<'tcx> {
 impl<'tcx> BindableRegions<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, instance: Instance<'tcx>) -> Self {
         // Let's grab the signature for this instance.
-        let sig = get_fn_sig_maybe_closure(tcx, instance.def_id());
+        let sig = instantiate_preserving_regions(
+            tcx,
+            get_fn_sig_maybe_closure(tcx, instance.def_id()).skip_binder(),
+            Some(instance.args),
+        );
 
-        // The first binder simply tells us that this function has early bound regions and types.
-        let sig = sig.skip_binder();
-
-        // The second binder gives us late-bound regions. We want them to be free so let's skip it
-        // too.
+        // The inner binder gives us late-bound regions. We want them to be free so let's skip it.
         let sig = sig.skip_binder();
 
         // Let's get the return type since that's what we're interested in.
@@ -587,7 +593,7 @@ impl<'tcx> BindableRegions<'tcx> {
     pub fn get_linked(
         &self,
         tcx: TyCtxt<'tcx>,
-        args: GenericArgsRef<'tcx>,
+        args: MaybeConcretizedArgs<'tcx>,
         name: Symbol,
     ) -> Option<BoundVar> {
         // Instantiate our generic signature with the instance's information.
@@ -600,20 +606,29 @@ impl<'tcx> BindableRegions<'tcx> {
 
         eprintln!("trait_sig = {trait_sig:?}");
 
-        // // Now, get our impl's concrete signature and instantiate it too.
-        // let concrete_sig = get_fn_sig_maybe_closure(tcx, concrete.def_id())
-        //     .skip_binder()
-        //     .skip_binder()
-        //     .output();
-        //
-        //         let concrete_sig = instantiate_ty_and_normalize_preserving_regions(
-        //             tcx,
-        //             param_env,
-        //             concrete_sig,
-        //             concrete.args,
-        //         );
-        //
-        //         eprintln!("concrete_sig = {concrete_sig:?}");
+        // Determine the concrete function we're calling.
+        let concrete = try_resolve_instance(
+            tcx,
+            self.param_env,
+            args.instantiate_arg(tcx, self.param_env, self.instance),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Now, get our impl's concrete signature and instantiate it too.
+        let concrete_sig = get_fn_sig_maybe_closure(tcx, concrete.def_id())
+            .skip_binder()
+            .skip_binder()
+            .output();
+
+        let concrete_sig = instantiate_ty_and_normalize_preserving_regions(
+            tcx,
+            self.param_env,
+            concrete_sig,
+            Some(concrete.args),
+        );
+
+        eprintln!("concrete_sig = {concrete_sig:?}");
 
         Some(BoundVar::from_u32(0))
     }

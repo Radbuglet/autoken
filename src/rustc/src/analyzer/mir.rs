@@ -9,9 +9,9 @@ use rustc_middle::{
     },
     ty::{
         fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, List,
-        Region, RegionKind, Ty, TyCtxt, TyKind, TypeAndMut, TypeFoldable, UniverseIndex, UserType,
-        Variance,
+        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, Instance,
+        InstanceDef, List, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeAndMut,
+        TypeFoldable, UniverseIndex, UserType, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
@@ -19,7 +19,7 @@ use rustc_target::abi::FieldIdx;
 
 use crate::util::ty::{
     err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
-    instantiate_preserving_regions,
+    instantiate_preserving_regions, BindableRegions,
 };
 
 type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
@@ -394,7 +394,21 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 .skip_binder()
                 .skip_binder()
                 .output(),
-            callee_generics,
+            Some(callee_generics),
+        );
+
+        // TODO:
+        eprintln!(
+            "{:?}",
+            BindableRegions::new(
+                self.tcx,
+                ParamEnv::reveal_all(),
+                Instance {
+                    def: InstanceDef::Item(*callee_id),
+                    args: callee_generics,
+                },
+            )
+            .generalized
         );
 
         // Remap these regions to inference variables.
