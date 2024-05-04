@@ -8,18 +8,17 @@ use rustc_middle::{
         TerminatorKind, UserTypeProjection,
     },
     ty::{
-        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserType,
-        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, Instance,
-        InstanceDef, List, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeAndMut,
-        TypeFoldable, UniverseIndex, UserType, Variance,
+        BoundRegion, BoundRegionKind, Canonical, CanonicalUserType, CanonicalUserTypeAnnotation,
+        CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, Instance, InstanceDef, List, ParamEnv,
+        Region, Ty, TyCtxt, TyKind, TypeAndMut, UniverseIndex, UserType, Variance,
     },
 };
 use rustc_span::{Symbol, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
 
 use crate::util::ty::{
-    err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
-    instantiate_preserving_regions, BindableRegions, MaybeConcretizedArgs,
+    err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure, BindableRegions,
+    MaybeConcretizedArgs,
 };
 
 type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
@@ -362,7 +361,6 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         mutability: Mutability,
         temp_args: MaybeConcretizedArgs<'tcx>,
         temp_name: Symbol,
-        mut is_tied: impl FnMut(Region<'tcx>) -> bool,
     ) {
         // Determine where the function call's return type is stored and the name of the basic block
         // jumped to immediately after the call.
@@ -390,83 +388,17 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         };
 
         // Figure out its return type with all our body's generic parameters substituted in.
-        let callee_out = instantiate_preserving_regions(
-            self.tcx,
-            get_fn_sig_maybe_closure(self.tcx, *callee_id)
-                .skip_binder()
-                .skip_binder()
-                .output(),
-            Some(callee_generics),
-        );
-
-        // TODO:
-        BindableRegions::new(
+        let br = BindableRegions::new(
             self.tcx,
             ParamEnv::reveal_all(),
             Instance {
                 def: InstanceDef::Item(*callee_id),
                 args: callee_generics,
             },
-        )
-        .get_linked(self.tcx, temp_args, temp_name);
+        );
+        let fn_tied = br.get_linked(self.tcx, temp_args, temp_name).unwrap();
 
-        // Remap these regions to inference variables.
-        let mut var_assignments = FxHashMap::default();
-        let mut var_assignment_count = 1;
-
-        let fn_result =
-            callee_out.fold_with(&mut RegionFolder::new(self.tcx, &mut |region, index| {
-                match region.kind() {
-                    // Mapped regions
-                    RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
-                        if index == DebruijnIndex::from_u32(0) {
-                            let idx = if is_tied(region) {
-                                0
-                            } else {
-                                var_assignment_count
-                            };
-
-                            let bound_var = *var_assignments.entry(region).or_insert_with(|| {
-                                let bv = BoundVar::from_u32(idx);
-                                var_assignment_count += 1;
-                                bv
-                            });
-
-                            Region::new_bound(
-                                self.tcx,
-                                DebruijnIndex::from_u32(0),
-                                BoundRegion {
-                                    kind: BoundRegionKind::BrAnon,
-                                    var: bound_var,
-                                },
-                            )
-                        } else {
-                            region
-                        }
-                    }
-                    RegionKind::ReErased => {
-                        // TODO: Make this less pessimistic.
-                        Region::new_bound(
-                            self.tcx,
-                            DebruijnIndex::from_u32(0),
-                            BoundRegion {
-                                kind: BoundRegionKind::BrAnon,
-                                var: BoundVar::from_u32(0),
-                            },
-                        )
-                    }
-
-                    // Unaffected regions
-                    RegionKind::ReBound(_, _) => region,
-                    RegionKind::ReStatic => region,
-
-                    // Non-applicable regions
-                    RegionKind::ReVar(_) => unreachable!(),
-                    RegionKind::RePlaceholder(_) => unreachable!(),
-                    RegionKind::ReError(_) => unreachable!(),
-                }
-            }));
-
+        let fn_result = br.generalized.skip_binder();
         let fn_result_inferred = call_out_place.ty(&self.body.local_decls, self.tcx).ty;
 
         // Create the ascription type from this function.
@@ -480,7 +412,8 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                         DebruijnIndex::from_u32(0),
                         BoundRegion {
                             kind: BoundRegionKind::BrAnon,
-                            var: BoundVar::from_u32(0),
+                            // TODO: Extract multiple lifetimes.
+                            var: *fn_tied.iter().next().unwrap(),
                         },
                     ),
                     TypeAndMut {
@@ -516,7 +449,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     value: UserType::Ty(tuple_binder),
                     max_universe: UniverseIndex::ROOT,
                     variables: self.tcx.mk_canonical_var_infos(
-                        &(0..var_assignment_count)
+                        &(0..br.param_count)
                             .map(|_| CanonicalVarInfo {
                                 kind: CanonicalVarKind::Region(UniverseIndex::ROOT),
                             })

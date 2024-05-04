@@ -24,7 +24,7 @@ use crate::util::{
         iter_all_local_def_ids, try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance,
         TerminalCallKind,
     },
-    ty::{find_region_with_name, get_fn_sig_maybe_closure, MaybeConcretizedFunc},
+    ty::MaybeConcretizedFunc,
     ty_legacy::try_resolve_mono_args_for_func,
 };
 
@@ -182,29 +182,12 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 body_mutator.ensure_not_borrowed_at(bb, TokenKey(ty), mutability);
 
                 if let Some(tied) = tied {
-                    // Compute the type as which the function result is going to be bound.
-                    let Ok(mapped_region) = find_region_with_name(
-                        tcx,
-                        // N.B. we need to use the monomorphized ID since the non-monomorphized
-                        //  ID could just be the parent trait function def, which won't have the
-                        //  user's regions.
-                        get_fn_sig_maybe_closure(tcx, target_instance_mono.def_id())
-                            .skip_binder()
-                            .skip_binder()
-                            .output(),
-                        tied,
-                    ) else {
-                        // TODO: Log here just in case.
-                        continue;
-                    };
-
                     body_mutator.tie_token_to_its_return(
                         bb,
                         TokenKey(ty),
                         mutability,
                         instance.args,
                         tied,
-                        |region| region == mapped_region,
                     );
                 }
             }

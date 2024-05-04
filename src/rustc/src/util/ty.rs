@@ -2,13 +2,12 @@ use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
-    DebruijnIndex, EarlyBinder, FnSig, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceDef, List, Mutability, ParamEnv, Region, RegionKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    EarlyBinder, ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgsRef, Instance,
+    InstanceDef, List, Mutability, ParamEnv, Region, RegionKind, TermKind, Ty, TyCtxt, TyKind,
+    TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
-
-use crate::util::hash::FxHashMap;
 
 use super::hash::FxHashSet;
 
@@ -530,52 +529,20 @@ impl<'tcx> BindableRegions<'tcx> {
         // Now, we have two types of free regions to handle: `ReBoundEarly` for early-bound regions
         // and `ReParam` for late-bound regions. Each of these can be mapped individually so let's
         // count them.
-        #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-        enum ReParam {
-            Early(u32),
-            Late(u32),
-        }
+        let mut param_count = 0;
 
-        let mut param_map = FxHashMap::default();
-
-        let mut map_region = |debrujin: DebruijnIndex, idx: ReParam| -> Region<'tcx> {
-            let param_count = BoundVar::from_usize(param_map.len());
-            let param = *param_map.entry(idx).or_insert(param_count);
-
-            Region::new_bound(
+        let sig = sig.fold_with(&mut RegionFolder::new(tcx, &mut |_, debrujin| {
+            let re = Region::new_bound(
                 tcx,
                 debrujin,
                 BoundRegion {
+                    var: BoundVar::from_u32(param_count),
                     kind: BoundRegionKind::BrAnon,
-                    var: param,
                 },
-            )
-        };
-
-        let sig = sig.fold_with(&mut RegionFolder::new(tcx, &mut |re, debrujin| {
-            match &*re {
-                RegionKind::ReEarlyParam(re) => map_region(debrujin, ReParam::Early(re.index)),
-                RegionKind::ReBound(_, re) => map_region(debrujin, ReParam::Late(re.var.as_u32())),
-
-                // These can just be ignored since they can only take on one value.
-                RegionKind::ReStatic => re,
-
-                // These are impossible.
-                // TODO: Justify
-                RegionKind::ReLateParam(_)
-                | RegionKind::ReVar(_)
-                | RegionKind::RePlaceholder(_)
-                | RegionKind::ReErased => {
-                    unreachable!();
-                }
-
-                // Just ignore these—the crate will already not compile.
-                RegionKind::ReError(_) => re,
-            }
+            );
+            param_count += 1;
+            re
         }));
-
-        // Wrap the generalized type in a binder.
-        let param_count = param_map.len() as u32;
 
         let sig = Binder::bind_with_vars(
             sig,
@@ -643,6 +610,7 @@ impl<'tcx> BindableRegions<'tcx> {
         };
         cx.traverse_types(concrete_sig.skip_binder(), trait_sig.skip_binder());
 
+        // TODO: Think long and hard about these rules.
         let result = cx.tied.filter(|s| !s.is_empty());
         eprintln!("result = {result:?}");
         result
@@ -711,9 +679,9 @@ impl<'tcx> LinkTraversalCx<'tcx> {
                 );
                 self.passed_binders -= 1;
             }
-            (TyKind::Dynamic(_left_ty, left_re, _), TyKind::Dynamic(_right_ty, right_re, _)) => {
+            (TyKind::Dynamic(left_ty, left_re, _), TyKind::Dynamic(right_ty, right_re, _)) => {
                 self.traverse_lifetimes(left_re, right_re);
-                // TODO: Handle type traversals
+                self.traverse_predicate_lists(left_ty, right_ty);
             }
             (TyKind::Closure(_, left), TyKind::Closure(_, right)) => {
                 self.traverse_generics(left, right);
@@ -781,6 +749,42 @@ impl<'tcx> LinkTraversalCx<'tcx> {
             left.iter().map(GenericArg::unpack),
             right.iter().map(GenericArg::unpack),
         );
+    }
+
+    fn traverse_predicate_lists(
+        &mut self,
+        left: &'tcx List<Binder<ExistentialPredicate<'tcx>>>,
+        right: &'tcx List<Binder<ExistentialPredicate<'tcx>>>,
+    ) {
+        self.passed_binders += 1;
+        for (left, right) in left.iter().zip(right.iter()) {
+            let left = left.skip_binder();
+            let right = right.skip_binder();
+
+            match (left, right) {
+                (ExistentialPredicate::Trait(left), ExistentialPredicate::Trait(right)) => {
+                    self.traverse_generics(left.args, right.args);
+                }
+                (
+                    ExistentialPredicate::Projection(left),
+                    ExistentialPredicate::Projection(right),
+                ) => {
+                    self.traverse_generics(left.args, right.args);
+
+                    match (left.term.unpack(), right.term.unpack()) {
+                        (TermKind::Ty(left), TermKind::Ty(right)) => {
+                            self.traverse_types(left, right);
+                        }
+                        (TermKind::Const(_), TermKind::Const(_)) => {}
+                        _ => unreachable!(),
+                    }
+                }
+                (ExistentialPredicate::AutoTrait(_), ExistentialPredicate::AutoTrait(_)) => {}
+                _ => unreachable!(),
+            }
+        }
+
+        self.passed_binders -= 1;
     }
 
     fn traverse_type_lists(&mut self, left: &'tcx List<Ty<'tcx>>, right: &'tcx List<Ty<'tcx>>) {
