@@ -76,16 +76,22 @@ pub fn find_region_with_name<'tcx>(
         region
     }));
 
-    found_region.ok_or_else(|| {
-        let mut found = Vec::new();
-        let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
-            if let Some(name) = region.get_name() {
-                found.push(name);
-            }
-            region
-        }));
-        found
-    })
+    found_region.ok_or_else(|| extract_free_region_list(tcx, ty, |re| re.get_name()))
+}
+
+pub fn extract_free_region_list<'tcx, R>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    mut f: impl FnMut(Region<'tcx>) -> Option<R>,
+) -> Vec<R> {
+    let mut found = Vec::new();
+    let _ = ty.fold_with(&mut RegionFolder::new(tcx, &mut |region, _idx| {
+        if let Some(region) = f(region) {
+            found.push(region);
+        }
+        region
+    }));
+    found
 }
 
 pub fn err_failed_to_find_region(tcx: TyCtxt<'_>, span: Span, name: Symbol, symbols: &[Symbol]) {

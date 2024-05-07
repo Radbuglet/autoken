@@ -1,14 +1,20 @@
+use petgraph::{visit::Dfs, Graph};
 use rustc_borrowck::consumers::{
     get_body_with_borrowck_facts, BodyWithBorrowckFacts, Borrows, ConsumerOptions,
 };
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
-    mir::{traversal::reverse_postorder, BasicBlock, Body, Location, Statement, Terminator},
-    ty::TyCtxt,
+    mir::{traversal::reverse_postorder, BasicBlock, Body, Local, Location, Statement, Terminator},
+    ty::{Region, RegionVid, TyCtxt},
 };
 use rustc_mir_dataflow::{
     Analysis, AnalysisDomain, Forward, Results, ResultsVisitable, ResultsVisitor,
+};
+
+use crate::util::{
+    hash::{FxHashMap, FxHashSet},
+    ty::extract_free_region_list,
 };
 
 // === Analysis === //
@@ -28,6 +34,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     }
 
     pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
+        eprintln!("=== {did:?} === ");
+
         // Determine the start and end locations of our borrows.
         // FIXME: Does not use `tcx.local_def_id_to_hir_id(def).owner` to determine the origin of the
         //  inference context.
@@ -43,9 +51,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .into_engine(tcx, &facts.body)
         .iterate_to_fixpoint();
 
-        let mut visitor = BorrowckVisitor { facts: &facts };
+        let mut visitor = BorrowckVisitor { _facts: &facts };
 
-        eprintln!("=== {did:?} ===");
         rustc_mir_dataflow::visit_results(
             &facts.body,
             reverse_postorder(&facts.body).map(|(bb, _)| bb),
@@ -53,12 +60,75 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             &mut visitor,
         );
 
+        // Now, use the region information to determine which locals are leaked
+        {
+            let mut cst_graph = Graph::new();
+            let mut cst_nodes = FxHashMap::default();
+
+            fn re_as_vid(re: Region<'_>) -> Option<RegionVid> {
+                re.is_var().then(|| re.as_var())
+            }
+
+            // Build constraint graph
+            for cst in facts.region_inference_context.outlives_constraints() {
+                // Left outlives right.
+                let left = cst.sup;
+                let right = cst.sub;
+
+                let left = *cst_nodes
+                    .entry(left)
+                    .or_insert_with(|| cst_graph.add_node(left));
+
+                let right = *cst_nodes
+                    .entry(right)
+                    .or_insert_with(|| cst_graph.add_node(right));
+
+                cst_graph.add_edge(right, left, ());
+            }
+
+            // Determine which nodes are reachable from our leaked regions.
+            let mut leaked = FxHashSet::default();
+
+            for origin in extract_free_region_list(
+                tcx,
+                facts.body.local_decls[Local::from_u32(0)].ty,
+                re_as_vid,
+            ) {
+                let Some(&origin) = cst_nodes.get(&origin) else {
+                    continue;
+                };
+
+                let mut bfs = Dfs::new(&cst_graph, origin);
+
+                while let Some(reachable) = bfs.next(&cst_graph) {
+                    leaked.insert(reachable);
+                }
+            }
+
+            // Finally, let's go through each local to see if it has any regions linked to the
+            // return type.
+            for (local, info) in facts.body.local_decls.iter_enumerated() {
+                for used in extract_free_region_list(tcx, info.ty, re_as_vid) {
+                    let Some(used) = cst_nodes.get(&used) else {
+                        continue;
+                    };
+
+                    if leaked.contains(used) {
+                        eprintln!(
+                            "{local:?} of type {:?} is tied to the return value",
+                            info.ty
+                        );
+                    }
+                }
+            }
+        }
+
         Self { _ty: &() }
     }
 }
 
 struct BorrowckVisitor<'mir, 'tcx> {
-    facts: &'mir BodyWithBorrowckFacts<'tcx>,
+    _facts: &'mir BodyWithBorrowckFacts<'tcx>,
 }
 
 impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx> {
@@ -67,41 +137,37 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
     fn visit_statement_before_primary_effect(
         &mut self,
         _results: &mut R,
-        state: &Self::FlowState,
-        statement: &'mir Statement<'tcx>,
+        _state: &Self::FlowState,
+        _statement: &'mir Statement<'tcx>,
         _location: Location,
     ) {
-        eprintln!("{statement:?}- {:?}", state);
     }
 
     fn visit_statement_after_primary_effect(
         &mut self,
         _results: &mut R,
-        state: &Self::FlowState,
-        statement: &'mir Statement<'tcx>,
+        _state: &Self::FlowState,
+        _statement: &'mir Statement<'tcx>,
         _location: Location,
     ) {
-        eprintln!("{statement:?}+ {:?}", state);
     }
 
     fn visit_terminator_before_primary_effect(
         &mut self,
         _results: &mut R,
-        state: &Self::FlowState,
-        terminator: &'mir Terminator<'tcx>,
+        _state: &Self::FlowState,
+        _terminator: &'mir Terminator<'tcx>,
         _location: Location,
     ) {
-        eprintln!("{terminator:?}- {state:?}");
     }
 
     fn visit_terminator_after_primary_effect(
         &mut self,
         _results: &mut R,
-        state: &Self::FlowState,
-        terminator: &'mir Terminator<'tcx>,
+        _state: &Self::FlowState,
+        _terminator: &'mir Terminator<'tcx>,
         _location: Location,
     ) {
-        eprintln!("{terminator:?}+ {state:?}");
     }
 }
 
