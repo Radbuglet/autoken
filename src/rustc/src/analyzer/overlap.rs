@@ -1,249 +1,170 @@
-use std::collections::hash_map;
-
-use rustc_borrowck::{
-    borrow_set::BorrowData,
-    consumers::{
-        calculate_borrows_out_of_scope_at_location, get_body_with_borrowck_facts, BorrowIndex,
-        ConsumerOptions,
-    },
+use rustc_borrowck::consumers::{
+    get_body_with_borrowck_facts, BodyWithBorrowckFacts, Borrows, ConsumerOptions,
 };
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_hash::{FxHashMap, FxHashSet};
+
 use rustc_hir::def_id::LocalDefId;
-use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{
-        BasicBlock, Body, BorrowKind, CallReturnPlaces, Local, Location, Mutability, Statement,
-        Terminator, TerminatorEdges,
-    },
-    ty::{ParamEnv, Ty, TyCtxt},
+    mir::{traversal::reverse_postorder, BasicBlock, Body, Location, Statement, Terminator},
+    ty::TyCtxt,
 };
 use rustc_mir_dataflow::{
-    fmt::DebugWithContext, Analysis, AnalysisDomain, Forward, GenKill, GenKillAnalysis,
+    Analysis, AnalysisDomain, Forward, Results, ResultsVisitable, ResultsVisitor,
 };
-use rustc_span::Span;
-
-use crate::util::ty::{GenericTransformer, MaybeConcretizedFunc, MutabilityExt};
 
 // === Analysis === //
 
 #[derive(Debug, Clone)]
 pub struct BodyOverlapFacts<'tcx> {
-    pub overlaps: Vec<OverlapPlace<'tcx>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OverlapPlace<'tcx> {
-    pub span: Span,
-    pub active: Vec<(Ty<'tcx>, Mutability)>,
+    _ty: &'tcx (),
 }
 
 impl<'tcx> BodyOverlapFacts<'tcx> {
-    pub fn new(
-        tcx: TyCtxt<'tcx>,
-        did: LocalDefId,
-        mut local_key: impl FnMut(Local) -> Vec<Ty<'tcx>>,
-    ) -> Self {
+    pub fn can_borrow_check(tcx: TyCtxt<'tcx>, did: LocalDefId) -> bool {
+        // `get_body_with_borrowck_facts` skips a validation step compared to `mir_borrowck` so we
+        // reintroduce it here.
+        let (input_body, _promoted) = tcx.mir_promoted(did);
+        let input_body = &input_body.borrow();
+        !input_body.should_skip() && input_body.tainted_by_errors.is_none()
+    }
+
+    pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
         // Determine the start and end locations of our borrows.
+        // FIXME: Does not use `tcx.local_def_id_to_hir_id(def).owner` to determine the origin of the
+        //  inference context.
         let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
-        let start_map = &facts.borrow_set.location_map;
-        let end_map = calculate_borrows_out_of_scope_at_location(
+
+        // Run fix-point analysis to figure out which sections of code have which borrows.
+        let mut results = Borrows::new(
+            tcx,
             &facts.body,
             &facts.region_inference_context,
             &facts.borrow_set,
+        )
+        .into_engine(tcx, &facts.body)
+        .iterate_to_fixpoint();
+
+        let mut visitor = BorrowckVisitor { facts: &facts };
+
+        eprintln!("=== {did:?} ===");
+        rustc_mir_dataflow::visit_results(
+            &facts.body,
+            reverse_postorder(&facts.body).map(|(bb, _)| bb),
+            &mut results,
+            &mut visitor,
         );
 
-        // Run fix-point analysis to figure out which sections of code have which borrows.
-        let mut results = RegionAwareLiveness {
-            start_map,
-            end_map: &end_map,
-        }
-        .into_engine(tcx, &facts.body)
-        .iterate_to_fixpoint()
-        .into_results_cursor(&facts.body);
-
-        // Determine overlap sets.
-        let mut overlaps = Vec::new();
-
-        for (bb_loc, bb) in facts.body.basic_blocks.iter_enumerated() {
-            let locs = bb
-                .statements
-                .iter()
-                .enumerate()
-                .map(|(stmt_loc, stmt)| {
-                    (
-                        Location {
-                            block: bb_loc,
-                            statement_index: stmt_loc,
-                        },
-                        stmt.source_info.span,
-                    )
-                })
-                .chain(bb.terminator.as_ref().into_iter().map(|terminator| {
-                    (
-                        Location {
-                            block: bb_loc,
-                            statement_index: bb.statements.len(),
-                        },
-                        terminator.source_info.span,
-                    )
-                }));
-
-            for (loc, span) in locs {
-                results.seek_before_primary_effect(loc);
-                let state = results.get();
-
-                let mut active = Vec::new();
-
-                for borrow in state.iter() {
-                    let borrow = start_map.get_index(borrow.as_usize()).unwrap().1;
-                    let local = borrow.borrowed_place.local;
-
-                    for local_key in local_key(local) {
-                        let mutability = match borrow.kind {
-                            BorrowKind::Shared => Mutability::Not,
-                            BorrowKind::Fake => unreachable!(),
-                            BorrowKind::Mut { .. } => Mutability::Mut,
-                        };
-
-                        active.push((local_key, mutability));
-                    }
-                }
-
-                // TODO: Optimize representation
-                overlaps.push(OverlapPlace { span, active });
-            }
-        }
-
-        Self { overlaps }
-    }
-
-    pub fn validate(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-        instance: MaybeConcretizedFunc<'tcx>,
-    ) {
-        let mut borrows = FxHashMap::default();
-
-        for overlap in &self.overlaps {
-            borrows.clear();
-
-            for &(key, mutability) in &overlap.active {
-                let key = instance.instantiate_arg(tcx, param_env, key);
-
-                match borrows.entry(key) {
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(mutability);
-                    }
-                    hash_map::Entry::Occupied(entry) => {
-                        let entry = entry.into_mut();
-                        if entry.is_mut() || mutability.is_mut() {
-                            // TODO: Improve diagnostics
-                            tcx.dcx().span_err(
-                                overlap.span,
-                                format!("conflicting borrows on token {key} at this point"),
-                            );
-                        }
-
-                        entry.upgrade(mutability);
-                    }
-                }
-            }
-        }
+        Self { _ty: &() }
     }
 }
 
-// === Dataflow Analyzer === //
-
-pub struct RegionAwareLiveness<'tcx, 'a> {
-    start_map: &'a FxIndexMap<Location, BorrowData<'tcx>>,
-    end_map: &'a FxIndexMap<Location, Vec<BorrowIndex>>,
+struct BorrowckVisitor<'mir, 'tcx> {
+    facts: &'mir BodyWithBorrowckFacts<'tcx>,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub struct LiveSet(pub FxHashSet<BorrowIndex>);
+impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx> {
+    type FlowState = <BorrowckResults<'mir, 'tcx> as ResultsVisitable<'tcx>>::FlowState;
 
-impl<'tcx, 'a> AnalysisDomain<'tcx> for RegionAwareLiveness<'tcx, 'a> {
-    type Domain = BitSet<BorrowIndex>;
-    type Direction = Forward;
-
-    const NAME: &'static str = "region_aware_liveness";
-
-    fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
-        BitSet::new_empty(self.start_map.len())
-    }
-
-    fn initialize_start_block(&self, _body: &Body<'tcx>, _state: &mut Self::Domain) {
-        // (no locals are live on function entry)
-    }
-}
-
-impl<'tcx, 'a> RegionAwareLiveness<'tcx, 'a> {
-    fn handle_start_loc(&self, trans: &mut impl GenKill<BorrowIndex>, location: Location) {
-        if let Some(borrow) = self.start_map.get_index_of(&location) {
-            trans.gen(BorrowIndex::from_usize(borrow));
-        }
-    }
-
-    fn handle_end_loc(&self, trans: &mut impl GenKill<BorrowIndex>, location: Location) {
-        if let Some(borrows) = self.end_map.get(&location) {
-            trans.kill_all(borrows.iter().copied());
-        }
-    }
-}
-
-impl<'tcx, 'a> GenKillAnalysis<'tcx> for RegionAwareLiveness<'tcx, 'a> {
-    type Idx = BorrowIndex;
-
-    fn domain_size(&self, _body: &Body<'tcx>) -> usize {
-        self.start_map.len()
-    }
-
-    fn statement_effect(
+    fn visit_statement_before_primary_effect(
         &mut self,
-        trans: &mut impl GenKill<Self::Idx>,
-        _statement: &Statement<'tcx>,
-        location: Location,
+        _results: &mut R,
+        state: &Self::FlowState,
+        statement: &'mir Statement<'tcx>,
+        _location: Location,
     ) {
-        self.handle_end_loc(trans, location);
+        eprintln!("{statement:?}- {:?}", state);
     }
 
-    fn before_statement_effect(
+    fn visit_statement_after_primary_effect(
         &mut self,
-        trans: &mut impl GenKill<Self::Idx>,
-        _statement: &Statement<'tcx>,
-        location: Location,
+        _results: &mut R,
+        state: &Self::FlowState,
+        statement: &'mir Statement<'tcx>,
+        _location: Location,
     ) {
-        self.handle_start_loc(trans, location);
+        eprintln!("{statement:?}+ {:?}", state);
     }
 
-    fn terminator_effect<'mir>(
+    fn visit_terminator_before_primary_effect(
         &mut self,
-        trans: &mut Self::Domain,
+        _results: &mut R,
+        state: &Self::FlowState,
         terminator: &'mir Terminator<'tcx>,
-        location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
-        self.handle_end_loc(trans, location);
-        terminator.edges()
+        _location: Location,
+    ) {
+        eprintln!("{terminator:?}- {state:?}");
     }
 
-    fn before_terminator_effect(
+    fn visit_terminator_after_primary_effect(
         &mut self,
-        trans: &mut Self::Domain,
-        _terminator: &Terminator<'tcx>,
-        location: Location,
+        _results: &mut R,
+        state: &Self::FlowState,
+        terminator: &'mir Terminator<'tcx>,
+        _location: Location,
     ) {
-        self.handle_start_loc(trans, location);
-    }
-
-    fn call_return_effect(
-        &mut self,
-        _trans: &mut Self::Domain,
-        _block: BasicBlock,
-        _return_places: CallReturnPlaces<'_, 'tcx>,
-    ) {
+        eprintln!("{terminator:?}+ {state:?}");
     }
 }
 
-impl<'tcx, 'a> DebugWithContext<RegionAwareLiveness<'tcx, 'a>> for BorrowIndex {}
+// === Forked === //
+
+struct BorrowckResults<'mir, 'tcx> {
+    borrows: Results<'tcx, Borrows<'mir, 'tcx>>,
+}
+
+impl<'mir, 'tcx> ResultsVisitable<'tcx> for BorrowckResults<'mir, 'tcx> {
+    // All three analyses are forward, but we have to use just one here.
+    type Direction = Forward;
+    type FlowState = <Borrows<'mir, 'tcx> as AnalysisDomain<'tcx>>::Domain;
+
+    fn new_flow_state(&self, body: &Body<'tcx>) -> Self::FlowState {
+        self.borrows.analysis.bottom_value(body)
+    }
+
+    fn reset_to_block_entry(&self, state: &mut Self::FlowState, block: BasicBlock) {
+        state.clone_from(self.borrows.entry_set_for_block(block));
+    }
+
+    fn reconstruct_before_statement_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        stmt: &Statement<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows
+            .analysis
+            .apply_before_statement_effect(&mut *state, stmt, loc);
+    }
+
+    fn reconstruct_statement_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        stmt: &Statement<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows
+            .analysis
+            .apply_statement_effect(&mut *state, stmt, loc);
+    }
+
+    fn reconstruct_before_terminator_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        term: &Terminator<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows
+            .analysis
+            .apply_before_terminator_effect(&mut *state, term, loc);
+    }
+
+    fn reconstruct_terminator_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        term: &Terminator<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows
+            .analysis
+            .apply_terminator_effect(&mut *state, term, loc);
+    }
+}

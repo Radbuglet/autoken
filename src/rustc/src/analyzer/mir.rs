@@ -104,16 +104,16 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         prepender.0.extend(stmts);
     }
 
+    fn flush_prepended(&mut self) {
+        Self::flush_prepended_raw(self.body, &mut self.preprender);
+    }
+
     fn prepend_statement(
         &mut self,
         bb: BasicBlock,
         stmts: impl IntoIterator<Item = Statement<'tcx>>,
     ) {
         Self::prepend_statement_raw(self.body, &mut self.preprender, bb, stmts)
-    }
-
-    fn flush_prepended(&mut self) {
-        Self::flush_prepended_raw(self.body, &mut self.preprender);
     }
 
     // === Tokens === //

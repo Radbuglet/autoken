@@ -24,8 +24,7 @@ use crate::util::{
         iter_all_local_def_ids, try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance,
         TerminalCallKind,
     },
-    ty::MaybeConcretizedFunc,
-    ty_legacy::try_resolve_mono_args_for_func,
+    ty::{try_resolve_mono_args_for_func, MaybeConcretizedFunc},
 };
 
 use self::{
@@ -229,7 +228,10 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Finally, borrow check everything in a single go to avoid issues with stolen values.
     for shadow in shadows {
-        let _ = tcx.mir_borrowck(shadow);
+        if overlap::BodyOverlapFacts::can_borrow_check(tcx, shadow) {
+            overlap::BodyOverlapFacts::new(tcx, shadow);
+        }
+        // let _ = tcx.mir_borrowck(shadow);
     }
 }
 
@@ -251,7 +253,10 @@ fn ensure_no_borrow<'tcx>(
                 facts
                     .borrows
                     .iter()
-                    .map(|(k, (m, _))| format!("{k} {}", m.mutably_str()))
+                    .map(|(k, (m, _))| format!(
+                        "{k} {}",
+                        if m.is_mut() { "mutably" } else { "immutably" }
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
