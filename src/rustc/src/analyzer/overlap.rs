@@ -98,9 +98,9 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     continue;
                 };
 
-                let mut bfs = Dfs::new(&cst_graph, origin);
+                let mut dfs = Dfs::new(&cst_graph, origin);
 
-                while let Some(reachable) = bfs.next(&cst_graph) {
+                while let Some(reachable) = dfs.next(&cst_graph) {
                     leaked.insert(reachable);
                 }
             }

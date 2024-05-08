@@ -1,15 +1,17 @@
+use std::hash;
+
 use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
     EarlyBinder, ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgs,
     GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region,
-    RegionKind, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
 
-use super::hash::FxHashSet;
+use super::hash::{FxHashMap, FxHashSet};
 
 // === Type Matching === //
 
@@ -638,29 +640,139 @@ impl<'tcx> BindableRegions<'tcx> {
         eprintln!("concrete_sig = {concrete_sig:?}");
 
         // Figure out the types' correspondences.
-        let mut cx = LinkTraversalCx {
-            _tcx: tcx,
-            tied: Some(FxHashSet::default()),
-            scan_name: name,
-            passed_binders: 0,
-        };
-        cx.traverse_types(concrete_sig.skip_binder(), trait_sig.skip_binder());
-
-        // TODO: Think long and hard about these rules.
-        let result = cx.tied.filter(|s| !s.is_empty());
-        eprintln!("result = {result:?}");
-        result
+        todo!();
     }
 }
 
-struct LinkTraversalCx<'tcx> {
-    _tcx: TyCtxt<'tcx>,
-    tied: Option<FxHashSet<BoundVar>>,
-    scan_name: Symbol,
+// === `determine_region_bijection` === //
+
+pub struct FunctionMap<T> {
+    pub map: FxHashMap<T, Option<T>>,
+}
+
+impl<T> Default for FunctionMap<T> {
+    fn default() -> Self {
+        Self {
+            map: FxHashMap::default(),
+        }
+    }
+}
+
+impl<T: hash::Hash + Eq> FunctionMap<T> {
+    pub fn insert(&mut self, domain: T, value: T) -> bool {
+        self.map
+            .entry(domain)
+            .and_modify(|v| {
+                if v.as_ref() != Some(&value) {
+                    *v = None;
+                }
+            })
+            .or_insert(Some(value))
+            .is_none()
+    }
+
+    pub fn invalidate(&mut self, domain: T) {
+        self.map.insert(domain, None);
+    }
+}
+
+pub struct Bijection<T> {
+    pub left_to_right: FunctionMap<T>,
+    pub right_to_left: FunctionMap<T>,
+}
+
+impl<T> Default for Bijection<T> {
+    fn default() -> Self {
+        Self {
+            left_to_right: FunctionMap::default(),
+            right_to_left: FunctionMap::default(),
+        }
+    }
+}
+
+impl<T: hash::Hash + Eq + Copy> Bijection<T> {
+    pub fn insert(&mut self, left: T, right: T) {
+        let is_not_bijection =
+            self.left_to_right.insert(left, right) || self.right_to_left.insert(right, left);
+
+        if is_not_bijection {
+            self.invalidate(left, right);
+        }
+    }
+
+    pub fn invalidate(&mut self, left: T, right: T) {
+        self.left_to_right.invalidate(left);
+        self.right_to_left.invalidate(right);
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RegionBijectionMode {
+    /// This element should be mapped to its partner bijectively.
+    NormalBijection,
+
+    /// Neither us nor the partner can be mapped bijectively.
+    RejectBijection,
+
+    /// Nothing should happen between us and our partner.
+    NoOperation,
+}
+
+pub fn determine_region_bijection<'tcx>(
+    left: Ty<'tcx>,
+    right: Ty<'tcx>,
+    mut region_mode: impl FnMut(Region<'tcx>, bool) -> RegionBijectionMode,
+) -> Bijection<Region<'tcx>> {
+    use RegionBijectionMode::*;
+
+    let mut bijection = Bijection::default();
+
+    par_traverse_regions(left, right, |left, right| {
+        let left_mode = (region_mode)(left, false);
+        let right_mode = (region_mode)(right, true);
+
+        match (left_mode, right_mode) {
+            (NormalBijection, NormalBijection) => {
+                bijection.insert(left, right);
+            }
+            (RejectBijection, _) => {
+                bijection.right_to_left.invalidate(right);
+            }
+            (_, RejectBijection) => {
+                bijection.left_to_right.invalidate(left);
+            }
+            (NoOperation, _) | (_, NoOperation) => {}
+        }
+    });
+    bijection
+}
+
+// === `par_traverse_regions` === //
+
+pub fn par_traverse_regions<'tcx>(
+    left: Ty<'tcx>,
+    right: Ty<'tcx>,
+    f: impl FnMut(Region<'tcx>, Region<'tcx>),
+) {
+    ParRegionTraversal::new(f).traverse_types(left, right);
+}
+
+pub struct ParRegionTraversal<F> {
+    handler: F,
     passed_binders: u32,
 }
 
-impl<'tcx> LinkTraversalCx<'tcx> {
+impl<'tcx, F> ParRegionTraversal<F>
+where
+    F: FnMut(Region<'tcx>, Region<'tcx>),
+{
+    pub fn new(handler: F) -> Self {
+        Self {
+            handler,
+            passed_binders: 0,
+        }
+    }
+
     fn traverse(&mut self, left: GenericArgKind<'tcx>, right: GenericArgKind<'tcx>) {
         match (left, right) {
             (GenericArgKind::Lifetime(left), GenericArgKind::Lifetime(right)) => {
@@ -756,28 +868,7 @@ impl<'tcx> LinkTraversalCx<'tcx> {
     }
 
     fn traverse_lifetimes(&mut self, left: Region<'tcx>, right: Region<'tcx>) {
-        eprintln!("traverse_lifetimes({left:?}, {right:?})");
-
-        // Ensure that this is the left region we're trying to bind.
-        // TODO: We might need more validation.
-        if left.get_name() != Some(self.scan_name) {
-            return;
-        }
-
-        // If this is a bindable region...
-        match right.kind() {
-            RegionKind::ReBound(debrujin, right) if debrujin.as_u32() == self.passed_binders => {
-                // ...add it.
-                if let Some(tied) = &mut self.tied {
-                    tied.insert(right.var);
-                }
-            }
-
-            // Otherwise, invalidate the operation.
-            _ => {
-                self.tied = None;
-            }
-        }
+        (self.handler)(left, right);
     }
 
     fn traverse_generics(&mut self, left: GenericArgsRef<'tcx>, right: GenericArgsRef<'tcx>) {
