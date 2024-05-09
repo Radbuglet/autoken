@@ -6,12 +6,10 @@ use rustc_borrowck::consumers::{
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{traversal::reverse_postorder, BasicBlock, Body, Local, Location, Statement, Terminator},
-    ty::{Region, RegionVid, TyCtxt},
+    mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
+    ty::{Mutability, Region, RegionVid, TyCtxt},
 };
-use rustc_mir_dataflow::{
-    Analysis, AnalysisDomain, Forward, Results, ResultsVisitable, ResultsVisitor,
-};
+use rustc_mir_dataflow::{Analysis, ResultsVisitor};
 use rustc_span::Span;
 
 use crate::util::{
@@ -26,7 +24,7 @@ use crate::util::{
 
 #[derive(Debug, Clone)]
 pub struct BodyOverlapFacts<'tcx> {
-    borrows: FxHashMap<BorrowIndex, (Local, Span)>,
+    borrows: FxHashMap<BorrowIndex, (Local, Mutability, Span)>,
     overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
     leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
 }
@@ -42,8 +40,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
     pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
         // Determine the start and end locations of our borrows.
-        // FIXME: Does not use `tcx.local_def_id_to_hir_id(def).owner` to determine the origin of the
-        //  inference context.
+        // FIXME: This function does not use `tcx.local_def_id_to_hir_id(def).owner` to determine
+        // the origin of the inference context like regular `mir_borrowck` does.
         let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
 
         let borrow_locations = facts
@@ -54,7 +52,11 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             .map(|(bw, (loc, info))| {
                 (
                     BorrowIndex::from_usize(bw),
-                    (info.borrowed_place.local, facts.body.source_info(*loc).span),
+                    (
+                        info.borrowed_place.local,
+                        info.kind.mutability(),
+                        facts.body.source_info(*loc).span,
+                    ),
                 )
             })
             .collect();
@@ -96,7 +98,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         let infer_ret_ty = facts.body.local_decls[Local::from_u32(0)].ty;
         let mut infer_to_real = FunctionMap::default();
 
-        par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real| {
+        par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real, _| {
             infer_to_real.insert(inf.as_var(), real);
         });
 
@@ -176,18 +178,44 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
         for (&new_bw, conflicts) in &self.overlaps {
             for old_bw in conflicts.iter() {
-                let (old_bw_local, old_bw_span) = self.borrows[&old_bw];
-                let (new_bw_local, new_bw_span) = self.borrows[&new_bw];
+                if old_bw == new_bw {
+                    continue;
+                }
+
+                let (old_bw_local, old_bw_mut, old_bw_span) = self.borrows[&old_bw];
+                let (new_bw_local, new_bw_mut, new_bw_span) = self.borrows[&new_bw];
 
                 if !(are_conflicting)(new_bw_local, old_bw_local) {
                     continue;
                 }
 
+                if old_bw_mut.is_not() && new_bw_mut.is_not() {
+                    continue;
+                }
+
                 // Report the conflict
                 // TODO: Better diagnostics
-                dcx.struct_span_warn(new_bw_span, "conflicting AuToken borrows")
-                    .with_span_label(old_bw_span, "first borrow here")
-                    .with_span_label(new_bw_span, "second borrow here")
+                dcx.struct_span_warn(new_bw_span, "conflicting borrows on AuToken token")
+                    .with_span_label(
+                        old_bw_span,
+                        format!(
+                            "value first borrowed {} here",
+                            match old_bw_mut {
+                                Mutability::Not => "immutably",
+                                Mutability::Mut => "mutably",
+                            }
+                        ),
+                    )
+                    .with_span_label(
+                        new_bw_span,
+                        format!(
+                            "value then borrowed {} here",
+                            match new_bw_mut {
+                                Mutability::Not => "immutably",
+                                Mutability::Mut => "mutably",
+                            }
+                        ),
+                    )
                     .emit();
             }
         }
@@ -210,7 +238,7 @@ impl<'mir, 'tcx> BorrowckVisitor<'mir, 'tcx> {
 }
 
 impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx> {
-    type FlowState = <BorrowckResults<'mir, 'tcx> as ResultsVisitable<'tcx>>::FlowState;
+    type FlowState = BitSet<BorrowIndex>;
 
     fn visit_statement_before_primary_effect(
         &mut self,
@@ -250,69 +278,5 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
         location: Location,
     ) {
         self.push_overlap_set(location, state);
-    }
-}
-
-// === Forked === //
-
-struct BorrowckResults<'mir, 'tcx> {
-    borrows: Results<'tcx, Borrows<'mir, 'tcx>>,
-}
-
-impl<'mir, 'tcx> ResultsVisitable<'tcx> for BorrowckResults<'mir, 'tcx> {
-    // All three analyses are forward, but we have to use just one here.
-    type Direction = Forward;
-    type FlowState = <Borrows<'mir, 'tcx> as AnalysisDomain<'tcx>>::Domain;
-
-    fn new_flow_state(&self, body: &Body<'tcx>) -> Self::FlowState {
-        self.borrows.analysis.bottom_value(body)
-    }
-
-    fn reset_to_block_entry(&self, state: &mut Self::FlowState, block: BasicBlock) {
-        state.clone_from(self.borrows.entry_set_for_block(block));
-    }
-
-    fn reconstruct_before_statement_effect(
-        &mut self,
-        state: &mut Self::FlowState,
-        stmt: &Statement<'tcx>,
-        loc: Location,
-    ) {
-        self.borrows
-            .analysis
-            .apply_before_statement_effect(&mut *state, stmt, loc);
-    }
-
-    fn reconstruct_statement_effect(
-        &mut self,
-        state: &mut Self::FlowState,
-        stmt: &Statement<'tcx>,
-        loc: Location,
-    ) {
-        self.borrows
-            .analysis
-            .apply_statement_effect(&mut *state, stmt, loc);
-    }
-
-    fn reconstruct_before_terminator_effect(
-        &mut self,
-        state: &mut Self::FlowState,
-        term: &Terminator<'tcx>,
-        loc: Location,
-    ) {
-        self.borrows
-            .analysis
-            .apply_before_terminator_effect(&mut *state, term, loc);
-    }
-
-    fn reconstruct_terminator_effect(
-        &mut self,
-        state: &mut Self::FlowState,
-        term: &Terminator<'tcx>,
-        loc: Location,
-    ) {
-        self.borrows
-            .analysis
-            .apply_terminator_effect(&mut *state, term, loc);
     }
 }

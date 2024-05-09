@@ -1,7 +1,17 @@
-fn main() {}
+fn main() {
+    let a = tie();
+    let _ = tie();
+    let _ = a;
+}
 
-struct Hehe;
+fn bar() {
+    let mut foo = Vec::new();
+    loop {
+        foo.push(tie());
+    }
+}
 
-fn whee<'a>() -> &'a Hehe {
-    &Hehe
+fn tie<'a>() -> &'a () {
+    autoken::tie!('a => ref ());
+    &()
 }

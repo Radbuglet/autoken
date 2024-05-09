@@ -192,6 +192,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             }
         }
 
+        let local_to_ty_map = body_mutator.hack_get_local_to_ty_map();
         drop(body_mutator);
 
         // Feed the query system the shadow function's properties.
@@ -223,14 +224,16 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         }
 
         // ...and queue it up for borrow checking!
-        shadows.push(shadow_def);
+        shadows.push((shadow_def, local_to_ty_map));
     }
 
     // Finally, borrow check everything in a single go to avoid issues with stolen values.
-    for shadow in shadows {
+    for (shadow, local_to_ty_map) in shadows {
         if overlap::BodyOverlapFacts::can_borrow_check(tcx, shadow) {
             let facts = overlap::BodyOverlapFacts::new(tcx, shadow);
-            facts.validate_overlaps(tcx, |_, _| true);
+            facts.validate_overlaps(tcx, |a, b| {
+                local_to_ty_map.get(&a) == local_to_ty_map.get(&b)
+            });
         }
         // let _ = tcx.mir_borrowck(shadow);
     }

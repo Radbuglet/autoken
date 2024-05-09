@@ -6,7 +6,7 @@ use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
     EarlyBinder, ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgs,
     GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region,
-    TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    RegionKind, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
@@ -633,7 +633,36 @@ impl<'tcx> BindableRegions<'tcx> {
         );
 
         // Figure out the types' correspondences.
-        todo!();
+        let mut tied = Some(FxHashSet::default());
+
+        par_traverse_regions(
+            concrete_sig.skip_binder(),
+            trait_sig.skip_binder(),
+            |left, right, passed_binders| {
+                // Ensure that this is the left region we're trying to bind.
+                // TODO: We might need more validation.
+                if left.get_name() != Some(name) {
+                    return;
+                }
+
+                // If this is a bindable region...
+                match right.kind() {
+                    RegionKind::ReBound(debrujin, right) if debrujin.as_u32() == passed_binders => {
+                        // ...add it.
+                        if let Some(tied) = &mut tied {
+                            tied.insert(right.var);
+                        }
+                    }
+
+                    // Otherwise, invalidate the operation.
+                    _ => {
+                        tied = None;
+                    }
+                }
+            },
+        );
+
+        tied.filter(|s| !s.is_empty())
     }
 }
 
@@ -674,7 +703,7 @@ impl<K: hash::Hash + Eq, V: Eq> FunctionMap<K, V> {
 pub fn par_traverse_regions<'tcx>(
     left: Ty<'tcx>,
     right: Ty<'tcx>,
-    f: impl FnMut(Region<'tcx>, Region<'tcx>),
+    f: impl FnMut(Region<'tcx>, Region<'tcx>, u32),
 ) {
     ParRegionTraversal::new(f).traverse_types(left, right);
 }
@@ -686,7 +715,7 @@ pub struct ParRegionTraversal<F> {
 
 impl<'tcx, F> ParRegionTraversal<F>
 where
-    F: FnMut(Region<'tcx>, Region<'tcx>),
+    F: FnMut(Region<'tcx>, Region<'tcx>, u32),
 {
     pub fn new(handler: F) -> Self {
         Self {
@@ -790,7 +819,7 @@ where
     }
 
     fn traverse_lifetimes(&mut self, left: Region<'tcx>, right: Region<'tcx>) {
-        (self.handler)(left, right);
+        (self.handler)(left, right, self.passed_binders);
     }
 
     fn traverse_generics(&mut self, left: GenericArgsRef<'tcx>, right: GenericArgsRef<'tcx>) {

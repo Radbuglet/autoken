@@ -327,11 +327,15 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 .local_decls
                 .push(LocalDecl::new(self.token_ref_mut_ty, DUMMY_SP)),
         };
+        let source_info = self.body.basic_blocks[bb]
+            .terminator
+            .as_ref()
+            .map_or(self.default_source_info, |sf| sf.source_info);
 
         self.body.basic_blocks.as_mut_preserves_cfg()[bb]
             .statements
             .push(Statement {
-                source_info: self.default_source_info,
+                source_info,
                 kind: StatementKind::Assign(Box::new((
                     Place {
                         local: dummy_token_holder,
@@ -372,12 +376,14 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     destination,
                     ..
                 },
+            source_info,
             ..
         }) = &self.body.basic_blocks.as_mut_preserves_cfg()[bb].terminator
         else {
             unreachable!();
         };
 
+        let source_info = *source_info;
         let call_out_bb = *target;
         let call_out_place = *destination;
 
@@ -483,7 +489,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             call_out_bb,
             [
                 Statement {
-                    source_info: self.default_source_info,
+                    source_info,
                     kind: StatementKind::Assign(Box::new((
                         Place {
                             local: token_rb_local,
@@ -505,7 +511,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     ))),
                 },
                 Statement {
-                    source_info: self.default_source_info,
+                    source_info,
                     kind: StatementKind::Assign(Box::new((
                         Place {
                             local: binder_local,
@@ -524,7 +530,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     ))),
                 },
                 Statement {
-                    source_info: self.default_source_info,
+                    source_info,
                     kind: StatementKind::AscribeUserType(
                         Box::new((
                             Place {
@@ -540,7 +546,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     ),
                 },
                 Statement {
-                    source_info: self.default_source_info,
+                    source_info,
                     kind: StatementKind::Assign(Box::new((
                         call_out_place,
                         Rvalue::Use(Operand::Move(Place {
@@ -554,6 +560,13 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 },
             ],
         );
+    }
+
+    pub fn hack_get_local_to_ty_map(&self) -> FxHashMap<Local, Ty<'tcx>> {
+        self.tokens
+            .iter()
+            .map(|(key, (local, _))| (*local, key.0))
+            .collect()
     }
 }
 
