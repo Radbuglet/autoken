@@ -229,7 +229,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     // Finally, borrow check everything in a single go to avoid issues with stolen values.
     for shadow in shadows {
         if overlap::BodyOverlapFacts::can_borrow_check(tcx, shadow) {
-            overlap::BodyOverlapFacts::new(tcx, shadow);
+            let facts = overlap::BodyOverlapFacts::new(tcx, shadow);
+            facts.validate_overlaps(tcx, |_, _| true);
         }
         // let _ = tcx.mir_borrowck(shadow);
     }

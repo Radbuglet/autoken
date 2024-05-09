@@ -26,8 +26,8 @@ use crate::util::{
 
 #[derive(Debug, Clone)]
 pub struct BodyOverlapFacts<'tcx> {
-    borrow_locations: FxHashMap<BorrowIndex, Span>,
-    overlaps: FxHashSet<BitSet<BorrowIndex>>,
+    borrows: FxHashMap<BorrowIndex, (Local, Span)>,
+    overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
     leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
 }
 
@@ -49,12 +49,12 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         let borrow_locations = facts
             .borrow_set
             .location_map
-            .keys()
+            .iter()
             .enumerate()
-            .map(|(bw, loc)| {
+            .map(|(bw, (loc, info))| {
                 (
                     BorrowIndex::from_usize(bw),
-                    facts.body.source_info(*loc).span,
+                    (info.borrowed_place.local, facts.body.source_info(*loc).span),
                 )
             })
             .collect();
@@ -70,8 +70,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .iterate_to_fixpoint();
 
         let mut visitor = BorrowckVisitor {
-            _facts: &facts,
-            overlaps: FxHashSet::default(),
+            facts: &facts,
+            overlaps: FxHashMap::default(),
         };
 
         rustc_mir_dataflow::visit_results(
@@ -161,27 +161,51 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         }
 
         Self {
-            borrow_locations,
+            borrows: borrow_locations,
             overlaps,
             leaked_locals,
         }
     }
 
-    pub fn validate(&self) {
-        // TODO
+    pub fn validate_overlaps(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        mut are_conflicting: impl FnMut(Local, Local) -> bool,
+    ) {
+        let dcx = tcx.dcx();
+
+        for (&new_bw, conflicts) in &self.overlaps {
+            for old_bw in conflicts.iter() {
+                let (old_bw_local, old_bw_span) = self.borrows[&old_bw];
+                let (new_bw_local, new_bw_span) = self.borrows[&new_bw];
+
+                if !(are_conflicting)(new_bw_local, old_bw_local) {
+                    continue;
+                }
+
+                // Report the conflict
+                // TODO: Better diagnostics
+                dcx.struct_span_warn(new_bw_span, "conflicting AuToken borrows")
+                    .with_span_label(old_bw_span, "first borrow here")
+                    .with_span_label(new_bw_span, "second borrow here")
+                    .emit();
+            }
+        }
     }
 }
 
 struct BorrowckVisitor<'mir, 'tcx> {
-    _facts: &'mir BodyWithBorrowckFacts<'tcx>,
-    overlaps: FxHashSet<BitSet<BorrowIndex>>,
+    facts: &'mir BodyWithBorrowckFacts<'tcx>,
+    overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
 }
 
 impl<'mir, 'tcx> BorrowckVisitor<'mir, 'tcx> {
-    fn push_overlap_set(&mut self, set: &BitSet<BorrowIndex>) {
-        if !self.overlaps.contains(set) {
-            self.overlaps.insert(set.clone());
-        }
+    fn push_overlap_set(&mut self, location: Location, set: &BitSet<BorrowIndex>) {
+        let Some(started) = self.facts.borrow_set.location_map.get_index_of(&location) else {
+            return;
+        };
+        self.overlaps
+            .insert(BorrowIndex::from_usize(started), set.clone());
     }
 }
 
@@ -193,9 +217,9 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
         _results: &mut R,
         state: &Self::FlowState,
         _statement: &'mir Statement<'tcx>,
-        _location: Location,
+        location: Location,
     ) {
-        self.push_overlap_set(state);
+        self.push_overlap_set(location, state);
     }
 
     fn visit_statement_after_primary_effect(
@@ -203,9 +227,9 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
         _results: &mut R,
         state: &Self::FlowState,
         _statement: &'mir Statement<'tcx>,
-        _location: Location,
+        location: Location,
     ) {
-        self.push_overlap_set(state);
+        self.push_overlap_set(location, state);
     }
 
     fn visit_terminator_before_primary_effect(
@@ -213,9 +237,9 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
         _results: &mut R,
         state: &Self::FlowState,
         _terminator: &'mir Terminator<'tcx>,
-        _location: Location,
+        location: Location,
     ) {
-        self.push_overlap_set(state);
+        self.push_overlap_set(location, state);
     }
 
     fn visit_terminator_after_primary_effect(
@@ -223,9 +247,9 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
         _results: &mut R,
         state: &Self::FlowState,
         _terminator: &'mir Terminator<'tcx>,
-        _location: Location,
+        location: Location,
     ) {
-        self.push_overlap_set(state);
+        self.push_overlap_set(location, state);
     }
 }
 
