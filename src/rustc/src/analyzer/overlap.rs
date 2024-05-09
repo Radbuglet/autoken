@@ -172,7 +172,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     pub fn validate_overlaps(
         &self,
         tcx: TyCtxt<'tcx>,
-        mut are_conflicting: impl FnMut(Local, Local) -> bool,
+        mut are_conflicting: impl FnMut(Local, Local) -> Option<String>,
     ) {
         let dcx = tcx.dcx();
 
@@ -185,9 +185,9 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 let (old_bw_local, old_bw_mut, old_bw_span) = self.borrows[&old_bw];
                 let (new_bw_local, new_bw_mut, new_bw_span) = self.borrows[&new_bw];
 
-                if !(are_conflicting)(new_bw_local, old_bw_local) {
+                let Some(conflict) = (are_conflicting)(new_bw_local, old_bw_local) else {
                     continue;
-                }
+                };
 
                 if old_bw_mut.is_not() && new_bw_mut.is_not() {
                     continue;
@@ -195,28 +195,31 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
                 // Report the conflict
                 // TODO: Better diagnostics
-                dcx.struct_span_warn(new_bw_span, "conflicting borrows on AuToken token")
-                    .with_span_label(
-                        old_bw_span,
-                        format!(
-                            "value first borrowed {} here",
-                            match old_bw_mut {
-                                Mutability::Not => "immutably",
-                                Mutability::Mut => "mutably",
-                            }
-                        ),
-                    )
-                    .with_span_label(
-                        new_bw_span,
-                        format!(
-                            "value then borrowed {} here",
-                            match new_bw_mut {
-                                Mutability::Not => "immutably",
-                                Mutability::Mut => "mutably",
-                            }
-                        ),
-                    )
-                    .emit();
+                dcx.struct_span_err(
+                    new_bw_span,
+                    format!("conflicting borrows on token {conflict}"),
+                )
+                .with_span_label(
+                    old_bw_span,
+                    format!(
+                        "value first borrowed {} here",
+                        match old_bw_mut {
+                            Mutability::Not => "immutably",
+                            Mutability::Mut => "mutably",
+                        }
+                    ),
+                )
+                .with_span_label(
+                    new_bw_span,
+                    format!(
+                        "value later borrowed {} here",
+                        match new_bw_mut {
+                            Mutability::Not => "immutably",
+                            Mutability::Mut => "mutably",
+                        }
+                    ),
+                )
+                .emit();
             }
         }
     }

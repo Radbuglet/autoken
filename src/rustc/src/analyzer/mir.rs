@@ -168,143 +168,170 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         );
 
         for (local, ties) in self.tokens.values() {
-            if ties.is_empty() {
-                // unit_holder: ()
-                let unit_holder = self
-                    .body
-                    .local_decls
-                    .push(LocalDecl::new(self.tcx.types.unit, DUMMY_SP));
-
-                Self::prepend_statement_raw(
-                    self.body,
-                    &mut self.preprender,
-                    init_basic_block,
-                    [
-                        // unit_holder = ();
-                        Statement {
-                            source_info: self.default_source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: unit_holder,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                                    span: DUMMY_SP,
-                                    user_ty: None,
-                                    const_: Const::Val(ConstValue::ZeroSized, self.tcx.types.unit),
-                                }))),
-                            ))),
+            // HACK: We make all tokens dangling to cater to the overlap analyzer's expectations.
+            //  This is how things will work once we implement the new MIR generator so this is fine.
+            Self::prepend_statement_raw(
+                self.body,
+                &mut self.preprender,
+                init_basic_block,
+                [Statement {
+                    source_info: self.default_source_info,
+                    kind: StatementKind::Assign(Box::new((
+                        Place {
+                            local: *local,
+                            projection: List::empty(),
                         },
-                        // <local> = &mut unit_holder;
-                        Statement {
-                            source_info: self.default_source_info,
-                            kind: StatementKind::Assign(Box::new((
-                                Place {
-                                    local: *local,
-                                    projection: List::empty(),
-                                },
-                                Rvalue::Ref(
-                                    self.tcx.lifetimes.re_erased,
-                                    BorrowKind::Mut {
-                                        kind: MutBorrowKind::Default,
-                                    },
-                                    Place {
-                                        local: unit_holder,
-                                        projection: List::empty(),
-                                    },
-                                ),
-                            ))),
-                        },
-                    ],
-                );
-            } else {
-                // <local> = &mut *dangling_addr_local
-                Self::prepend_statement_raw(
-                    self.body,
-                    &mut self.preprender,
-                    init_basic_block,
-                    [Statement {
-                        source_info: self.default_source_info,
-                        kind: StatementKind::Assign(Box::new((
-                            Place {
-                                local: *local,
-                                projection: List::empty(),
+                        Rvalue::Ref(
+                            self.tcx.lifetimes.re_erased,
+                            BorrowKind::Mut {
+                                kind: MutBorrowKind::Default,
                             },
-                            Rvalue::Ref(
-                                self.tcx.lifetimes.re_erased,
-                                BorrowKind::Mut {
-                                    kind: MutBorrowKind::Default,
-                                },
-                                Place {
-                                    local: self.dangling_addr_local,
-                                    projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                                },
-                            ),
-                        ))),
-                    }],
-                );
+                            Place {
+                                local: self.dangling_addr_local,
+                                projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
+                            },
+                        ),
+                    ))),
+                }],
+            );
 
-                for &tie in ties {
-                    let found_region = match find_region_with_name(
-                        self.tcx,
-                        get_fn_sig_maybe_closure(self.tcx, self.body.source.def_id())
-                            .skip_binder()
-                            .skip_binder()
-                            .output(),
-                        tie,
-                    ) {
-                        Ok(re) => re,
-                        Err(re) => {
-                            err_failed_to_find_region(self.tcx, self.body.span, tie, &re);
-                            continue;
-                        }
-                    };
-
-                    // annotation => &'<found_region> mut ()
-                    let annotation =
-                        self.body
-                            .user_type_annotations
-                            .push(CanonicalUserTypeAnnotation {
-                                user_ty: Box::new(CanonicalUserType {
-                                    value: UserType::Ty(Ty::new_ref(
-                                        self.tcx,
-                                        found_region,
-                                        TypeAndMut {
-                                            mutbl: Mutability::Mut,
-                                            ty: self.tcx.types.unit,
-                                        },
-                                    )),
-                                    max_universe: UniverseIndex::ROOT,
-                                    variables: List::empty(),
-                                }),
-                                span: DUMMY_SP,
-                                inferred_ty: self.token_ref_mut_ty,
-                            });
-
-                    // let <local>: &'<found_region> mut () = <local>;
-                    Self::prepend_statement_raw(
-                        self.body,
-                        &mut self.preprender,
-                        init_basic_block,
-                        [Statement {
-                            source_info: self.default_source_info,
-                            kind: StatementKind::AscribeUserType(
-                                Box::new((
-                                    Place {
-                                        local: *local,
-                                        projection: List::empty(),
-                                    },
-                                    UserTypeProjection {
-                                        base: annotation,
-                                        projs: Vec::new(),
-                                    },
-                                )),
-                                Variance::Invariant,
-                            ),
-                        }],
-                    );
-                }
-            }
+            //             if ties.is_empty() {
+            //                 // unit_holder: ()
+            //                 let unit_holder = self
+            //                     .body
+            //                     .local_decls
+            //                     .push(LocalDecl::new(self.tcx.types.unit, DUMMY_SP));
+            //
+            //                 Self::prepend_statement_raw(
+            //                     self.body,
+            //                     &mut self.preprender,
+            //                     init_basic_block,
+            //                     [
+            //                         // unit_holder = ();
+            //                         Statement {
+            //                             source_info: self.default_source_info,
+            //                             kind: StatementKind::Assign(Box::new((
+            //                                 Place {
+            //                                     local: unit_holder,
+            //                                     projection: List::empty(),
+            //                                 },
+            //                                 Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
+            //                                     span: DUMMY_SP,
+            //                                     user_ty: None,
+            //                                     const_: Const::Val(ConstValue::ZeroSized, self.tcx.types.unit),
+            //                                 }))),
+            //                             ))),
+            //                         },
+            //                         // <local> = &mut unit_holder;
+            //                         Statement {
+            //                             source_info: self.default_source_info,
+            //                             kind: StatementKind::Assign(Box::new((
+            //                                 Place {
+            //                                     local: *local,
+            //                                     projection: List::empty(),
+            //                                 },
+            //                                 Rvalue::Ref(
+            //                                     self.tcx.lifetimes.re_erased,
+            //                                     BorrowKind::Mut {
+            //                                         kind: MutBorrowKind::Default,
+            //                                     },
+            //                                     Place {
+            //                                         local: unit_holder,
+            //                                         projection: List::empty(),
+            //                                     },
+            //                                 ),
+            //                             ))),
+            //                         },
+            //                     ],
+            //                 );
+            //             } else {
+            //                 // <local> = &mut *dangling_addr_local
+            //                 Self::prepend_statement_raw(
+            //                     self.body,
+            //                     &mut self.preprender,
+            //                     init_basic_block,
+            //                     [Statement {
+            //                         source_info: self.default_source_info,
+            //                         kind: StatementKind::Assign(Box::new((
+            //                             Place {
+            //                                 local: *local,
+            //                                 projection: List::empty(),
+            //                             },
+            //                             Rvalue::Ref(
+            //                                 self.tcx.lifetimes.re_erased,
+            //                                 BorrowKind::Mut {
+            //                                     kind: MutBorrowKind::Default,
+            //                                 },
+            //                                 Place {
+            //                                     local: self.dangling_addr_local,
+            //                                     projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
+            //                                 },
+            //                             ),
+            //                         ))),
+            //                     }],
+            //                 );
+            //
+            //                 for &tie in ties {
+            //                     let found_region = match find_region_with_name(
+            //                         self.tcx,
+            //                         get_fn_sig_maybe_closure(self.tcx, self.body.source.def_id())
+            //                             .skip_binder()
+            //                             .skip_binder()
+            //                             .output(),
+            //                         tie,
+            //                     ) {
+            //                         Ok(re) => re,
+            //                         Err(re) => {
+            //                             err_failed_to_find_region(self.tcx, self.body.span, tie, &re);
+            //                             continue;
+            //                         }
+            //                     };
+            //
+            //                     // annotation => &'<found_region> mut ()
+            //                     let annotation =
+            //                         self.body
+            //                             .user_type_annotations
+            //                             .push(CanonicalUserTypeAnnotation {
+            //                                 user_ty: Box::new(CanonicalUserType {
+            //                                     value: UserType::Ty(Ty::new_ref(
+            //                                         self.tcx,
+            //                                         found_region,
+            //                                         TypeAndMut {
+            //                                             mutbl: Mutability::Mut,
+            //                                             ty: self.tcx.types.unit,
+            //                                         },
+            //                                     )),
+            //                                     max_universe: UniverseIndex::ROOT,
+            //                                     variables: List::empty(),
+            //                                 }),
+            //                                 span: DUMMY_SP,
+            //                                 inferred_ty: self.token_ref_mut_ty,
+            //                             });
+            //
+            //                     // let <local>: &'<found_region> mut () = <local>;
+            //                     Self::prepend_statement_raw(
+            //                         self.body,
+            //                         &mut self.preprender,
+            //                         init_basic_block,
+            //                         [Statement {
+            //                             source_info: self.default_source_info,
+            //                             kind: StatementKind::AscribeUserType(
+            //                                 Box::new((
+            //                                     Place {
+            //                                         local: *local,
+            //                                         projection: List::empty(),
+            //                                     },
+            //                                     UserTypeProjection {
+            //                                         base: annotation,
+            //                                         projs: Vec::new(),
+            //                                     },
+            //                                 )),
+            //                                 Variance::Invariant,
+            //                             ),
+            //                         }],
+            //                     );
+            //                 }
+            //             }
         }
     }
 

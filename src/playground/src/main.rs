@@ -12,6 +12,6 @@ fn bar() {
 }
 
 fn tie<'a>() -> &'a () {
-    autoken::tie!('a => ref ());
+    autoken::tie!('a => mut ());
     &()
 }

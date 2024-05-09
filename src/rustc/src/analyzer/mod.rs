@@ -232,7 +232,9 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         if overlap::BodyOverlapFacts::can_borrow_check(tcx, shadow) {
             let facts = overlap::BodyOverlapFacts::new(tcx, shadow);
             facts.validate_overlaps(tcx, |a, b| {
-                local_to_ty_map.get(&a) == local_to_ty_map.get(&b)
+                let a = local_to_ty_map.get(&a)?;
+                let b = local_to_ty_map.get(&b)?;
+                (a == b).then(|| format!("{a}"))
             });
         }
         // let _ = tcx.mir_borrowck(shadow);
