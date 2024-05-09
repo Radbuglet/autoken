@@ -1,9 +1,10 @@
 use petgraph::{visit::Dfs, Graph};
 use rustc_borrowck::consumers::{
-    get_body_with_borrowck_facts, BodyWithBorrowckFacts, Borrows, ConsumerOptions,
+    get_body_with_borrowck_facts, BodyWithBorrowckFacts, BorrowIndex, Borrows, ConsumerOptions,
 };
 
 use rustc_hir::def_id::LocalDefId;
+use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{traversal::reverse_postorder, BasicBlock, Body, Local, Location, Statement, Terminator},
     ty::{Region, RegionVid, TyCtxt},
@@ -11,17 +12,23 @@ use rustc_middle::{
 use rustc_mir_dataflow::{
     Analysis, AnalysisDomain, Forward, Results, ResultsVisitable, ResultsVisitor,
 };
+use rustc_span::Span;
 
 use crate::util::{
     hash::{FxHashMap, FxHashSet},
-    ty::extract_free_region_list,
+    ty::{
+        extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
+        par_traverse_regions, FunctionMap,
+    },
 };
 
 // === Analysis === //
 
 #[derive(Debug, Clone)]
 pub struct BodyOverlapFacts<'tcx> {
-    _ty: &'tcx (),
+    borrow_locations: FxHashMap<BorrowIndex, Span>,
+    overlaps: FxHashSet<BitSet<BorrowIndex>>,
+    leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
 }
 
 impl<'tcx> BodyOverlapFacts<'tcx> {
@@ -34,12 +41,23 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     }
 
     pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
-        eprintln!("=== {did:?} === ");
-
         // Determine the start and end locations of our borrows.
         // FIXME: Does not use `tcx.local_def_id_to_hir_id(def).owner` to determine the origin of the
         //  inference context.
         let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
+
+        let borrow_locations = facts
+            .borrow_set
+            .location_map
+            .keys()
+            .enumerate()
+            .map(|(bw, loc)| {
+                (
+                    BorrowIndex::from_usize(bw),
+                    facts.body.source_info(*loc).span,
+                )
+            })
+            .collect();
 
         // Run fix-point analysis to figure out which sections of code have which borrows.
         let mut results = Borrows::new(
@@ -51,7 +69,10 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .into_engine(tcx, &facts.body)
         .iterate_to_fixpoint();
 
-        let mut visitor = BorrowckVisitor { _facts: &facts };
+        let mut visitor = BorrowckVisitor {
+            _facts: &facts,
+            overlaps: FxHashSet::default(),
+        };
 
         rustc_mir_dataflow::visit_results(
             &facts.body,
@@ -60,7 +81,27 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             &mut visitor,
         );
 
+        let overlaps = visitor.overlaps;
+
+        // Determine the bijection between the inferred return type and the actual return type.
+        let real_ret_ty = normalize_preserving_regions(
+            tcx,
+            tcx.param_env(did),
+            get_fn_sig_maybe_closure(tcx, did.to_def_id())
+                .skip_binder()
+                .output(),
+        )
+        .skip_binder();
+
+        let infer_ret_ty = facts.body.local_decls[Local::from_u32(0)].ty;
+        let mut infer_to_real = FunctionMap::default();
+
+        par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real| {
+            infer_to_real.insert(inf.as_var(), real);
+        });
+
         // Now, use the region information to determine which locals are leaked
+        let mut leaked_locals = FxHashMap::default();
         {
             let mut cst_graph = Graph::new();
             let mut cst_nodes = FxHashMap::default();
@@ -87,48 +128,61 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             }
 
             // Determine which nodes are reachable from our leaked regions.
-            let mut leaked = FxHashSet::default();
+            for origin_re_var in extract_free_region_list(tcx, infer_ret_ty, re_as_vid) {
+                let mut leaked_res = FxHashSet::default();
 
-            for origin in extract_free_region_list(
-                tcx,
-                facts.body.local_decls[Local::from_u32(0)].ty,
-                re_as_vid,
-            ) {
-                let Some(&origin) = cst_nodes.get(&origin) else {
+                let Some(&origin) = cst_nodes.get(&origin_re_var) else {
                     continue;
                 };
 
                 let mut dfs = Dfs::new(&cst_graph, origin);
 
                 while let Some(reachable) = dfs.next(&cst_graph) {
-                    leaked.insert(reachable);
+                    leaked_res.insert(reachable);
                 }
-            }
 
-            // Finally, let's go through each local to see if it has any regions linked to the
-            // return type.
-            for (local, info) in facts.body.local_decls.iter_enumerated() {
-                for used in extract_free_region_list(tcx, info.ty, re_as_vid) {
-                    let Some(used) = cst_nodes.get(&used) else {
-                        continue;
-                    };
+                // Finally, let's go through each local to see if it has any regions linked to the
+                // return type.
+                let origin_real = infer_to_real.map[&origin_re_var].unwrap();
+                let leaked_locals: &mut Vec<_> = leaked_locals.entry(origin_real).or_default();
 
-                    if leaked.contains(used) {
-                        eprintln!(
-                            "{local:?} of type {:?} is tied to the return value",
-                            info.ty
-                        );
+                for (local, info) in facts.body.local_decls.iter_enumerated() {
+                    for used in extract_free_region_list(tcx, info.ty, re_as_vid) {
+                        let Some(used) = cst_nodes.get(&used) else {
+                            continue;
+                        };
+
+                        if leaked_res.contains(used) {
+                            leaked_locals.push(local);
+                        }
                     }
                 }
             }
         }
 
-        Self { _ty: &() }
+        Self {
+            borrow_locations,
+            overlaps,
+            leaked_locals,
+        }
+    }
+
+    pub fn validate(&self) {
+        // TODO
     }
 }
 
 struct BorrowckVisitor<'mir, 'tcx> {
     _facts: &'mir BodyWithBorrowckFacts<'tcx>,
+    overlaps: FxHashSet<BitSet<BorrowIndex>>,
+}
+
+impl<'mir, 'tcx> BorrowckVisitor<'mir, 'tcx> {
+    fn push_overlap_set(&mut self, set: &BitSet<BorrowIndex>) {
+        if !self.overlaps.contains(set) {
+            self.overlaps.insert(set.clone());
+        }
+    }
 }
 
 impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx> {
@@ -137,37 +191,41 @@ impl<'mir, 'tcx, R> ResultsVisitor<'mir, 'tcx, R> for BorrowckVisitor<'mir, 'tcx
     fn visit_statement_before_primary_effect(
         &mut self,
         _results: &mut R,
-        _state: &Self::FlowState,
+        state: &Self::FlowState,
         _statement: &'mir Statement<'tcx>,
         _location: Location,
     ) {
+        self.push_overlap_set(state);
     }
 
     fn visit_statement_after_primary_effect(
         &mut self,
         _results: &mut R,
-        _state: &Self::FlowState,
+        state: &Self::FlowState,
         _statement: &'mir Statement<'tcx>,
         _location: Location,
     ) {
+        self.push_overlap_set(state);
     }
 
     fn visit_terminator_before_primary_effect(
         &mut self,
         _results: &mut R,
-        _state: &Self::FlowState,
+        state: &Self::FlowState,
         _terminator: &'mir Terminator<'tcx>,
         _location: Location,
     ) {
+        self.push_overlap_set(state);
     }
 
     fn visit_terminator_after_primary_effect(
         &mut self,
         _results: &mut R,
-        _state: &Self::FlowState,
+        state: &Self::FlowState,
         _terminator: &'mir Terminator<'tcx>,
         _location: Location,
     ) {
+        self.push_overlap_set(state);
     }
 }
 

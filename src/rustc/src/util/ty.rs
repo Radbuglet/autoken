@@ -603,9 +603,6 @@ impl<'tcx> BindableRegions<'tcx> {
         args: MaybeConcretizedArgs<'tcx>,
         name: Symbol,
     ) -> Option<FxHashSet<BoundVar>> {
-        eprintln!("name = {name:?}");
-        eprintln!("generalized = {:?}", self.generalized);
-
         // Instantiate our generic signature with the instance's information.
         let trait_sig = instantiate_ty_and_normalize_preserving_regions(
             tcx,
@@ -613,8 +610,6 @@ impl<'tcx> BindableRegions<'tcx> {
             self.generalized,
             args,
         );
-
-        eprintln!("trait_sig = {trait_sig:?}");
 
         // Determine the concrete function we're calling.
         let concrete = try_resolve_instance(
@@ -637,20 +632,18 @@ impl<'tcx> BindableRegions<'tcx> {
             Some(concrete.args),
         );
 
-        eprintln!("concrete_sig = {concrete_sig:?}");
-
         // Figure out the types' correspondences.
         todo!();
     }
 }
 
-// === `determine_region_bijection` === //
+// === FunctionMap === //
 
-pub struct FunctionMap<T> {
-    pub map: FxHashMap<T, Option<T>>,
+pub struct FunctionMap<K, V> {
+    pub map: FxHashMap<K, Option<V>>,
 }
 
-impl<T> Default for FunctionMap<T> {
+impl<K, V> Default for FunctionMap<K, V> {
     fn default() -> Self {
         Self {
             map: FxHashMap::default(),
@@ -658,8 +651,8 @@ impl<T> Default for FunctionMap<T> {
     }
 }
 
-impl<T: hash::Hash + Eq> FunctionMap<T> {
-    pub fn insert(&mut self, domain: T, value: T) -> bool {
+impl<K: hash::Hash + Eq, V: Eq> FunctionMap<K, V> {
+    pub fn insert(&mut self, domain: K, value: V) -> bool {
         self.map
             .entry(domain)
             .and_modify(|v| {
@@ -671,80 +664,9 @@ impl<T: hash::Hash + Eq> FunctionMap<T> {
             .is_none()
     }
 
-    pub fn invalidate(&mut self, domain: T) {
+    pub fn invalidate(&mut self, domain: K) {
         self.map.insert(domain, None);
     }
-}
-
-pub struct Bijection<T> {
-    pub left_to_right: FunctionMap<T>,
-    pub right_to_left: FunctionMap<T>,
-}
-
-impl<T> Default for Bijection<T> {
-    fn default() -> Self {
-        Self {
-            left_to_right: FunctionMap::default(),
-            right_to_left: FunctionMap::default(),
-        }
-    }
-}
-
-impl<T: hash::Hash + Eq + Copy> Bijection<T> {
-    pub fn insert(&mut self, left: T, right: T) {
-        let is_not_bijection =
-            self.left_to_right.insert(left, right) || self.right_to_left.insert(right, left);
-
-        if is_not_bijection {
-            self.invalidate(left, right);
-        }
-    }
-
-    pub fn invalidate(&mut self, left: T, right: T) {
-        self.left_to_right.invalidate(left);
-        self.right_to_left.invalidate(right);
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum RegionBijectionMode {
-    /// This element should be mapped to its partner bijectively.
-    NormalBijection,
-
-    /// Neither us nor the partner can be mapped bijectively.
-    RejectBijection,
-
-    /// Nothing should happen between us and our partner.
-    NoOperation,
-}
-
-pub fn determine_region_bijection<'tcx>(
-    left: Ty<'tcx>,
-    right: Ty<'tcx>,
-    mut region_mode: impl FnMut(Region<'tcx>, bool) -> RegionBijectionMode,
-) -> Bijection<Region<'tcx>> {
-    use RegionBijectionMode::*;
-
-    let mut bijection = Bijection::default();
-
-    par_traverse_regions(left, right, |left, right| {
-        let left_mode = (region_mode)(left, false);
-        let right_mode = (region_mode)(right, true);
-
-        match (left_mode, right_mode) {
-            (NormalBijection, NormalBijection) => {
-                bijection.insert(left, right);
-            }
-            (RejectBijection, _) => {
-                bijection.right_to_left.invalidate(right);
-            }
-            (_, RejectBijection) => {
-                bijection.left_to_right.invalidate(left);
-            }
-            (NoOperation, _) | (_, NoOperation) => {}
-        }
-    });
-    bijection
 }
 
 // === `par_traverse_regions` === //
