@@ -24,21 +24,20 @@ pub struct TokenMirBuilder<'tcx, 'body> {
     body: &'body mut Body<'tcx>,
 
     // Caches
+    token_ref_ty: Ty<'tcx>,
     token_ref_mut_ty: Ty<'tcx>,
-    dangling_addr_local_ty: Ty<'tcx>,
     dangling_addr_local: Local,
     default_source_info: SourceInfo,
 
     // Addition queues
-    preprender: PrependerState<'tcx>,
-    tokens: Vec<Local>,
+    prepender: PrependerState<'tcx>,
 }
-
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct TokenKey<'tcx>(pub Ty<'tcx>);
 
 impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
     pub fn new(tcx: TyCtxt<'tcx>, body: &'body mut Body<'tcx>) -> Self {
+        // token_ref_ty = &'erased ()
+        let token_ref_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
+
         // token_ref_mut_ty = &'erased mut ()
         let token_ref_mut_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
 
@@ -53,19 +52,49 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             scope: SourceScope::from_u32(0),
         };
 
+        let mut prepender = (Vec::new(), BasicBlock::from_u32(0));
+
+        // Define
+        // dangling_addr_local = 0x1 as *mut ()
+        Self::prepend_statement_raw(
+            body,
+            &mut prepender,
+            BasicBlock::from_u32(0),
+            [Statement {
+                source_info: default_source_info,
+                kind: StatementKind::Assign(Box::new((
+                    Place {
+                        local: dangling_addr_local,
+                        projection: List::empty(),
+                    },
+                    Rvalue::Cast(
+                        CastKind::PointerFromExposedAddress,
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: DUMMY_SP,
+                            user_ty: None,
+                            const_: Const::Val(
+                                ConstValue::Scalar(Scalar::from_target_usize(1, &tcx.data_layout)),
+                                tcx.types.usize,
+                            ),
+                        })),
+                        dangling_addr_local_ty,
+                    ),
+                ))),
+            }],
+        );
+
         Self {
             tcx,
             body,
 
             // Caches
+            token_ref_ty,
             token_ref_mut_ty,
-            dangling_addr_local_ty,
             dangling_addr_local,
             default_source_info,
 
             // Addition queues
-            preprender: (Vec::new(), BasicBlock::from_u32(0)),
-            tokens: Vec::new(),
+            prepender,
         }
     }
 
@@ -95,7 +124,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
     }
 
     fn flush_prepended(&mut self) {
-        Self::flush_prepended_raw(self.body, &mut self.preprender);
+        Self::flush_prepended_raw(self.body, &mut self.prepender);
     }
 
     fn prepend_statement(
@@ -103,101 +132,25 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         bb: BasicBlock,
         stmts: impl IntoIterator<Item = Statement<'tcx>>,
     ) {
-        Self::prepend_statement_raw(self.body, &mut self.preprender, bb, stmts)
+        Self::prepend_statement_raw(self.body, &mut self.prepender, bb, stmts)
     }
 
     // === Tokens === //
 
-    fn prepend_token_initializers(&mut self) {
-        let init_basic_block = BasicBlock::from_u32(0);
-
-        // dangling_addr_local = 0x1 as *mut ()
-        self.prepend_statement(
-            init_basic_block,
-            [Statement {
-                source_info: self.default_source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place {
-                        local: self.dangling_addr_local,
-                        projection: List::empty(),
-                    },
-                    Rvalue::Cast(
-                        CastKind::PointerFromExposedAddress,
-                        Operand::Constant(Box::new(ConstOperand {
-                            span: DUMMY_SP,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_target_usize(
-                                    1,
-                                    &self.tcx.data_layout,
-                                )),
-                                self.tcx.types.usize,
-                            ),
-                        })),
-                        self.dangling_addr_local_ty,
-                    ),
-                ))),
-            }],
-        );
-
-        for &local in &self.tokens {
-            Self::prepend_statement_raw(
-                self.body,
-                &mut self.preprender,
-                init_basic_block,
-                [Statement {
-                    source_info: self.default_source_info,
-                    kind: StatementKind::Assign(Box::new((
-                        Place {
-                            local,
-                            projection: List::empty(),
-                        },
-                        Rvalue::Ref(
-                            self.tcx.lifetimes.re_erased,
-                            BorrowKind::Mut {
-                                kind: MutBorrowKind::Default,
-                            },
-                            Place {
-                                local: self.dangling_addr_local,
-                                projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
-                            },
-                        ),
-                    ))),
-                }],
-            );
-        }
-    }
-
-    fn create_token(&mut self) -> Local {
+    #[must_use]
+    fn create_token(&mut self) -> (Local, Statement<'tcx>) {
         let local = self
             .body
             .local_decls
             .push(LocalDecl::new(self.token_ref_mut_ty, DUMMY_SP));
 
-        self.tokens.push(local);
-        local
-    }
-
-    // === Calls === //
-
-    pub fn ensure_not_borrowed_at(&mut self, bb: BasicBlock) -> Local {
-        let local = self.create_token();
-        let dummy_token_holder = self
-            .body
-            .local_decls
-            .push(LocalDecl::new(self.token_ref_mut_ty, DUMMY_SP));
-        let source_info = self.body.basic_blocks[bb]
-            .terminator
-            .as_ref()
-            .map_or(self.default_source_info, |sf| sf.source_info);
-
-        self.body.basic_blocks.as_mut_preserves_cfg()[bb]
-            .statements
-            .push(Statement {
-                source_info,
+        (
+            local,
+            Statement {
+                source_info: self.default_source_info,
                 kind: StatementKind::Assign(Box::new((
                     Place {
-                        local: dummy_token_holder,
+                        local,
                         projection: List::empty(),
                     },
                     Rvalue::Ref(
@@ -206,12 +159,52 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                             kind: MutBorrowKind::Default,
                         },
                         Place {
-                            local,
+                            local: self.dangling_addr_local,
                             projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
                         },
                     ),
                 ))),
-            });
+            },
+        )
+    }
+
+    // === Calls === //
+
+    pub fn ensure_not_borrowed_at(&mut self, bb: BasicBlock) -> Local {
+        let (local, local_initializer) = self.create_token();
+
+        let dummy_token_holder = self
+            .body
+            .local_decls
+            .push(LocalDecl::new(self.token_ref_ty, DUMMY_SP));
+
+        let source_info = self.body.basic_blocks[bb]
+            .terminator
+            .as_ref()
+            .map_or(self.default_source_info, |sf| sf.source_info);
+
+        self.body.basic_blocks.as_mut_preserves_cfg()[bb]
+            .statements
+            .extend([
+                local_initializer,
+                Statement {
+                    source_info,
+                    kind: StatementKind::Assign(Box::new((
+                        Place {
+                            local: dummy_token_holder,
+                            projection: List::empty(),
+                        },
+                        Rvalue::Ref(
+                            self.tcx.lifetimes.re_erased,
+                            BorrowKind::Shared,
+                            Place {
+                                local,
+                                projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
+                            },
+                        ),
+                    ))),
+                },
+            ]);
 
         local
     }
@@ -260,7 +253,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                         },
                     ),
                     TypeAndMut {
-                        mutbl: Mutability::Mut,
+                        mutbl: Mutability::Not,
                         ty: self.tcx.types.unit,
                     },
                 ),
@@ -275,7 +268,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     self.tcx,
                     self.tcx.lifetimes.re_erased,
                     TypeAndMut {
-                        mutbl: Mutability::Mut,
+                        mutbl: Mutability::Not,
                         ty: self.tcx.types.unit,
                     },
                 ),
@@ -308,17 +301,18 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             .local_decls
             .push(LocalDecl::new(tuple_binder_inferred, DUMMY_SP));
 
-        let token_local = self.create_token();
+        let (token_local, token_initializer) = self.create_token();
         let token_rb_local = self
             .body
             .local_decls
-            .push(LocalDecl::new(self.token_ref_mut_ty, DUMMY_SP));
+            .push(LocalDecl::new(self.token_ref_ty, DUMMY_SP));
 
         self.body.local_decls[call_out_place.local].mutability = Mutability::Mut;
 
         self.prepend_statement(
             call_out_bb,
             [
+                token_initializer,
                 Statement {
                     source_info,
                     kind: StatementKind::Assign(Box::new((
@@ -328,9 +322,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                         },
                         Rvalue::Ref(
                             self.tcx.lifetimes.re_erased,
-                            BorrowKind::Mut {
-                                kind: MutBorrowKind::Default,
-                            },
+                            BorrowKind::Shared,
                             Place {
                                 local: token_local,
                                 projection: self.tcx.mk_place_elems(&[ProjectionElem::Deref]),
@@ -395,7 +387,6 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
 
 impl Drop for TokenMirBuilder<'_, '_> {
     fn drop(&mut self) {
-        self.prepend_token_initializers();
         self.flush_prepended();
     }
 }
