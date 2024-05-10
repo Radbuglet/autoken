@@ -14,9 +14,9 @@ use crate::util::{
         },
         read_feed,
     },
-    hash::{FxHashMap, FxHashSet},
+    hash::FxHashMap,
     mir::{get_callee_from_terminator, TerminalCallKind},
-    ty::{FunctionCallAndRegions, MaybeConcretizedFunc},
+    ty::{FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc, MutabilityExt},
 };
 
 use super::{
@@ -37,7 +37,7 @@ pub struct BodyTemplateFacts<'tcx> {
 
 pub struct TemplateCall<'tcx> {
     /// The function we called.
-    pub call: FunctionCallAndRegions<'tcx>,
+    pub func: FunctionCallAndRegions<'tcx>,
 
     /// The local borrowed mutably before the call is made.
     pub prevent_call_local: Local,
@@ -99,7 +99,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             calls.push(TemplateCall {
                 prevent_call_local: enb_local,
                 tied_locals,
-                call: mask,
+                func: mask,
             });
         }
 
@@ -148,21 +148,75 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         overlaps: &BodyOverlapFacts<'tcx>,
         args: GenericArgsRef<'tcx>,
     ) {
+        // Determine what each local borrows
+        let mut borrowing_locals = FxHashMap::<Local, FxHashMap<Ty<'tcx>, Mutability>>::default();
+
+        fn add_local_borrow<'tcx>(
+            bs: &mut FxHashMap<Local, FxHashMap<Ty<'tcx>, Mutability>>,
+            local: Local,
+            token: Ty<'tcx>,
+            mutability: Mutability,
+        ) {
+            bs.entry(local)
+                .or_default()
+                .entry(token)
+                .or_insert(Mutability::Not)
+                .upgrade(mutability);
+        }
+
+        for call in &self.calls {
+            let callee = args.instantiate_arg(tcx, ParamEnv::reveal_all(), call.func.instance);
+            let Some(callee) = trace.facts(callee) else {
+                continue;
+            };
+
+            for (&borrow_ty, &(borrow_mut, borrow_sym)) in &callee.borrows {
+                add_local_borrow(
+                    &mut borrowing_locals,
+                    call.prevent_call_local,
+                    borrow_ty,
+                    borrow_mut,
+                );
+
+                if let Some(borrow_sym) = borrow_sym {
+                    for tie_local in call.func.get_linked(tcx, Some(args), borrow_sym).unwrap() {
+                        add_local_borrow(
+                            &mut borrowing_locals,
+                            call.tied_locals[tie_local.as_usize()],
+                            borrow_ty,
+                            borrow_mut,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Validate borrow overlaps
+        overlaps.validate_overlaps(tcx, |first, second| {
+            let first = borrowing_locals.get(&first)?;
+            let second = borrowing_locals.get(&second)?;
+
+            let (first, second) = if first.len() > second.len() {
+                (first, second)
+            } else {
+                (second, first)
+            };
+
+            for (token, first_mut) in first {
+                let Some(second_mut) = second.get(token) else {
+                    continue;
+                };
+
+                if !first_mut.is_compatible_with(*second_mut) {
+                    // FIXME: Mutabilities need to be swapped
+                    return Some((token.to_string(), *first_mut, *second_mut));
+                }
+            }
+
+            None
+        });
+
+        // Validate leaked locals
         // TODO
-        //         // Determine what each local borrows
-        //         let mut borrowing_locals = FxHashMap::<Local, FxHashSet<(Ty<'tcx>, Mutability)>>::default();
-        //         let mut get_local_borrow_set = |local: Local| borrowing_locals.entry(local).or_default();
-        //
-        //         for call in &self.calls {
-        //             get_local_borrow_set(call.prevent_call_local).insert(value);
-        //         }
-        //
-        //         // Validate borrow overlaps
-        //         overlaps.validate_overlaps(tcx, |first, second| {
-        //             todo!();
-        //         });
-        //
-        //         // Validate leaked locals
-        //         // TODO
     }
 }

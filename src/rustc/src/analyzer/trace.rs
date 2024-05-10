@@ -1,9 +1,12 @@
 use std::collections::hash_map;
 
 use rustc_middle::ty::{Instance, Mutability, ParamEnv, Ty, TyCtxt};
+use rustc_span::Symbol;
 
 use crate::{
-    analyzer::sets::{instantiate_set, instantiate_set_proc, is_absorb_func, is_tie_func},
+    analyzer::sets::{
+        instantiate_set, instantiate_set_proc, is_absorb_func, is_tie_func, parse_tie_func,
+    },
     util::{
         graph::{GraphPropagator, GraphPropagatorCx},
         hash::FxHashMap,
@@ -24,7 +27,7 @@ pub struct TraceFacts<'tcx> {
 
 #[derive(Debug, Clone)]
 pub struct TracedFuncFacts<'tcx> {
-    pub borrows: FxHashMap<Ty<'tcx>, Mutability>,
+    pub borrows: FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
 }
 
 impl<'tcx> TraceFacts<'tcx> {
@@ -141,11 +144,19 @@ fn analyze_fn_facts<'tcx>(
             continue;
         };
 
-        for (borrow_key, borrow_mut) in &target_facts.borrows {
-            let curr_mut = borrows.entry(*borrow_key).or_insert(Mutability::Not);
+        let lt_id = parse_tie_func(tcx, target_instance).and_then(|v| v.tied_to);
+
+        for (borrow_key, (borrow_mut, _)) in &target_facts.borrows {
+            let (curr_mut, curr_lt) = borrows
+                .entry(*borrow_key)
+                .or_insert((Mutability::Not, None));
 
             if borrow_mut.is_mut() {
                 *curr_mut = Mutability::Mut;
+            }
+
+            if let Some(lt_id) = lt_id {
+                *curr_lt = Some(lt_id);
             }
         }
     }
@@ -157,7 +168,7 @@ fn analyze_fn_facts<'tcx>(
             instance.args[0].as_type().unwrap(),
             &mut |ty, mutability| match borrows.entry(ty) {
                 hash_map::Entry::Occupied(entry) => {
-                    if mutability.is_mut() || *entry.get() == Mutability::Not {
+                    if mutability.is_mut() || entry.get().0 == Mutability::Not {
                         entry.remove();
                     }
                 }

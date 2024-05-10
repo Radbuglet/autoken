@@ -16,7 +16,7 @@ use crate::util::{
     hash::{FxHashMap, FxHashSet},
     ty::{
         extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
-        par_traverse_regions, FunctionRelation,
+        par_traverse_regions, FunctionRelation, MutabilityExt,
     },
 };
 
@@ -185,6 +185,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 else {
                     continue;
                 };
+
+                assert!(!old_bw_mut.is_compatible_with(new_bw_mut));
 
                 // Report the conflict
                 dcx.struct_span_err(

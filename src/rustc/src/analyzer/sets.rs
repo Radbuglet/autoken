@@ -53,17 +53,20 @@ pub fn parse_tie_func<'tcx>(
     })
 }
 
-pub fn instantiate_set<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> FxHashMap<Ty<'tcx>, Mutability> {
-    let mut set = FxHashMap::<Ty<'tcx>, Mutability>::default();
+pub fn instantiate_set<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)> {
+    let mut set = FxHashMap::<Ty<'tcx>, (Mutability, Option<Symbol>)>::default();
 
     instantiate_set_proc(tcx, ty, &mut |ty, mutability| match set.entry(ty) {
         hash_map::Entry::Occupied(entry) => {
             if mutability.is_mut() {
-                *entry.into_mut() = Mutability::Mut;
+                entry.into_mut().0 = Mutability::Mut;
             }
         }
         hash_map::Entry::Vacant(entry) => {
-            entry.insert(mutability);
+            entry.insert((mutability, None));
         }
     });
 
@@ -93,11 +96,11 @@ pub fn instantiate_set_proc<'tcx>(
         {
             let mut set = instantiate_set(tcx, generics[0].as_type().unwrap());
 
-            for mutability in set.values_mut() {
+            for (mutability, _) in set.values_mut() {
                 *mutability = Mutability::Not;
             }
 
-            for (ty, mutability) in set {
+            for (ty, (mutability, _)) in set {
                 add(ty, mutability);
             }
         }
@@ -105,14 +108,14 @@ pub fn instantiate_set_proc<'tcx>(
             let mut set = instantiate_set(tcx, generics[0].as_type().unwrap());
 
             fn remover_func<'set, 'tcx>(
-                set: &'set mut FxHashMap<Ty<'tcx>, Mutability>,
+                set: &'set mut FxHashMap<Ty<'tcx>, (Mutability, Option<Symbol>)>,
             ) -> impl FnMut(Ty<'tcx>, Mutability) + 'set {
                 |ty, mutability| match set.entry(ty) {
                     hash_map::Entry::Occupied(entry) => {
                         if mutability.is_mut() {
                             entry.remove();
                         } else {
-                            *entry.into_mut() = Mutability::Not;
+                            entry.into_mut().0 = Mutability::Not;
                         }
                     }
                     hash_map::Entry::Vacant(_) => {}
@@ -125,7 +128,7 @@ pub fn instantiate_set_proc<'tcx>(
                 &mut remover_func(&mut set),
             );
 
-            for (ty, mutability) in set {
+            for (ty, (mutability, _)) in set {
                 add(ty, mutability);
             }
         }

@@ -117,7 +117,7 @@ fn ensure_no_borrow<'tcx>(
                 facts
                     .borrows
                     .iter()
-                    .map(|(k, m)| format!(
+                    .map(|(k, (m, _))| format!(
                         "{k} {}",
                         if m.is_mut() { "mutably" } else { "immutably" }
                     ))

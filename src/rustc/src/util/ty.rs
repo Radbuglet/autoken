@@ -151,11 +151,17 @@ pub fn try_resolve_mono_args_for_func(
 
 pub trait MutabilityExt {
     fn upgrade(&mut self, other: Mutability);
+
+    fn is_compatible_with(&self, other: Mutability) -> bool;
 }
 
 impl MutabilityExt for Mutability {
     fn upgrade(&mut self, other: Mutability) {
         *self = (*self).max(other);
+    }
+
+    fn is_compatible_with(&self, other: Mutability) -> bool {
+        self.is_not() && other.is_not()
     }
 }
 

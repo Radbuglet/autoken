@@ -1,8 +1,4 @@
-fn main() {
-    let a = tie();
-    let _ = tie();
-    let _ = a;
-}
+fn main() {}
 
 fn bar() {
     let mut foo = Vec::new();
@@ -11,7 +7,13 @@ fn bar() {
     }
 }
 
+fn baz() {
+    let foo = tie();
+    let bar = tie();
+    let _ = foo;
+}
+
 fn tie<'a>() -> &'a () {
-    autoken::tie!('a => mut ());
+    autoken::tie!('a => mut u32);
     &()
 }
