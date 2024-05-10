@@ -539,17 +539,17 @@ where
         .unwrap()
 }
 
-// === BindableRegions === //
+// === FunctionCallAndRegions === //
 
 #[derive(Debug, Copy, Clone)]
-pub struct BindableRegions<'tcx> {
+pub struct FunctionCallAndRegions<'tcx> {
     pub param_env: ParamEnv<'tcx>,
     pub instance: Instance<'tcx>,
     pub generalized: Binder<'tcx, Ty<'tcx>>,
     pub param_count: u32,
 }
 
-impl<'tcx> BindableRegions<'tcx> {
+impl<'tcx> FunctionCallAndRegions<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, instance: Instance<'tcx>) -> Self {
         // Let's grab the signature for this instance.
         let sig = instantiate_preserving_regions(
@@ -666,13 +666,13 @@ impl<'tcx> BindableRegions<'tcx> {
     }
 }
 
-// === FunctionMap === //
+// === FunctionRelation === //
 
-pub struct FunctionMap<K, V> {
+pub struct FunctionRelation<K, V> {
     pub map: FxHashMap<K, Option<V>>,
 }
 
-impl<K, V> Default for FunctionMap<K, V> {
+impl<K, V> Default for FunctionRelation<K, V> {
     fn default() -> Self {
         Self {
             map: FxHashMap::default(),
@@ -680,7 +680,7 @@ impl<K, V> Default for FunctionMap<K, V> {
     }
 }
 
-impl<K: hash::Hash + Eq, V: Eq> FunctionMap<K, V> {
+impl<K: hash::Hash + Eq, V: Eq> FunctionRelation<K, V> {
     pub fn insert(&mut self, domain: K, value: V) -> bool {
         self.map
             .entry(domain)
@@ -788,6 +788,9 @@ where
             (TyKind::Tuple(left), TyKind::Tuple(right)) => {
                 self.traverse_type_lists(left, right);
             }
+            (TyKind::Alias(_, left), TyKind::Alias(_, right)) => {
+                self.traverse_generics(left.args, right.args);
+            }
 
             // Unsupported.
             (TyKind::CoroutineClosure(..), TyKind::CoroutineClosure(..)) => todo!(),
@@ -803,17 +806,14 @@ where
             (TyKind::Foreign(..), TyKind::Foreign(..)) => {}
             (TyKind::Str, TyKind::Str) => {}
             (TyKind::Never, TyKind::Never) => {}
+            (TyKind::Infer(..), TyKind::Infer(..)) => {}
+            (TyKind::Placeholder(..), TyKind::Placeholder(..)) => {}
+            (TyKind::Param(..), TyKind::Param(..)) => {}
+            (TyKind::Bound(..), TyKind::Bound(..)) => {}
 
             // We just ignore errors since this crate is already rejected and
             // we have to do something sensible.
             (TyKind::Error(..), TyKind::Error(..)) => {}
-
-            // Non-applicable.
-            (TyKind::Infer(..), TyKind::Infer(..)) => unreachable!(),
-            (TyKind::Placeholder(..), TyKind::Placeholder(..)) => unreachable!(),
-            (TyKind::Param(..), TyKind::Param(..)) => unreachable!(),
-            (TyKind::Alias(..), TyKind::Alias(..)) => unreachable!(),
-            (TyKind::Bound(..), TyKind::Bound(..)) => unreachable!(),
             _ => unreachable!(),
         }
     }

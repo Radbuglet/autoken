@@ -16,7 +16,7 @@ use crate::util::{
     hash::{FxHashMap, FxHashSet},
     ty::{
         extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
-        par_traverse_regions, FunctionMap,
+        par_traverse_regions, FunctionRelation,
     },
 };
 
@@ -24,7 +24,7 @@ use crate::util::{
 
 #[derive(Debug, Clone)]
 pub struct BodyOverlapFacts<'tcx> {
-    borrows: FxHashMap<BorrowIndex, (Local, Mutability, Span)>,
+    borrows: FxHashMap<BorrowIndex, (Local, Span)>,
     overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
     leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
 }
@@ -52,11 +52,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             .map(|(bw, (loc, info))| {
                 (
                     BorrowIndex::from_usize(bw),
-                    (
-                        info.borrowed_place.local,
-                        info.kind.mutability(),
-                        facts.body.source_info(*loc).span,
-                    ),
+                    (info.borrowed_place.local, facts.body.source_info(*loc).span),
                 )
             })
             .collect();
@@ -96,7 +92,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         .skip_binder();
 
         let infer_ret_ty = facts.body.local_decls[Local::from_u32(0)].ty;
-        let mut infer_to_real = FunctionMap::default();
+        let mut infer_to_real = FunctionRelation::default();
 
         par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real, _| {
             infer_to_real.insert(inf.as_var(), real);
@@ -172,7 +168,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     pub fn validate_overlaps(
         &self,
         tcx: TyCtxt<'tcx>,
-        mut are_conflicting: impl FnMut(Local, Local) -> Option<String>,
+        mut are_conflicting: impl FnMut(Local, Local) -> Option<(String, Mutability, Mutability)>,
     ) {
         let dcx = tcx.dcx();
 
@@ -182,19 +178,15 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     continue;
                 }
 
-                let (old_bw_local, old_bw_mut, old_bw_span) = self.borrows[&old_bw];
-                let (new_bw_local, new_bw_mut, new_bw_span) = self.borrows[&new_bw];
+                let (old_bw, old_bw_span) = self.borrows[&old_bw];
+                let (new_bw, new_bw_span) = self.borrows[&new_bw];
 
-                let Some(conflict) = (are_conflicting)(new_bw_local, old_bw_local) else {
+                let Some((conflict, old_bw_mut, new_bw_mut)) = (are_conflicting)(new_bw, old_bw)
+                else {
                     continue;
                 };
 
-                if old_bw_mut.is_not() && new_bw_mut.is_not() {
-                    continue;
-                }
-
                 // Report the conflict
-                // TODO: Better diagnostics
                 dcx.struct_span_err(
                     new_bw_span,
                     format!("conflicting borrows on token {conflict}"),

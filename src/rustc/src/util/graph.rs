@@ -41,11 +41,11 @@ where
         }
     }
 
-    pub fn context(&self) -> &Cx {
+    pub fn cx(&self) -> &Cx {
         &self.cx
     }
 
-    pub fn context_mut(&mut self) -> &mut Cx {
+    pub fn cx_mut(&mut self) -> &mut Cx {
         &mut self.cx
     }
 
@@ -150,7 +150,7 @@ where
         self.propagator.fact_map_mut().get_mut(&node)
     }
 
-    pub fn context_mut(&mut self) -> &mut Cx {
-        self.propagator.context_mut()
+    pub fn cx(&mut self) -> &mut Cx {
+        self.propagator.cx_mut()
     }
 }
