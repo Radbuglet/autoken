@@ -6,7 +6,7 @@ use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
     EarlyBinder, ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgs,
     GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region,
-    RegionKind, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    RegionKind, RegionVid, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
@@ -14,6 +14,10 @@ use rustc_trait_selection::traits::ObligationCtxt;
 use super::hash::{FxHashMap, FxHashSet};
 
 // === Type Matching === //
+
+pub fn re_as_vid(re: Region<'_>) -> Option<RegionVid> {
+    re.is_var().then(|| re.as_var())
+}
 
 pub fn is_generic_ty_param(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), TyKind::Param(_) | TyKind::Alias(_, _))

@@ -1,7 +1,7 @@
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
 use rustc_middle::{
     mir::{BasicBlock, Local},
-    ty::{BoundVar, GenericArgsRef, Instance, InstanceDef, Mutability, ParamEnv, Ty, TyCtxt},
+    ty::{BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Ty, TyCtxt},
 };
 use rustc_span::Symbol;
 
@@ -16,10 +16,7 @@ use crate::util::{
     },
     hash::FxHashMap,
     mir::{get_callee_from_terminator, TerminalCallKind},
-    ty::{
-        try_resolve_instance, FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc,
-        MutabilityExt,
-    },
+    ty::{FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc, MutabilityExt},
 };
 
 use super::{

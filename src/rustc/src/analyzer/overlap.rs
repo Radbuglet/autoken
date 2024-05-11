@@ -5,7 +5,7 @@ use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
-    ty::{Mutability, Region, RegionVid, TyCtxt},
+    ty::{Mutability, Region, TyCtxt},
 };
 use rustc_mir_dataflow::{Analysis, ResultsVisitor};
 use rustc_span::Span;
@@ -15,7 +15,7 @@ use crate::util::{
     mir::get_body_with_borrowck_facts_but_sinful,
     ty::{
         extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
-        par_traverse_regions, FunctionRelation, MutabilityExt,
+        par_traverse_regions, re_as_vid, FunctionRelation, MutabilityExt,
     },
 };
 
@@ -88,7 +88,9 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         let mut infer_to_real = FunctionRelation::default();
 
         par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real, _| {
-            infer_to_real.insert(inf.as_var(), real);
+            if let Some(inf) = re_as_vid(inf) {
+                infer_to_real.insert(inf, real);
+            }
         });
 
         // Now, use the region information to determine which locals are leaked
@@ -96,10 +98,6 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         {
             let mut cst_graph = Graph::new();
             let mut cst_nodes = FxHashMap::default();
-
-            fn re_as_vid(re: Region<'_>) -> Option<RegionVid> {
-                re.is_var().then(|| re.as_var())
-            }
 
             // Build constraint graph
             for cst in facts.region_inference_context.outlives_constraints() {
