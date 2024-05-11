@@ -1,5 +1,10 @@
 use std::sync::OnceLock;
 
+use rustc_data_structures::sync::RwLock as RdsRwLock;
+
+use rustc_borrowck::consumers::{
+    get_body_with_borrowck_facts, BodyWithBorrowckFacts, ConsumerOptions,
+};
 use rustc_data_structures::steal::Steal;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
@@ -383,5 +388,91 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                 _ => {}
             }
         }
+    }
+}
+
+// === `get_body_with_borrowck_facts_but_sinful` === //
+
+// HACK: `get_body_with_borrowck_facts` does not use `tcx.local_def_id_to_hir_id(def).owner` to
+// determine the origin of the inference context like regular `mir_borrowck` does.
+//
+// Here's the source of `get_body_with_borrowck_facts`:
+//
+// ```
+// pub fn get_body_with_borrowck_facts(
+//     tcx: TyCtxt<'_>,
+//     def: LocalDefId,
+//     options: ConsumerOptions,
+// ) -> BodyWithBorrowckFacts<'_> {
+//     let (input_body, promoted) = tcx.mir_promoted(def);
+//     let infcx = tcx.infer_ctxt().with_opaque_type_inference(DefiningAnchor::Bind(def)).build();
+//     let input_body: &Body<'_> = &input_body.borrow();
+//     let promoted: &IndexSlice<_, _> = &promoted.borrow();
+//     *super::do_mir_borrowck(&infcx, input_body, promoted, Some(options)).1.unwrap()
+// }
+// ```
+//
+// ...and here's the (abridged) source of `mir_borrowck`:
+//
+// ```
+// fn mir_borrowck(tcx: TyCtxt<'_>, def: LocalDefId) -> &BorrowCheckResult<'_> {
+//     let (input_body, promoted) = tcx.mir_promoted(def);
+//     let input_body: &Body<'_> = &input_body.borrow();
+//
+//     // (erroneous input rejection here)
+//
+//     let hir_owner = tcx.local_def_id_to_hir_id(def).owner;
+//     let infcx =
+//         tcx.infer_ctxt().with_opaque_type_inference(DefiningAnchor::Bind(hir_owner.def_id)).build();
+//
+//     let promoted: &IndexSlice<_, _> = &promoted.borrow();
+//     let opt_closure_req = do_mir_borrowck(&infcx, input_body, promoted, None).0;
+//     tcx.arena.alloc(opt_closure_req)
+// }
+// ```
+//
+// So long as we can pass the owner's `DefId` to `get_body_with_borrowck_facts` but the shadow's body
+// and promoted set, we can emulate the correct behavior of `mir_borrowck`—which is exactly what this
+// Abomination To Everything Good does.
+pub fn get_body_with_borrowck_facts_but_sinful(
+    tcx: TyCtxt<'_>,
+    shadow_did: LocalDefId,
+    options: ConsumerOptions,
+) -> BodyWithBorrowckFacts<'_> {
+    // Begin by stealing the `mir_promoted` for our shadow function.
+    let (shadow_body, shadow_promoted) = tcx.mir_promoted(shadow_did);
+
+    let shadow_body = shadow_body.steal();
+    let shadow_promoted = shadow_promoted.steal();
+
+    // Now, let's determine the `orig_did`.
+    let hir_did = tcx.local_def_id_to_hir_id(shadow_did).owner.def_id;
+
+    // Modify the instance MIR in place. This doesn't violate query caching because steal is
+    // interior-mutable and stable across queries. We're not breaking caching anywhere else since
+    // `get_body_with_borrowck_facts` is just a wrapper around `do_mir_borrowck`.
+    let (orig_body, orig_promoted) = tcx.mir_promoted(hir_did);
+
+    let orig_body = unpack_steal(orig_body);
+    let orig_promoted = unpack_steal(orig_promoted);
+
+    let old_body = std::mem::replace(&mut *orig_body.write(), Some(shadow_body));
+    let _dg1 = scopeguard::guard(old_body, |old_body| {
+        *orig_body.write() = old_body;
+    });
+
+    let old_promoted = std::mem::replace(&mut *orig_promoted.write(), Some(shadow_promoted));
+    let _dg2 = scopeguard::guard(old_promoted, |old_promoted| {
+        *orig_promoted.write() = old_promoted;
+    });
+
+    // Now, do the actual borrow-check, replacing back the original MIR once the operation is done.
+    get_body_with_borrowck_facts(tcx, hir_did, options)
+}
+
+fn unpack_steal<T>(steal: &Steal<T>) -> &RdsRwLock<Option<T>> {
+    unsafe {
+        // Safety: None. This is technically U.B.
+        &*(steal as *const Steal<T> as *const RdsRwLock<Option<T>>)
     }
 }

@@ -1,7 +1,5 @@
 use petgraph::{visit::Dfs, Graph};
-use rustc_borrowck::consumers::{
-    get_body_with_borrowck_facts, BodyWithBorrowckFacts, BorrowIndex, Borrows, ConsumerOptions,
-};
+use rustc_borrowck::consumers::{BodyWithBorrowckFacts, BorrowIndex, Borrows, ConsumerOptions};
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::BitSet;
@@ -14,6 +12,7 @@ use rustc_span::Span;
 
 use crate::util::{
     hash::{FxHashMap, FxHashSet},
+    mir::get_body_with_borrowck_facts_but_sinful,
     ty::{
         extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
         par_traverse_regions, FunctionRelation, MutabilityExt,
@@ -30,19 +29,13 @@ pub struct BodyOverlapFacts<'tcx> {
 }
 
 impl<'tcx> BodyOverlapFacts<'tcx> {
-    pub fn can_borrow_check(tcx: TyCtxt<'tcx>, did: LocalDefId) -> bool {
-        // `get_body_with_borrowck_facts` skips a validation step compared to `mir_borrowck` so we
-        // reintroduce it here.
-        let (input_body, _promoted) = tcx.mir_promoted(did);
-        let input_body = &input_body.borrow();
-        !input_body.should_skip() && input_body.tainted_by_errors.is_none()
-    }
-
     pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
         // Determine the start and end locations of our borrows.
-        // FIXME: This function does not use `tcx.local_def_id_to_hir_id(def).owner` to determine
-        // the origin of the inference context like regular `mir_borrowck` does.
-        let facts = get_body_with_borrowck_facts(tcx, did, ConsumerOptions::RegionInferenceContext);
+        let facts = get_body_with_borrowck_facts_but_sinful(
+            tcx,
+            did,
+            ConsumerOptions::RegionInferenceContext,
+        );
 
         let borrow_locations = facts
             .borrow_set

@@ -1,4 +1,4 @@
-use rustc_hir::{def::DefKind, LangItem};
+use rustc_hir::{def::DefKind, Constness, LangItem};
 
 use rustc_middle::ty::{Instance, ParamEnv, TyCtxt};
 
@@ -41,6 +41,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     for did in iter_all_local_def_ids(tcx) {
         if read_feed::<MirBuiltStasher>(tcx, did).is_none()
             || !has_optimized_mir(tcx, did.to_def_id())
+            || tcx.constness(did) == Constness::Const
         {
             continue;
         }
