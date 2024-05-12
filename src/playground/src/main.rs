@@ -1,19 +1,14 @@
 fn main() {}
 
-fn bar() {
-    let mut foo = Vec::new();
-    loop {
-        foo.push(tie());
-    }
+fn works<'a>() -> impl Iterator<Item = &'a ()> {
+    let v = (0..1).map(move |_| &());
+    v
 }
 
-fn baz() {
-    let foo = tie();
-    let bar = tie();
-    let _ = foo;
+fn previously_broke<'a>() -> impl Iterator<Item = &'a ()> {
+    (0..1).map(move |_| &())
 }
 
-fn tie<'a>() -> &'a () {
-    autoken::tie!('a => mut u32);
-    &()
+fn still_breaks<'a>() -> impl Iterator<Item = &'a ()> {
+    previously_broke()
 }

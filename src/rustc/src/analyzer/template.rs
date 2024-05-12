@@ -57,7 +57,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             unreachable!();
         };
 
-        let mut body_mutator = TokenMirBuilder::new(tcx, &mut body);
+        let mut body_mutator = TokenMirBuilder::new(tcx, param_env, &mut body);
         let mut calls = Vec::new();
         let mut ties = Vec::new();
 
