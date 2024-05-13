@@ -25,12 +25,16 @@ fn whee(f: impl FnOnce()) {
     let _ = guard;
 }
 
-fn hehe<'a>() -> &'a u32 {
+fn hehe(_dummy: &u32) -> (&u32, &str) {
     map(tie())
 }
 
-fn map(_v: &()) -> &u32 {
-    &3
+fn hehe2<'b, 'c>() -> (&'b u32, &'c str) {
+    map(tie())
+}
+
+fn map(_v: &()) -> (&u32, &str) {
+    (&3, "hi!!")
 }
 
 fn tie<'a>() -> &'a () {

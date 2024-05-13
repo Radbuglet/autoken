@@ -12,7 +12,7 @@ use rustc_middle::{
         ParamEnv, Region, Ty, TyCtxt, TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
 };
-use rustc_span::DUMMY_SP;
+use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::FieldIdx;
 
 use crate::util::ty::FunctionCallAndRegions;
@@ -144,11 +144,11 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
     // === Tokens === //
 
     #[must_use]
-    fn create_token(&mut self) -> (Local, Statement<'tcx>) {
+    fn create_token(&mut self, span: Span) -> (Local, Statement<'tcx>) {
         let local = self
             .body
             .local_decls
-            .push(LocalDecl::new(self.token_ref_mut_ty, DUMMY_SP));
+            .push(LocalDecl::new(self.token_ref_mut_ty, span));
 
         (
             local,
@@ -177,7 +177,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
     // === Calls === //
 
     pub fn ensure_not_borrowed_at(&mut self, bb: BasicBlock) -> Local {
-        let (local, local_initializer) = self.create_token();
+        let (local, local_initializer) = self.create_token(DUMMY_SP);
 
         let dummy_token_holder = self
             .body
@@ -240,6 +240,9 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         let source_info = *source_info;
         let call_out_bb = *target;
         let orig_call_out_place = *destination;
+        let orig_call_out_place_span = self.body.local_decls[orig_call_out_place.local]
+            .source_info
+            .span;
 
         let fn_result = call.generalized.skip_binder();
         let fn_result_erased = self
@@ -328,7 +331,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             .local_decls
             .push(LocalDecl::new(tuple_binder_erased, DUMMY_SP));
 
-        let (token_local, token_initializer) = self.create_token();
+        let (token_local, token_initializer) = self.create_token(orig_call_out_place_span);
         let token_rb_local = self
             .body
             .local_decls

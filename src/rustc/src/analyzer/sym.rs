@@ -17,3 +17,5 @@ define! {
     __autoken_diff_ty_marker
     unnamed
 }
+
+pub static ANON_LT: CachedSymbol = CachedSymbol::new("'_");

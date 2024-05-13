@@ -270,7 +270,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
 
                 return Some(format!(
                     "since the token {borrow} is not tied to the return region {}",
-                    re.get_name_or_anon(),
+                    re.get_name().unwrap_or(sym::ANON_LT.get()),
                 ));
             }
 
