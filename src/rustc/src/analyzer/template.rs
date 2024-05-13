@@ -16,7 +16,10 @@ use crate::util::{
     },
     hash::FxHashMap,
     mir::{get_callee_from_terminator, TerminalCallKind},
-    ty::{FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc, MutabilityExt},
+    ty::{
+        try_resolve_instance, FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc,
+        MutabilityExt,
+    },
 };
 
 use super::{
@@ -78,7 +81,9 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             ) {
                 Some(TerminalCallKind::Static(_, callee)) => callee,
                 Some(TerminalCallKind::Generic(_, callee)) => callee,
-                _ => continue,
+                _ => {
+                    continue;
+                }
             };
 
             // Determine whether it has any special effects on ties.
@@ -87,7 +92,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             }
 
             // Determine mask
-            let mask = FunctionCallAndRegions::new(tcx, param_env_user, callee); // TODO: changed
+            let mask = FunctionCallAndRegions::new(tcx, param_env_user, callee);
 
             // Give it the opportunity to kill off some borrows and tie stuff to itself.
             let enb_local = body_mutator.ensure_not_borrowed_at(bb);
@@ -164,7 +169,15 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         }
 
         for call in &self.calls {
-            let callee = args.instantiate_arg(tcx, ParamEnv::reveal_all(), call.func.instance);
+            let callee = match try_resolve_instance(
+                tcx,
+                ParamEnv::reveal_all(),
+                args.instantiate_arg(tcx, ParamEnv::reveal_all(), call.func.instance),
+            ) {
+                Ok(Some(callee)) => callee,
+                Ok(None) | Err(_) => continue,
+            };
+
             let Some(callee) = trace.facts(callee) else {
                 continue;
             };
