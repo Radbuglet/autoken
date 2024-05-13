@@ -26,6 +26,7 @@ pub struct BodyOverlapFacts<'tcx> {
     borrows: FxHashMap<BorrowIndex, (Local, Span)>,
     overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
     leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
+    leaked_local_def_spans: FxHashMap<Local, Span>,
 }
 
 impl<'tcx> BodyOverlapFacts<'tcx> {
@@ -37,7 +38,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             ConsumerOptions::RegionInferenceContext,
         );
 
-        let borrow_locations = facts
+        let borrows = facts
             .borrow_set
             .location_map
             .iter()
@@ -93,6 +94,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
         // Now, use the region information to determine which locals are leaked
         let mut leaked_locals = FxHashMap::default();
+        let mut leaked_local_def_spans = FxHashMap::default();
         {
             let mut cst_graph = Graph::new();
             let mut cst_nodes = FxHashMap::default();
@@ -134,6 +136,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 let leaked_locals: &mut Vec<_> = leaked_locals.entry(origin_real).or_default();
 
                 for (local, info) in facts.body.local_decls.iter_enumerated() {
+                    let mut was_used = false;
+
                     for used in extract_free_region_list(tcx, info.ty, re_as_vid) {
                         let Some(used) = cst_nodes.get(&used) else {
                             continue;
@@ -141,16 +145,22 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
                         if leaked_res.contains(used) {
                             leaked_locals.push(local);
+                            was_used = true;
                         }
+                    }
+
+                    if was_used {
+                        leaked_local_def_spans.insert(local, info.source_info.span);
                     }
                 }
             }
         }
 
         Self {
-            borrows: borrow_locations,
+            borrows,
             overlaps,
             leaked_locals,
+            leaked_local_def_spans,
         }
     }
 
@@ -203,6 +213,25 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                     ),
                 )
                 .emit();
+            }
+        }
+    }
+
+    pub fn validate_leaks(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        mut can_leak: impl FnMut(Region<'tcx>, Local) -> Option<String>,
+    ) {
+        for (&region, locals) in &self.leaked_locals {
+            for &local in locals {
+                let Some(deny_reason) = (can_leak)(region, local) else {
+                    continue;
+                };
+
+                tcx.dcx().span_err(
+                    self.leaked_local_def_spans[&local],
+                    format!("cannot leak local variable {deny_reason}"),
+                );
             }
         }
     }

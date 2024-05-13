@@ -1,7 +1,7 @@
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
 use rustc_middle::{
     mir::{BasicBlock, Local},
-    ty::{BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Ty, TyCtxt},
+    ty::{BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Region, Ty, TyCtxt},
 };
 use rustc_span::Symbol;
 
@@ -14,9 +14,10 @@ use crate::util::{
         },
         read_feed,
     },
-    hash::FxHashMap,
+    hash::{FxHashMap, FxHashSet},
     mir::{get_callee_from_terminator, TerminalCallKind},
     ty::{
+        err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
         try_resolve_instance, FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc,
         MutabilityExt,
     },
@@ -25,14 +26,14 @@ use crate::util::{
 use super::{
     mir::TokenMirBuilder,
     overlap::BodyOverlapFacts,
-    sets::{parse_tie_func, ParsedTieCall},
+    sets::{instantiate_set_proc, parse_tie_func},
     sym,
     trace::TraceFacts,
 };
 
 pub struct BodyTemplateFacts<'tcx> {
-    /// The set of tie directives in this function.
-    pub tied_to: Vec<ParsedTieCall<'tcx>>,
+    /// The set of region-type-set pairs that can be leaked from the current function.
+    pub permitted_leaks: Vec<(Region<'tcx>, Ty<'tcx>)>,
 
     /// The set of calls made by this function.
     pub calls: Vec<TemplateCall<'tcx>>,
@@ -61,15 +62,16 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         };
 
         let mut body_mutator = TokenMirBuilder::new(tcx, param_env_user, &mut body);
+        let mut permitted_leaks = Vec::new();
         let mut calls = Vec::new();
-        let mut ties = Vec::new();
+        let fn_ret_ty = get_fn_sig_maybe_closure(tcx, orig_id.to_def_id());
 
         let bb_count = body_mutator.body().basic_blocks.len();
         for bb in 0..bb_count {
             let bb = BasicBlock::from_usize(bb);
 
             // If the current basic block is a call...
-            let callee = match get_callee_from_terminator(
+            let (span, callee) = match get_callee_from_terminator(
                 tcx,
                 param_env_user,
                 MaybeConcretizedFunc {
@@ -79,16 +81,36 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 &body_mutator.body().basic_blocks[bb].terminator,
                 &body_mutator.body().local_decls,
             ) {
-                Some(TerminalCallKind::Static(_, callee)) => callee,
-                Some(TerminalCallKind::Generic(_, callee)) => callee,
+                Some(TerminalCallKind::Static(span, callee)) => (span, callee),
+                Some(TerminalCallKind::Generic(span, callee)) => (span, callee),
                 _ => {
                     continue;
                 }
             };
 
             // Determine whether it has any special effects on ties.
-            if let Some(func) = parse_tie_func(tcx, callee) {
-                ties.push(func);
+            'tie: {
+                let Some(func) = parse_tie_func(tcx, callee) else {
+                    break 'tie;
+                };
+
+                let Some(tied_to) = func.tied_to else {
+                    break 'tie;
+                };
+
+                let region = match find_region_with_name(
+                    tcx,
+                    fn_ret_ty.skip_binder().skip_binder(),
+                    tied_to,
+                ) {
+                    Ok(region) => region,
+                    Err(symbols) => {
+                        err_failed_to_find_region(tcx, span, tied_to, &symbols);
+                        break 'tie;
+                    }
+                };
+
+                permitted_leaks.push((region, func.acquired_set));
             }
 
             // Determine mask
@@ -138,8 +160,8 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
 
         (
             Self {
+                permitted_leaks,
                 calls,
-                tied_to: Vec::new(),
             },
             shadow_def,
         )
@@ -229,6 +251,30 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         });
 
         // Validate leaked locals
-        // TODO
+        let mut permitted_leaks = FxHashSet::default();
+        for &(re, set) in &self.permitted_leaks {
+            let set = args.instantiate_arg(tcx, ParamEnv::reveal_all(), set);
+
+            instantiate_set_proc(tcx, set, &mut |ty, _| {
+                permitted_leaks.insert((re, ty));
+            });
+        }
+
+        overlaps.validate_leaks(tcx, |re, local| {
+            let borrows = borrowing_locals.get(&local)?;
+
+            for &borrow in borrows.keys() {
+                if self.permitted_leaks.contains(&(re, borrow)) {
+                    continue;
+                }
+
+                return Some(format!(
+                    "since the token {borrow} is not tied to the return region {}",
+                    re.get_name_or_anon(),
+                ));
+            }
+
+            None
+        });
     }
 }
