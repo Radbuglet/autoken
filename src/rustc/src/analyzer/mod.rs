@@ -23,6 +23,8 @@ mod sym;
 mod template;
 mod trace;
 
+// TODO: Double-check the short-circuits in the analysis routine to make sure we're not ignoring
+//  important items.
 pub fn analyze(tcx: TyCtxt<'_>) {
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
     for local_def in iter_all_local_def_ids(tcx) {
@@ -86,8 +88,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     }
 
     // Borrow-check each template fact
-    for (_, shadow_did, overlaps) in templates.values_mut() {
-        *overlaps = Some(BodyOverlapFacts::new(tcx, *shadow_did));
+    for (orig_did, (_, shadow_did, overlaps)) in &mut templates {
+        *overlaps = Some(BodyOverlapFacts::new(tcx, *orig_did, *shadow_did));
     }
 
     // Validate each traced function using their template

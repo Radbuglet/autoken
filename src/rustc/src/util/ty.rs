@@ -4,9 +4,9 @@ use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
-    EarlyBinder, ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgs,
-    GenericArgsRef, GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region,
-    RegionKind, RegionVid, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
+    EarlyBinder, ExistentialPredicate, GenericArg, GenericArgKind, GenericArgs, GenericArgsRef,
+    GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region, RegionKind,
+    RegionVid, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
@@ -43,29 +43,14 @@ pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
 
 // === Signature Parsing === //
 
-pub type UnboundFnSig<'tcx> = EarlyBinder<Binder<'tcx, FnSig<'tcx>>>;
+pub type UnboundFnReturnTy<'tcx> = EarlyBinder<Binder<'tcx, Ty<'tcx>>>;
 
-pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> UnboundFnSig<'_> {
-    match tcx.type_of(def_id).skip_binder().kind() {
-        TyKind::Closure(_, args) => {
-            let sig = args.as_closure().sig();
-
-            EarlyBinder::bind(sig.map_bound(|sig| {
-                let inputs = sig.inputs();
-                assert_eq!(inputs.len(), 1);
-                let inputs = &inputs[0].tuple_fields();
-
-                FnSig {
-                    inputs_and_output: tcx
-                        .mk_type_list_from_iter(inputs.iter().chain([sig.output()])),
-                    c_variadic: sig.c_variadic,
-                    unsafety: sig.unsafety,
-                    abi: sig.abi,
-                }
-            }))
-        }
-        _ => tcx.fn_sig(def_id),
-    }
+pub fn get_fn_sig_maybe_closure(tcx: TyCtxt<'_>, def_id: DefId) -> UnboundFnReturnTy<'_> {
+    EarlyBinder::bind(match tcx.type_of(def_id).skip_binder().kind() {
+        TyKind::Coroutine(_, args) => Binder::dummy(args.as_coroutine().sig().return_ty),
+        TyKind::Closure(_, args) => args.as_closure().sig().output(),
+        _ => tcx.fn_sig(def_id).skip_binder().output(),
+    })
 }
 
 pub fn find_region_with_name<'tcx>(
@@ -571,9 +556,6 @@ impl<'tcx> FunctionCallAndRegions<'tcx> {
         // The inner binder gives us late-bound regions. We want them to be free so let's skip it.
         let sig = sig.skip_binder();
 
-        // Let's get the return type since that's what we're interested in.
-        let sig = sig.output();
-
         // Now, we have two types of free regions to handle: `ReBoundEarly` for early-bound regions
         // and `ReParam` for late-bound regions. Each of these can be mapped individually so let's
         // count them.
@@ -631,9 +613,7 @@ impl<'tcx> FunctionCallAndRegions<'tcx> {
         .unwrap();
 
         // Now, get our impl's concrete signature and instantiate it too.
-        let concrete_sig = get_fn_sig_maybe_closure(tcx, concrete.def_id())
-            .skip_binder()
-            .output();
+        let concrete_sig = get_fn_sig_maybe_closure(tcx, concrete.def_id()).skip_binder();
 
         let concrete_sig = instantiate_ty_and_normalize_preserving_regions(
             tcx,

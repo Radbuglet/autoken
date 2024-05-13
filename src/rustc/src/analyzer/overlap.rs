@@ -1,7 +1,7 @@
 use petgraph::{visit::Dfs, Graph};
 use rustc_borrowck::consumers::{BodyWithBorrowckFacts, BorrowIndex, Borrows, ConsumerOptions};
 
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
@@ -29,11 +29,11 @@ pub struct BodyOverlapFacts<'tcx> {
 }
 
 impl<'tcx> BodyOverlapFacts<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, orig_did: DefId, shadow_did: LocalDefId) -> Self {
         // Determine the start and end locations of our borrows.
         let facts = get_body_with_borrowck_facts_but_sinful(
             tcx,
-            did,
+            shadow_did,
             ConsumerOptions::RegionInferenceContext,
         );
 
@@ -77,10 +77,8 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
         // Determine the bijection between the inferred return type and the actual return type.
         let real_ret_ty = normalize_preserving_regions(
             tcx,
-            tcx.param_env(did),
-            get_fn_sig_maybe_closure(tcx, did.to_def_id())
-                .skip_binder()
-                .output(),
+            tcx.param_env(orig_did),
+            get_fn_sig_maybe_closure(tcx, orig_did).skip_binder(),
         )
         .skip_binder();
 
