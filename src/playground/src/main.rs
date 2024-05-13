@@ -33,6 +33,13 @@ fn hehe2<'b, 'c>() -> (&'b u32, &'c str) {
     map(tie())
 }
 
+fn hehe3<'b, 'c>() -> (&'b u32, &'c str) {
+    autoken::tie!('b => mut ());
+    autoken::tie!('c => mut ());
+
+    map(tie())
+}
+
 fn map(_v: &()) -> (&u32, &str) {
     (&3, "hi!!")
 }

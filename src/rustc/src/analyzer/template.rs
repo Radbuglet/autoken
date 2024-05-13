@@ -264,7 +264,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             let borrows = borrowing_locals.get(&local)?;
 
             for &borrow in borrows.keys() {
-                if self.permitted_leaks.contains(&(re, borrow)) {
+                if permitted_leaks.contains(&(re, borrow)) {
                     continue;
                 }
 
