@@ -46,8 +46,10 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             continue;
         }
 
-        let param_env = tcx.param_env_reveal_all_normalized(did);
-        let (template, shadow_did) = BodyTemplateFacts::new(tcx, param_env, did);
+        let param_env_all = tcx.param_env_reveal_all_normalized(did);
+        let param_env_user = tcx.param_env(did);
+        let (template, shadow_did) =
+            BodyTemplateFacts::new(tcx, param_env_all, param_env_user, did);
 
         templates.insert(
             did.to_def_id(),

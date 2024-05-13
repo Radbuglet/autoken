@@ -50,14 +50,15 @@ pub struct TemplateCall<'tcx> {
 impl<'tcx> BodyTemplateFacts<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
+        param_env_all: ParamEnv<'tcx>,
+        param_env_user: ParamEnv<'tcx>,
         orig_id: LocalDefId,
     ) -> (Self, LocalDefId) {
         let Some(mut body) = read_feed::<MirBuiltStasher>(tcx, orig_id).cloned() else {
             unreachable!();
         };
 
-        let mut body_mutator = TokenMirBuilder::new(tcx, param_env, &mut body);
+        let mut body_mutator = TokenMirBuilder::new(tcx, param_env_user, &mut body);
         let mut calls = Vec::new();
         let mut ties = Vec::new();
 
@@ -68,7 +69,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             // If the current basic block is a call...
             let callee = match get_callee_from_terminator(
                 tcx,
-                param_env,
+                param_env_all,
                 MaybeConcretizedFunc {
                     def: InstanceDef::Item(orig_id.to_def_id()),
                     args: None,
@@ -87,7 +88,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             }
 
             // Determine mask
-            let mask = FunctionCallAndRegions::new(tcx, param_env, callee);
+            let mask = FunctionCallAndRegions::new(tcx, param_env_all, callee);
 
             // Give it the opportunity to kill off some borrows and tie stuff
             // to itself.

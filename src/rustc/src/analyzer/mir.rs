@@ -7,9 +7,9 @@ use rustc_middle::{
         TerminatorKind, UserTypeProjection,
     },
     ty::{
-        BoundRegion, BoundRegionKind, BoundVar, Canonical, CanonicalUserTypeAnnotation,
-        CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, List, ParamEnv, Region, Ty, TyCtxt,
-        TypeAndMut, UniverseIndex, UserType, Variance,
+        fold::RegionFolder, BoundRegion, BoundRegionKind, BoundVar, Canonical,
+        CanonicalUserTypeAnnotation, CanonicalVarInfo, CanonicalVarKind, DebruijnIndex, List,
+        ParamEnv, Region, Ty, TyCtxt, TypeAndMut, TypeFoldable, UniverseIndex, UserType, Variance,
     },
 };
 use rustc_span::DUMMY_SP;
@@ -21,7 +21,7 @@ type PrependerState<'tcx> = (Vec<Statement<'tcx>>, BasicBlock);
 
 pub struct TokenMirBuilder<'tcx, 'body> {
     tcx: TyCtxt<'tcx>,
-    param_env: ParamEnv<'tcx>,
+    param_env_user: ParamEnv<'tcx>,
     body: &'body mut Body<'tcx>,
 
     // Caches
@@ -35,7 +35,11 @@ pub struct TokenMirBuilder<'tcx, 'body> {
 }
 
 impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
-    pub fn new(tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, body: &'body mut Body<'tcx>) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        param_env_user: ParamEnv<'tcx>,
+        body: &'body mut Body<'tcx>,
+    ) -> Self {
         // token_ref_ty = &'erased ()
         let token_ref_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, tcx.types.unit);
 
@@ -86,7 +90,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
 
         Self {
             tcx,
-            param_env,
+            param_env_user,
             body,
 
             // Caches
@@ -228,25 +232,37 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 },
             source_info,
             ..
-        }) = &self.body.basic_blocks.as_mut_preserves_cfg()[bb].terminator
+        }) = &mut self.body.basic_blocks.as_mut_preserves_cfg()[bb].terminator
         else {
             unreachable!();
         };
 
         let source_info = *source_info;
         let call_out_bb = *target;
-        let call_out_place = *destination;
+        let orig_call_out_place = *destination;
 
         let fn_result = call.generalized.skip_binder();
+        let fn_result_erased = self
+            .tcx
+            .normalize_erasing_regions(self.param_env_user, fn_result)
+            .fold_with(&mut RegionFolder::new(self.tcx, &mut |_, _| {
+                self.tcx.lifetimes.re_erased
+            }));
 
-        // N.B. We need to reveal all parameters in this type before using it since it may be opaque
-        // despite the fact that MIR type-checking reveals all types. This seems to happen, afaict,
-        // when the return place is the return of the function and that function resolves to an opaque
-        // type.
-        let fn_result_inferred = self.tcx.normalize_erasing_regions(
-            self.param_env,
-            call_out_place.ty(&self.body.local_decls, self.tcx).ty,
-        );
+        // N.B. Assignments in the MIR may occasionally upcast a type from its concrete form to its
+        // opaque form. However, our type ascriptions always operate on their concrete form so we
+        // need to defer this upcast by creating a temporary local with the concrete type.
+        let new_call_out_place = self
+            .body
+            .local_decls
+            .push(LocalDecl::new(fn_result_erased, DUMMY_SP));
+
+        let new_call_out_place = Place {
+            local: new_call_out_place,
+            projection: List::empty(),
+        };
+
+        *destination = new_call_out_place;
 
         // Create the ascription type from this function.
         let tuple_binder = Ty::new_tup(
@@ -271,7 +287,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             ],
         );
 
-        let tuple_binder_inferred = Ty::new_tup(
+        let tuple_binder_erased = Ty::new_tup(
             self.tcx,
             &[
                 Ty::new_ref(
@@ -282,7 +298,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                         ty: self.tcx.types.unit,
                     },
                 ),
-                fn_result_inferred,
+                fn_result_erased,
             ],
         );
 
@@ -303,21 +319,19 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                     ),
                 }),
                 span: DUMMY_SP,
-                inferred_ty: tuple_binder_inferred,
+                inferred_ty: tuple_binder_erased,
             });
 
         let binder_local = self
             .body
             .local_decls
-            .push(LocalDecl::new(tuple_binder_inferred, DUMMY_SP));
+            .push(LocalDecl::new(tuple_binder_erased, DUMMY_SP));
 
         let (token_local, token_initializer) = self.create_token();
         let token_rb_local = self
             .body
             .local_decls
             .push(LocalDecl::new(self.token_ref_ty, DUMMY_SP));
-
-        self.body.local_decls[call_out_place.local].mutability = Mutability::Mut;
 
         self.prepend_statement(
             call_out_bb,
@@ -354,7 +368,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                                     local: token_rb_local,
                                     projection: List::empty(),
                                 }),
-                                Operand::Move(call_out_place),
+                                Operand::Move(new_call_out_place),
                             ]),
                         ),
                     ))),
@@ -378,18 +392,19 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
                 Statement {
                     source_info,
                     kind: StatementKind::Assign(Box::new((
-                        call_out_place,
+                        orig_call_out_place,
                         Rvalue::Use(Operand::Move(Place {
                             local: binder_local,
                             projection: self.tcx.mk_place_elems(&[ProjectionElem::Field(
                                 FieldIdx::from_u32(1),
-                                fn_result_inferred,
+                                fn_result_erased,
                             )]),
                         })),
                     ))),
                 },
             ],
         );
+        self.flush_prepended();
 
         token_local
     }
