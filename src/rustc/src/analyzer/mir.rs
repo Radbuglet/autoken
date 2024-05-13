@@ -245,6 +245,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
         let fn_result_erased = self
             .tcx
             .normalize_erasing_regions(self.param_env_user, fn_result)
+            // `normalize_erasing_regions` does not erase late-bound regions so we fold them manually
             .fold_with(&mut RegionFolder::new(self.tcx, &mut |_, _| {
                 self.tcx.lifetimes.re_erased
             }));

@@ -50,7 +50,6 @@ pub struct TemplateCall<'tcx> {
 impl<'tcx> BodyTemplateFacts<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
-        param_env_all: ParamEnv<'tcx>,
         param_env_user: ParamEnv<'tcx>,
         orig_id: LocalDefId,
     ) -> (Self, LocalDefId) {
@@ -69,7 +68,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             // If the current basic block is a call...
             let callee = match get_callee_from_terminator(
                 tcx,
-                param_env_all,
+                param_env_user,
                 MaybeConcretizedFunc {
                     def: InstanceDef::Item(orig_id.to_def_id()),
                     args: None,
@@ -88,10 +87,9 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             }
 
             // Determine mask
-            let mask = FunctionCallAndRegions::new(tcx, param_env_all, callee);
+            let mask = FunctionCallAndRegions::new(tcx, param_env_user, callee); // TODO: changed
 
-            // Give it the opportunity to kill off some borrows and tie stuff
-            // to itself.
+            // Give it the opportunity to kill off some borrows and tie stuff to itself.
             let enb_local = body_mutator.ensure_not_borrowed_at(bb);
             let tied_locals = (0..mask.param_count)
                 .map(|i| body_mutator.tie_token_to_function_return(bb, mask, BoundVar::from_u32(i)))
