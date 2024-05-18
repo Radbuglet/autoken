@@ -5,7 +5,7 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
-    ty::{Mutability, Region, TyCtxt},
+    ty::{GenericArgs, Mutability, Region, TyCtxt},
 };
 use rustc_mir_dataflow::{Analysis, ResultsVisitor};
 use rustc_span::Span;
@@ -13,10 +13,7 @@ use rustc_span::Span;
 use crate::util::{
     hash::{FxHashMap, FxHashSet},
     mir::get_body_with_borrowck_facts_but_sinful,
-    ty::{
-        extract_free_region_list, get_fn_sig_maybe_closure, normalize_preserving_regions,
-        par_traverse_regions, re_as_vid, FunctionRelation, MutabilityExt,
-    },
+    ty::{extract_free_region_list, re_as_vid, MutabilityExt},
 };
 
 // === Analysis === //
@@ -75,22 +72,15 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
         let overlaps = visitor.overlaps;
 
-        // Determine the bijection between the inferred return type and the actual return type.
-        let real_ret_ty = normalize_preserving_regions(
-            tcx,
-            tcx.param_env(orig_did),
-            get_fn_sig_maybe_closure(tcx, orig_did).skip_binder(),
-        )
-        .skip_binder();
+        // Determine the bijection between universal regions in signature-land and inference-land.
+        let mut universal_to_vid = FxHashMap::default();
+        for arg in GenericArgs::identity_for_item(tcx, tcx.typeck_root_def_id(orig_did)) {
+            let Some(re) = arg.as_region() else {
+                continue;
+            };
 
-        let infer_ret_ty = facts.body.local_decls[Local::from_u32(0)].ty;
-        let mut infer_to_real = FunctionRelation::default();
-
-        par_traverse_regions(infer_ret_ty, real_ret_ty, |inf, real, _| {
-            if let Some(inf) = re_as_vid(inf) {
-                infer_to_real.insert(inf, real);
-            }
-        });
+            universal_to_vid.insert(re, facts.region_inference_context.to_region_vid(re));
+        }
 
         // Now, use the region information to determine which locals are leaked
         let mut leaked_locals = FxHashMap::default();
@@ -116,11 +106,11 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 cst_graph.add_edge(right, left, ());
             }
 
-            // Determine which nodes are reachable from our leaked regions.
-            for origin_re_var in extract_free_region_list(tcx, infer_ret_ty, re_as_vid) {
+            // Determine which nodes are reachable from our universal regions.
+            for (&origin_real, &origin_vid) in &universal_to_vid {
                 let mut leaked_res = FxHashSet::default();
 
-                let Some(&origin) = cst_nodes.get(&origin_re_var) else {
+                let Some(&origin) = cst_nodes.get(&origin_vid) else {
                     continue;
                 };
 
@@ -132,7 +122,6 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
                 // Finally, let's go through each local to see if it has any regions linked to the
                 // return type.
-                let origin_real = infer_to_real.map[&origin_re_var].unwrap();
                 let leaked_locals: &mut Vec<_> = leaked_locals.entry(origin_real).or_default();
 
                 for (local, info) in facts.body.local_decls.iter_enumerated() {
