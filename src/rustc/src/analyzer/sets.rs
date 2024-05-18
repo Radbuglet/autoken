@@ -20,6 +20,7 @@ pub fn is_absorb_func(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 pub struct ParsedTieCall<'tcx> {
     pub acquired_set: Ty<'tcx>,
     pub tied_to: Option<Symbol>,
+    pub is_unsafe: bool,
 }
 
 pub fn parse_tie_func<'tcx>(
@@ -46,9 +47,13 @@ pub fn parse_tie_func<'tcx>(
         // Determine set type
         let acquired_set = instance.args[1].as_type().unwrap();
 
+        // Determine whether it's unsafe
+        let is_unsafe = !instance.args[2].as_type().unwrap().is_unit();
+
         ParsedTieCall {
             tied_to,
             acquired_set,
+            is_unsafe,
         }
     })
 }

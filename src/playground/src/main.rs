@@ -6,6 +6,7 @@ fn tie<'a>() -> &'a () {
 }
 
 fn huh<'a, R>(f: impl FnOnce(&'a ()) -> R) -> R {
+    autoken::tie!('a => mut ());
     f(tie())
 }
 

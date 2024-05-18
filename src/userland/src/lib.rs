@@ -241,11 +241,12 @@ impl<'a, T: TokenSet> BorrowsRef<'a, T> {
 
 #[doc(hidden)]
 pub mod tie_macro_internals {
-    pub fn __autoken_declare_tied<I, T: crate::TokenSet>() {}
+    pub fn __autoken_declare_tied<I, T: crate::TokenSet, IsUnsafe>() {}
 }
 
 #[macro_export]
 macro_rules! tie {
+    // Safe variants
     ($lt:lifetime => set $ty:ty) => {{
         struct AutokenLifetimeDefiner<$lt> {
             _v: &$lt(),
@@ -253,7 +254,7 @@ macro_rules! tie {
 
         let _: &$lt() = &();
 
-        $crate::tie_macro_internals::__autoken_declare_tied::<AutokenLifetimeDefiner<'_>, $ty>();
+        $crate::tie_macro_internals::__autoken_declare_tied::<AutokenLifetimeDefiner<'_>, $ty, ()>();
     }};
     ($lt:lifetime => mut $ty:ty) => {
         $crate::tie!($lt => set $crate::Mut<$ty>);
@@ -262,12 +263,38 @@ macro_rules! tie {
         $crate::tie!($lt => set $crate::Ref<$ty>);
     };
     (set $ty:ty) => {{
-        $crate::tie_macro_internals::__autoken_declare_tied::<(), $ty>();
+        $crate::tie_macro_internals::__autoken_declare_tied::<(), $ty, ()>();
     }};
     (mut $ty:ty) => {
         $crate::tie!(set $crate::Mut<$ty>);
     };
     (ref $ty:ty) => {
         $crate::tie!(set $crate::Ref<$ty>);
+    };
+
+    // Unsafe variants
+    (unsafe $lt:lifetime => set $ty:ty) => {{
+        struct AutokenLifetimeDefiner<$lt> {
+            _v: &$lt(),
+        }
+
+        let _: &$lt() = &();
+
+        $crate::tie_macro_internals::__autoken_declare_tied::<AutokenLifetimeDefiner<'_>, $ty, ((),)>();
+    }};
+    (unsafe $lt:lifetime => mut $ty:ty) => {
+        $crate::tie!(unsafe $lt => set $crate::Mut<$ty>);
+    };
+    (unsafe $lt:lifetime => ref $ty:ty) => {
+        $crate::tie!(unsafe $lt => set $crate::Ref<$ty>);
+    };
+    (unsafe set $ty:ty) => {{
+        $crate::tie_macro_internals::__autoken_declare_tied::<(), $ty, ((),)>();
+    }};
+    (unsafe mut $ty:ty) => {
+        $crate::tie!(unsafe set $crate::Mut<$ty>);
+    };
+    (unsafe ref $ty:ty) => {
+        $crate::tie!(unsafe set $crate::Ref<$ty>);
     };
 }

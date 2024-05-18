@@ -1,9 +1,12 @@
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
 use rustc_middle::{
     mir::{BasicBlock, Local},
-    ty::{BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Region, Ty, TyCtxt},
+    ty::{
+        fold::RegionFolder, BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Region,
+        RegionKind, Ty, TyCtxt, TypeFoldable,
+    },
 };
-use rustc_span::Symbol;
+use rustc_span::{Span, Symbol};
 
 use crate::util::{
     feeder::{
@@ -17,9 +20,8 @@ use crate::util::{
     hash::{FxHashMap, FxHashSet},
     mir::{get_callee_from_terminator, TerminalCallKind},
     ty::{
-        err_failed_to_find_region, find_region_with_name, get_fn_sig_maybe_closure,
-        try_resolve_instance, FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc,
-        MutabilityExt,
+        find_region_with_name, get_fn_sig_maybe_closure, try_resolve_instance,
+        FunctionCallAndRegions, GenericTransformer, MaybeConcretizedFunc, MutabilityExt,
     },
 };
 
@@ -40,6 +42,9 @@ pub struct BodyTemplateFacts<'tcx> {
 }
 
 pub struct TemplateCall<'tcx> {
+    // The span of the function call.
+    pub span: Span,
+
     /// The function we called.
     pub func: FunctionCallAndRegions<'tcx>,
 
@@ -105,10 +110,61 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 ) {
                     Ok(region) => region,
                     Err(symbols) => {
-                        err_failed_to_find_region(tcx, span, tied_to, &symbols);
+                        tcx.dcx()
+                            .struct_err(format!(
+                                "lifetime with name {tied_to} not found in output of function{}",
+                                if symbols.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "; found {}",
+                                        symbols
+                                            .iter()
+                                            .map(|v| v.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                }
+                            ))
+                            .with_span(span)
+                            .with_note(
+                                "it is not currently possible to tie lifetimes which appear in input \
+                                 parameters to tokens",
+                            )
+                            .emit();
                         break 'tie;
                     }
                 };
+
+                // HACK: Reject regions which appear anywhere other than the output type.
+                if !func.is_unsafe {
+                    let mut soundness_hole = false;
+
+                    if !matches!(region.kind(), RegionKind::ReEarlyParam(_)) {
+                        soundness_hole = true;
+                    }
+
+                    for bound in param_env_user.caller_bounds() {
+                        bound.fold_with(&mut RegionFolder::new(tcx, &mut |re, _| {
+                            if re == region {
+                                soundness_hole = true;
+                            }
+
+                            re
+                        }));
+                    }
+
+                    if soundness_hole {
+                        tcx.dcx()
+                            .struct_err(
+                                "ties to lifetimes appearing in generic bounds or input parameters \
+                                types are currently rejected due to soundness issues",
+                            )
+                            .with_span(span)
+                            .with_help("if this use is safe, prefix the `tie!` directive with `unsafe`")
+                            .emit();
+                    }
+                }
 
                 permitted_leaks.push((region, func.acquired_set));
             }
@@ -123,6 +179,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 .collect();
 
             calls.push(TemplateCall {
+                span,
                 prevent_call_local: enb_local,
                 tied_locals,
                 func: mask,
@@ -213,7 +270,18 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 );
 
                 if let Some(borrow_sym) = borrow_sym {
-                    for tie_local in call.func.get_linked(tcx, Some(args), borrow_sym).unwrap() {
+                    let Some(linked) = call.func.get_linked(tcx, Some(args), borrow_sym) else {
+                        tcx.dcx().span_err(
+                            call.span,
+                            format!(
+                                "failed to find lifetime {borrow_sym} to which {borrow_ty} is tied \
+                                 in the return type of the function"
+                            ),
+                        );
+
+                        continue;
+                    };
+                    for tie_local in linked {
                         add_local_borrow(
                             &mut borrowing_locals,
                             call.tied_locals[tie_local.as_usize()],

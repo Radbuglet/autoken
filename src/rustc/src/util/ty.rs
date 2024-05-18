@@ -8,7 +8,7 @@ use rustc_middle::ty::{
     GenericParamDefKind, Instance, InstanceDef, List, Mutability, ParamEnv, Region, RegionKind,
     RegionVid, TermKind, Ty, TyCtxt, TyKind, TypeFoldable,
 };
-use rustc_span::{ErrorGuaranteed, Span, Symbol};
+use rustc_span::{ErrorGuaranteed, Symbol};
 use rustc_trait_selection::traits::ObligationCtxt;
 
 use super::hash::{FxHashMap, FxHashSet};
@@ -83,27 +83,6 @@ pub fn extract_free_region_list<'tcx, R>(
         region
     }));
     found
-}
-
-pub fn err_failed_to_find_region(tcx: TyCtxt<'_>, span: Span, name: Symbol, symbols: &[Symbol]) {
-    tcx.dcx().span_err(
-        span,
-        format!(
-            "lifetime with name {name} not found in output of function{}",
-            if symbols.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; found {}",
-                    symbols
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        ),
-    );
 }
 
 pub fn try_resolve_mono_args_for_func(
