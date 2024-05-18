@@ -2,118 +2,6 @@
 
 use std::{fmt, marker::PhantomData};
 
-// === `cap!` === //
-
-#[doc(hidden)]
-pub mod cap_macro_internals {
-    pub use std::{cell::Cell, ops::FnOnce, ptr::null_mut, thread::LocalKey, thread_local};
-
-    pub struct CxScope {
-        tls: &'static LocalKey<Cell<*mut ()>>,
-        prev: *mut (),
-    }
-
-    impl CxScope {
-        pub fn new(tls: &'static LocalKey<Cell<*mut ()>>, new_ptr: *mut ()) -> Self {
-            tls.set(new_ptr);
-
-            Self {
-                tls,
-                prev: tls.get(),
-            }
-        }
-    }
-
-    impl Drop for CxScope {
-        fn drop(&mut self) {
-            self.tls.set(self.prev);
-        }
-    }
-}
-
-pub trait CapTarget<T> {
-    fn provide<R>(value: T, f: impl FnOnce() -> R) -> R;
-}
-
-#[macro_export]
-macro_rules! cap {
-    ( $($ty:ty: $expr:expr),*$(,)? => $($body:tt)* ) => {{
-        #[allow(unused_mut)]
-        let mut f = || { $($body)* };
-
-        $(
-            #[allow(unused_mut)]
-            let mut f = || <$ty as $crate::CapTarget<_>>::provide($expr, f);
-        )*
-
-        f()
-    }};
-    ($(
-        $(#[$attr:meta])*
-        $vis:vis $name:ident$(<$($lt:lifetime),* $(,)?>)? = $ty:ty;
-    )*) => {$(
-        $(#[$attr])*
-        #[non_exhaustive]
-        $vis struct $name;
-
-        impl $name {
-            fn tls() -> &'static $crate::cap_macro_internals::LocalKey<$crate::cap_macro_internals::Cell<*mut ()>> {
-                $crate::cap_macro_internals::thread_local! {
-                    static VALUE: $crate::cap_macro_internals::Cell<*mut ()> = const {
-                        $crate::cap_macro_internals::Cell::new($crate::cap_macro_internals::null_mut())
-                    };
-                }
-
-                &VALUE
-            }
-
-            $vis fn get<'out, R: 'out>(f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out $ty) -> R) -> $crate::BindHelper<'out, R> {
-                $crate::tie!('out => ref $name);
-
-                $crate::BindHelper(f(Self::tls().with(|ptr| unsafe { &*ptr.get().cast() })), [])
-            }
-
-            $vis fn get_mut<'out, R: 'out>(f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out mut $ty) -> R) -> $crate::BindHelper<'out, R> {
-                $crate::tie!('out => mut $name);
-
-                $crate::BindHelper(f(Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() })), [])
-            }
-        }
-
-        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out mut $ty> for $name {
-            fn provide<R>(value: &'out mut $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
-                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *mut $ty as *mut ());
-
-                unsafe {
-                    $crate::absorb::<$crate::Mut<Self>, R>(f)
-                }
-            }
-        }
-
-        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out $ty> for $name {
-            fn provide<R>(value: &'out $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
-                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *const $ty as *const () as *mut ());
-
-                fn tier<'a>() -> &'a () {
-                    $crate::tie!('a => mut $name);
-                    &()
-                }
-
-                unsafe {
-                    $crate::absorb::<$crate::Mut<Self>, R>(|| {
-                        let tier = tier();
-                        let res = $crate::absorb::<$crate::Ref<Self>, R>(f);
-                        let _ = tier;
-                        res
-                    })
-                }
-            }
-        }
-    )*};
-}
-
-pub struct BindHelper<'a, T>(pub T, pub [&'a (); 0]);
-
 // === TokenSet === //
 
 mod sealed {
@@ -297,4 +185,151 @@ macro_rules! tie {
     (unsafe ref $ty:ty) => {
         $crate::tie!(unsafe set $crate::Ref<$ty>);
     };
+}
+
+// === Brand === //
+
+pub struct Brand<T> {
+    _ty: PhantomData<fn() -> T>,
+}
+
+impl<T> Brand<T> {
+    pub fn acquire_ref<'a>() -> &'a Self {
+        tie!('a => ref T);
+
+        &Self { _ty: PhantomData }
+    }
+
+    pub fn acquire_mut<'a>() -> &'a mut Self {
+        tie!('a => mut T);
+
+        unsafe { &mut *(1usize as *const Self as *mut Self) }
+    }
+}
+
+// === `cap!` === //
+
+#[doc(hidden)]
+pub mod cap_macro_internals {
+    pub use {
+        crate::Brand,
+        std::{cell::Cell, ops::FnOnce, ptr::null_mut, thread::LocalKey, thread_local},
+    };
+
+    pub struct CxScope {
+        tls: &'static LocalKey<Cell<*mut ()>>,
+        prev: *mut (),
+    }
+
+    impl CxScope {
+        pub fn new(tls: &'static LocalKey<Cell<*mut ()>>, new_ptr: *mut ()) -> Self {
+            tls.set(new_ptr);
+
+            Self {
+                tls,
+                prev: tls.get(),
+            }
+        }
+    }
+
+    impl Drop for CxScope {
+        fn drop(&mut self) {
+            self.tls.set(self.prev);
+        }
+    }
+}
+
+pub trait CapTarget<T> {
+    fn provide<R>(value: T, f: impl FnOnce() -> R) -> R;
+}
+
+#[macro_export]
+macro_rules! cap {
+    ( $($ty:ty: $expr:expr),*$(,)? => $($body:tt)* ) => {{
+        #[allow(unused_mut)]
+        let mut f = || { $($body)* };
+
+        $(
+            #[allow(unused_mut)]
+            let mut f = || <$ty as $crate::CapTarget<_>>::provide($expr, f);
+        )*
+
+        f()
+    }};
+    (ref $ty:ty) => {
+        <$ty>::get($crate::cap_macro_internals::Brand::acquire_ref(), |v| v)
+    };
+    (mut $ty:ty) => {
+        <$ty>::get_mut($crate::cap_macro_internals::Brand::acquire_mut(), |v| v)
+    };
+    (ref $ty:ty => $name:ident in $out:expr) => {
+        <$ty>::get($crate::cap_macro_internals::Brand::acquire_ref(), |$name| $out)
+    };
+    (mut $ty:ty => $name:ident in $out:expr) => {
+        <$ty>::get_mut($crate::cap_macro_internals::Brand::acquire_mut(), |$name| $out)
+    };
+    ($(
+        $(#[$attr:meta])*
+        $vis:vis $name:ident$(<$($lt:lifetime),* $(,)?>)? = $ty:ty;
+    )*) => {$(
+        $(#[$attr])*
+        #[non_exhaustive]
+        $vis struct $name;
+
+        impl $name {
+            fn tls() -> &'static $crate::cap_macro_internals::LocalKey<$crate::cap_macro_internals::Cell<*mut ()>> {
+                $crate::cap_macro_internals::thread_local! {
+                    static VALUE: $crate::cap_macro_internals::Cell<*mut ()> = const {
+                        $crate::cap_macro_internals::Cell::new($crate::cap_macro_internals::null_mut())
+                    };
+                }
+
+                &VALUE
+            }
+
+            $vis fn get<'out, R: 'out>(
+                _brand: &'out $crate::cap_macro_internals::Brand<$name>,
+                f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out $ty) -> R,
+            ) -> R {
+                f(Self::tls().with(|ptr| unsafe { &*ptr.get().cast() }))
+            }
+
+            $vis fn get_mut<'out, R: 'out>(
+                _brand: &'out mut $crate::cap_macro_internals::Brand<$name>,
+                f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out mut $ty) -> R,
+            ) -> R {
+                f(Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() }))
+            }
+        }
+
+        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out mut $ty> for $name {
+            fn provide<R>(value: &'out mut $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
+                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *mut $ty as *mut ());
+
+                unsafe {
+                    $crate::absorb::<$crate::Mut<Self>, R>(f)
+                }
+            }
+        }
+
+        impl<'out $($(, $lt)*)?> $crate::CapTarget<&'out $ty> for $name {
+            fn provide<R>(value: &'out $ty, f: impl $crate::cap_macro_internals::FnOnce() -> R) -> R {
+                let _scope = $crate::cap_macro_internals::CxScope::new(Self::tls(), value as *const $ty as *const () as *mut ());
+
+                fn tier<'a>() -> &'a () {
+                    $crate::tie!('a => mut $name);
+                    &()
+                }
+
+                unsafe {
+                    $crate::absorb::<$crate::Mut<Self>, R>(|| {
+                        let tier = tier();
+                        let res = $crate::absorb::<$crate::Ref<Self>, R>(f);
+                        let _ = tier;
+                        res
+                    })
+                }
+            }
+        }
+    )*};
 }
