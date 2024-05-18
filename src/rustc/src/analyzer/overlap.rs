@@ -80,6 +80,12 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             };
 
             universal_to_vid.insert(re, facts.region_inference_context.to_region_vid(re));
+            universal_to_vid.insert(
+                tcx.lifetimes.re_static,
+                facts
+                    .region_inference_context
+                    .to_region_vid(tcx.lifetimes.re_static),
+            );
         }
 
         // Now, use the region information to determine which locals are leaked
