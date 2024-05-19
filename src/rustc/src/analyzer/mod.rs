@@ -23,8 +23,6 @@ mod sym;
 mod template;
 mod trace;
 
-// TODO: Double-check the short-circuits in the analysis routine to make sure we're not ignoring
-//  important items.
 pub fn analyze(tcx: TyCtxt<'_>) {
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
     for local_def in iter_all_local_def_ids(tcx) {
@@ -34,8 +32,6 @@ pub fn analyze(tcx: TyCtxt<'_>) {
     }
 
     // Generate borrow-checking templates for each local function.
-    //
-    // TODO: Serialize these across crates.
     assert!(!tcx.untracked().definitions.is_frozen());
 
     let mut templates = FxHashMap::default();
