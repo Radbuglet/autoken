@@ -244,7 +244,7 @@ impl<'tcx, 'body> TokenMirBuilder<'tcx, 'body> {
             .source_info
             .span;
 
-        let fn_result = call.generalized.skip_binder();
+        let fn_result = call.generalized().skip_binder();
         let fn_result_erased = self
             .tcx
             .normalize_erasing_regions(self.param_env_user, fn_result)

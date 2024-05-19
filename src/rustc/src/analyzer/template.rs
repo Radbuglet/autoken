@@ -1,4 +1,5 @@
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
+use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::{
     mir::{BasicBlock, Local},
     ty::{
@@ -33,6 +34,7 @@ use super::{
     trace::TraceFacts,
 };
 
+#[derive(TyEncodable, TyDecodable)]
 pub struct BodyTemplateFacts<'tcx> {
     /// The set of region-type-set pairs that can be leaked from the current function.
     pub permitted_leaks: Vec<(Region<'tcx>, Ty<'tcx>)>,
@@ -41,6 +43,7 @@ pub struct BodyTemplateFacts<'tcx> {
     pub calls: Vec<TemplateCall<'tcx>>,
 }
 
+#[derive(TyEncodable, TyDecodable)]
 pub struct TemplateCall<'tcx> {
     // The span of the function call.
     pub span: Span,

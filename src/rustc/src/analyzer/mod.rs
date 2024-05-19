@@ -16,12 +16,16 @@ use crate::{
 
 use self::{template::BodyTemplateFacts, trace::TraceFacts};
 
+// === Modules === //
+
 mod mir;
 mod overlap;
 mod sets;
 mod sym;
 mod template;
 mod trace;
+
+// === Driver === //
 
 pub fn analyze(tcx: TyCtxt<'_>) {
     // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.

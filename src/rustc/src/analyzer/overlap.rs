@@ -3,6 +3,7 @@ use rustc_borrowck::consumers::{BodyWithBorrowckFacts, BorrowIndex, Borrows, Con
 
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::BitSet;
+use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::{
     mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
     ty::{GenericArgs, Mutability, Region, TyCtxt},
@@ -18,10 +19,17 @@ use crate::util::{
 
 // === Analysis === //
 
-#[derive(Debug, Clone)]
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "bw{}"]
+    #[encodable]
+    pub struct SerBorrowIndex {}
+}
+
+#[derive(Debug, Clone, TyEncodable, TyDecodable)]
 pub struct BodyOverlapFacts<'tcx> {
-    borrows: FxHashMap<BorrowIndex, (Local, Span)>,
-    overlaps: FxHashMap<BorrowIndex, BitSet<BorrowIndex>>,
+    borrows: FxHashMap<SerBorrowIndex, (Local, Span)>,
+    overlaps: FxHashMap<SerBorrowIndex, BitSet<SerBorrowIndex>>,
     leaked_locals: FxHashMap<Region<'tcx>, Vec<Local>>,
     leaked_local_def_spans: FxHashMap<Local, Span>,
 }
@@ -42,7 +50,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             .enumerate()
             .map(|(bw, (loc, info))| {
                 (
-                    BorrowIndex::from_usize(bw),
+                    SerBorrowIndex::from_usize(bw),
                     (info.borrowed_place.local, facts.body.source_info(*loc).span),
                 )
             })
@@ -70,7 +78,19 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
             &mut visitor,
         );
 
-        let overlaps = visitor.overlaps;
+        let overlaps = visitor
+            .overlaps
+            .into_iter()
+            .map(|(k, v)| {
+                (SerBorrowIndex::from_u32(k.as_u32()), {
+                    let mut v2 = BitSet::new_empty(v.domain_size());
+                    for i in v.iter() {
+                        v2.insert(SerBorrowIndex::from_u32(i.as_u32()));
+                    }
+                    v2
+                })
+            })
+            .collect();
 
         // Determine the bijection between universal regions in signature-land and inference-land.
         let mut universal_to_vid = FxHashMap::default();

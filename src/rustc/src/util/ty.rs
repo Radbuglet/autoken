@@ -2,6 +2,7 @@ use std::hash;
 
 use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
+use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::ty::{
     fold::RegionFolder, AdtDef, Binder, BoundRegion, BoundRegionKind, BoundVar, BoundVariableKind,
     EarlyBinder, ExistentialPredicate, GenericArg, GenericArgKind, GenericArgs, GenericArgsRef,
@@ -515,11 +516,12 @@ where
 
 // === FunctionCallAndRegions === //
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, TyEncodable, TyDecodable)]
 pub struct FunctionCallAndRegions<'tcx> {
     pub param_env: ParamEnv<'tcx>,
     pub instance: Instance<'tcx>,
-    pub generalized: Binder<'tcx, Ty<'tcx>>,
+    pub generalized_value: Ty<'tcx>,
+    pub generalized_bound_vars: &'tcx List<BoundVariableKind>,
     pub param_count: u32,
 }
 
@@ -563,7 +565,8 @@ impl<'tcx> FunctionCallAndRegions<'tcx> {
         Self {
             param_env,
             instance,
-            generalized: sig,
+            generalized_value: sig.skip_binder(),
+            generalized_bound_vars: sig.bound_vars(),
             param_count,
         }
     }
@@ -578,7 +581,7 @@ impl<'tcx> FunctionCallAndRegions<'tcx> {
         let trait_sig = instantiate_ty_and_normalize_preserving_regions(
             tcx,
             self.param_env,
-            self.generalized,
+            self.generalized(),
             args,
         );
 
@@ -632,6 +635,10 @@ impl<'tcx> FunctionCallAndRegions<'tcx> {
         );
 
         tied.filter(|s| !s.is_empty())
+    }
+
+    pub fn generalized(&self) -> Binder<'tcx, Ty<'tcx>> {
+        Binder::bind_with_vars(self.generalized_value, self.generalized_bound_vars)
     }
 }
 
