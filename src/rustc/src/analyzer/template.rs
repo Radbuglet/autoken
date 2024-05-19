@@ -34,7 +34,7 @@ use super::{
     trace::TraceFacts,
 };
 
-#[derive(TyEncodable, TyDecodable)]
+#[derive(Debug, Clone, TyEncodable, TyDecodable)]
 pub struct BodyTemplateFacts<'tcx> {
     /// The set of region-type-set pairs that can be leaked from the current function.
     pub permitted_leaks: Vec<(Region<'tcx>, Ty<'tcx>)>,
@@ -43,7 +43,7 @@ pub struct BodyTemplateFacts<'tcx> {
     pub calls: Vec<TemplateCall<'tcx>>,
 }
 
-#[derive(TyEncodable, TyDecodable)]
+#[derive(Debug, Clone, TyEncodable, TyDecodable)]
 pub struct TemplateCall<'tcx> {
     // The span of the function call.
     pub span: Span,

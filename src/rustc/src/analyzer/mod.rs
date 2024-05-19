@@ -1,12 +1,18 @@
-use rustc_hir::{def::DefKind, Constness, LangItem};
+use rustc_hir::{
+    def::DefKind,
+    def_id::{DefId, LOCAL_CRATE},
+    Constness, LangItem,
+};
 
 use rustc_middle::ty::{Instance, ParamEnv, TyCtxt};
+use rustc_session::config::CrateType;
 
 use crate::{
     analyzer::overlap::BodyOverlapFacts,
     util::{
         feeder::{feeders::MirBuiltStasher, read_feed},
         hash::FxHashMap,
+        meta::{get_crate_cache_path, save_to_file, try_load_from_file},
         mir::{
             for_each_concrete_unsized_func, has_optimized_mir, iter_all_local_def_ids,
             try_grab_base_mir_of_def_id, try_grab_optimized_mir_of_instance,
@@ -27,15 +33,18 @@ mod trace;
 
 // === Driver === //
 
+type SerializedCrateData<'tcx> =
+    FxHashMap<DefId, (BodyTemplateFacts<'tcx>, BodyOverlapFacts<'tcx>)>;
+
 pub fn analyze(tcx: TyCtxt<'_>) {
-    // Fetch the MIR for each local definition to populate the `MirBuiltStasher`.
+    // Fetch the MIR for each local definition to populate the `MirBuiltStasher`
     for local_def in iter_all_local_def_ids(tcx) {
         if try_grab_base_mir_of_def_id(tcx, local_def).is_some() {
             assert!(read_feed::<MirBuiltStasher>(tcx, local_def).is_some());
         }
     }
 
-    // Generate borrow-checking templates for each local function.
+    // Generate borrow-checking templates for each local function
     assert!(!tcx.untracked().definitions.is_frozen());
 
     let mut templates = FxHashMap::default();
@@ -53,14 +62,14 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
         templates.insert(
             did.to_def_id(),
-            (template, shadow_did, None::<BodyOverlapFacts>),
+            (template, Some(shadow_did), None::<BodyOverlapFacts>),
         );
     }
 
-    // Generate trace facts.
+    // Generate trace facts
     let trace = TraceFacts::compute(tcx);
 
-    // Check for undeclared unsizing in trace.
+    // Check for undeclared unsizing in trace
     for &instance in trace.facts.keys() {
         let body = try_grab_optimized_mir_of_instance(tcx, instance.def).unwrap();
 
@@ -89,7 +98,23 @@ pub fn analyze(tcx: TyCtxt<'_>) {
 
     // Borrow-check each template fact
     for (orig_did, (_, shadow_did, overlaps)) in &mut templates {
-        *overlaps = Some(BodyOverlapFacts::new(tcx, *orig_did, *shadow_did));
+        *overlaps = Some(BodyOverlapFacts::new(tcx, *orig_did, shadow_did.unwrap()));
+    }
+
+    // Load other crates' facts
+    for &krate in tcx.crates(()) {
+        let path = get_crate_cache_path(tcx, krate);
+
+        let Some(map) =
+            try_load_from_file::<SerializedCrateData<'_>>(tcx, "AuToken metadata", &path)
+        else {
+            continue;
+        };
+
+        for (did, (template, overlap)) in map {
+            assert!(!templates.contains_key(&did));
+            templates.insert(did, (template, None, Some(overlap)));
+        }
     }
 
     // Validate each traced function using their template
@@ -99,6 +124,21 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         };
 
         template.validate(tcx, &trace, overlaps.as_ref().unwrap(), instance.args);
+    }
+
+    // Save my crate's facts
+    if tcx.needs_metadata() && !tcx.crate_types().contains(&CrateType::ProcMacro) {
+        let path = get_crate_cache_path(tcx, LOCAL_CRATE);
+
+        let serialized = templates
+            .iter()
+            .filter(|(did, _)| did.is_local())
+            .map(|(&did, (template, _, overlaps))| {
+                (did, (template.clone(), overlaps.as_ref().unwrap().clone()))
+            })
+            .collect::<SerializedCrateData<'_>>();
+
+        save_to_file(tcx, "AuToken metadata", &path, &serialized);
     }
 }
 
