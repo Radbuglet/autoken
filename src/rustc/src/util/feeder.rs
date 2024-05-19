@@ -113,6 +113,7 @@ pub mod once_val_macro_internals {
     pub struct MyOnceLock<T>(OnceLock<T>);
 
     impl<T: Copy> MyOnceLock<T> {
+        #[allow(clippy::new_without_default)]
         pub const fn new() -> Self {
             Self(OnceLock::new())
         }
