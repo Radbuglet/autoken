@@ -19,8 +19,8 @@ use rustc_serialize::{
 };
 use rustc_session::StableCrateId;
 use rustc_span::{
-    hygiene::{ExpnIndex, Transparency},
-    ExpnId, Span, SpanDecoder, SpanEncoder, Symbol, SyntaxContext, DUMMY_SP,
+    hygiene::ExpnIndex, BytePos, ExpnId, FileName, RealFileName, Span, SpanData, SpanDecoder,
+    SpanEncoder, StableSourceFileId, Symbol, SyntaxContext, DUMMY_SP,
 };
 use rustc_type_ir::{TyDecoder, TyEncoder};
 
@@ -43,6 +43,26 @@ where
         predicate_shorthands: FxHashMap::default(),
     };
 
+    // Encode set of source files to preload for span generation
+    for file in tcx.sess.source_map().files().iter() {
+        let FileName::Real(RealFileName::LocalPath(path)) = &file.name else {
+            continue;
+        };
+
+        let Some(path) = path.to_str() else {
+            continue;
+        };
+
+        if path.is_empty() {
+            continue;
+        }
+
+        encoder.emit_str(path);
+    }
+
+    encoder.emit_str("");
+
+    // Encode item
     item.encode(&mut encoder);
 
     if let Err((_, err)) = encoder.encoder.finish() {
@@ -72,6 +92,17 @@ where
         ty_cache: FxHashMap::default(),
     };
 
+    // Load preloaded source files
+    loop {
+        let preload_path = decoder.read_str();
+        if preload_path.is_empty() {
+            break;
+        }
+
+        let _ = tcx.sess.source_map().load_file(Path::new(&preload_path));
+    }
+
+    // Load decoded value
     Some(T::decode(&mut decoder))
 }
 
@@ -112,12 +143,21 @@ impl<'tcx, 'a> TyEncoder for AutokenEncoder<'tcx, 'a> {
     }
 
     fn encode_alloc_id(&mut self, alloc_id: &AllocId) {
-        todo!();
+        let _ = alloc_id;
+        unimplemented!("not used by analyzer");
     }
 }
 
 impl<'tcx, 'a> SpanEncoder for AutokenEncoder<'tcx, 'a> {
-    fn encode_span(&mut self, _span: Span) {}
+    fn encode_span(&mut self, span: Span) {
+        let src_file = self.tcx.sess.source_map().lookup_source_file(span.lo());
+        let src_offset = src_file.start_pos;
+
+        src_file.stable_id.encode(self);
+        (span.lo() - src_offset).encode(self);
+        (span.hi() - src_offset).encode(self);
+        span.data().ctxt.encode(self);
+    }
 
     fn encode_symbol(&mut self, symbol: Symbol) {
         self.emit_str(symbol.as_str());
@@ -129,7 +169,8 @@ impl<'tcx, 'a> SpanEncoder for AutokenEncoder<'tcx, 'a> {
     }
 
     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
-        syntax_context.marks().encode(self);
+        // Unimplemented: not used by our analyzer
+        let _ = syntax_context;
     }
 
     fn encode_crate_num(&mut self, crate_num: CrateNum) {
@@ -238,13 +279,35 @@ impl<'tcx, 'a> TyDecoder for AutokenDecoder<'tcx, 'a> {
     }
 
     fn decode_alloc_id(&mut self) -> AllocId {
-        todo!()
+        unimplemented!("not used by analyzer");
     }
 }
 
 impl<'tcx, 'a> SpanDecoder for AutokenDecoder<'tcx, 'a> {
     fn decode_span(&mut self) -> Span {
-        DUMMY_SP
+        let src_file = StableSourceFileId::decode(self);
+        let rel_lo = BytePos::decode(self);
+        let rel_hi = BytePos::decode(self);
+        let ctxt = SyntaxContext::decode(self);
+
+        let Some(src_file) = self
+            .tcx
+            .sess
+            .source_map()
+            .source_file_by_stable_id(src_file)
+        else {
+            return DUMMY_SP;
+        };
+
+        let file_offset = src_file.start_pos;
+
+        SpanData {
+            lo: file_offset + rel_lo,
+            hi: file_offset + rel_hi,
+            ctxt,
+            parent: None,
+        }
+        .span()
     }
 
     fn decode_symbol(&mut self) -> Symbol {
@@ -258,13 +321,8 @@ impl<'tcx, 'a> SpanDecoder for AutokenDecoder<'tcx, 'a> {
     }
 
     fn decode_syntax_context(&mut self) -> SyntaxContext {
-        let mut cx = SyntaxContext::root();
-
-        for (expn, trans) in Vec::<(ExpnId, Transparency)>::decode(self) {
-            cx = cx.apply_mark(expn, trans);
-        }
-
-        cx
+        // Unimplemented: not used by our analyzer
+        SyntaxContext::root()
     }
 
     fn decode_crate_num(&mut self) -> CrateNum {
@@ -286,7 +344,7 @@ impl<'tcx, 'a> SpanDecoder for AutokenDecoder<'tcx, 'a> {
     }
 
     fn decode_attr_id(&mut self) -> AttrId {
-        todo!()
+        unimplemented!("not used by analyzer");
     }
 }
 
