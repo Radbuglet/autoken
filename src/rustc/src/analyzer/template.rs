@@ -1,7 +1,7 @@
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
 use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::{
-    mir::{BasicBlock, Local},
+    mir::{BasicBlock, Local, Terminator, TerminatorKind},
     ty::{
         fold::RegionFolder, BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Region,
         RegionKind, Ty, TyCtxt, TypeFoldable,
@@ -41,6 +41,9 @@ pub struct BodyTemplateFacts<'tcx> {
 
     /// The set of calls made by this function.
     pub calls: Vec<TemplateCall<'tcx>>,
+
+    /// The set of locals held by yields.
+    pub yield_locals: FxHashSet<Local>,
 }
 
 #[derive(Debug, Clone, TyEncodable, TyDecodable)]
@@ -71,12 +74,22 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
 
         let mut body_mutator = TokenMirBuilder::new(tcx, param_env_user, &mut body);
         let mut permitted_leaks = Vec::new();
+        let mut yield_locals = FxHashSet::default();
         let mut calls = Vec::new();
         let fn_ret_ty = get_fn_sig_maybe_closure(tcx, orig_id.to_def_id());
 
         let bb_count = body_mutator.body().basic_blocks.len();
         for bb in 0..bb_count {
             let bb = BasicBlock::from_usize(bb);
+
+            // Yields can be treated as if they were function calls borrowing everything.
+            if let Some(Terminator {
+                kind: TerminatorKind::Yield { .. },
+                ..
+            }) = &body_mutator.body()[bb].terminator
+            {
+                yield_locals.insert(body_mutator.ensure_not_borrowed_at(bb));
+            }
 
             // If the current basic block is a call...
             let (span, callee) = match get_callee_from_terminator(
@@ -222,6 +235,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
             Self {
                 permitted_leaks,
                 calls,
+                yield_locals,
             },
             shadow_def,
         )
@@ -297,14 +311,49 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         }
 
         // Validate borrow overlaps
+        // TODO: These diagnostics desperately need to be improved.
         overlaps.validate_overlaps(tcx, |first, second| {
+            // Handle yields
+            'yields: {
+                let Some(first) = borrowing_locals.get(&first) else {
+                    break 'yields;
+                };
+
+                if !self.yield_locals.contains(&second) {
+                    break 'yields;
+                }
+
+                let Some((token, mutability)) = first.iter().next() else {
+                    break 'yields;
+                };
+
+                return Some((token.to_string(), *mutability, Mutability::Mut));
+            }
+
+            'yields: {
+                let Some(second) = borrowing_locals.get(&second) else {
+                    break 'yields;
+                };
+
+                if !self.yield_locals.contains(&first) {
+                    break 'yields;
+                }
+
+                let Some((token, mutability)) = second.iter().next() else {
+                    break 'yields;
+                };
+
+                return Some((token.to_string(), Mutability::Mut, *mutability));
+            }
+
+            // Handle regular borrows
             let first = borrowing_locals.get(&first)?;
             let second = borrowing_locals.get(&second)?;
 
-            let (first, second) = if first.len() > second.len() {
-                (first, second)
+            let (first, second, flipped) = if first.len() > second.len() {
+                (first, second, false)
             } else {
-                (second, first)
+                (second, first, true)
             };
 
             for (token, first_mut) in first {
@@ -313,7 +362,12 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 };
 
                 if !first_mut.is_compatible_with(*second_mut) {
-                    // FIXME: Mutabilities need to be swapped
+                    let (first_mut, second_mut) = if flipped {
+                        (second_mut, first_mut)
+                    } else {
+                        (first_mut, second_mut)
+                    };
+
                     return Some((token.to_string(), *first_mut, *second_mut));
                 }
             }

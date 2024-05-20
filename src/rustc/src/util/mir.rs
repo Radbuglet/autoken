@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, DefIndex, LocalDefId},
-    ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
+    ExprKind, ImplItemKind, ItemKind, Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::{
     mir::{Body, CastKind, LocalDecls, Rvalue, StatementKind, Terminator, TerminatorKind},
@@ -90,6 +90,12 @@ pub fn try_grab_base_mir_of_def_id(tcx: TyCtxt<'_>, id: LocalDefId) -> Option<&S
         Node::AnonConst(_) => {
             // (fallthrough)
         }
+
+        // HACK: Not sure why we can do this.
+        Node::Expr(expr) if matches!(expr.kind, ExprKind::Closure(_)) => {
+            // (fallthrough)
+        }
+
         _ => return None,
     }
 
