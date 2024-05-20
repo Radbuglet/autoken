@@ -113,7 +113,7 @@ fn analyze_fn_facts<'tcx>(
         ParamEnv::reveal_all(),
         instance.into(),
         body,
-        |instance| {
+        |_span, instance| {
             if should_analyze(tcx, instance) {
                 cx.cx().analysis_queue.push(instance);
             }

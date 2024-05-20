@@ -1,3 +1,4 @@
+use rustc_ast::Mutability;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, LOCAL_CRATE},
@@ -6,6 +7,9 @@ use rustc_hir::{
 
 use rustc_middle::ty::{Instance, ParamEnv, TyCtxt};
 use rustc_session::config::CrateType;
+use rustc_span::Span;
+
+use std::fmt::Write;
 
 use crate::{
     analyzer::overlap::BodyOverlapFacts,
@@ -74,7 +78,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         let body = try_grab_optimized_mir_of_instance(tcx, instance.def).unwrap();
 
         if tcx.entry_fn(()).map(|(did, _)| did) == Some(instance.def_id()) {
-            ensure_no_borrow(tcx, &trace, instance, "use this main function");
+            ensure_no_borrow(
+                tcx,
+                &trace,
+                instance,
+                tcx.def_span(instance.def_id()),
+                "use this main function",
+            );
         }
 
         if tcx.def_kind(instance.def_id()) == DefKind::AssocFn
@@ -84,7 +94,13 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 .map(|method_did| tcx.parent(method_did))
                 == Some(tcx.require_lang_item(LangItem::Drop, None))
         {
-            ensure_no_borrow(tcx, &trace, instance, "use this method as a destructor");
+            ensure_no_borrow(
+                tcx,
+                &trace,
+                instance,
+                tcx.def_span(instance.def_id()),
+                "use this method as a destructor",
+            );
         }
 
         for_each_concrete_unsized_func(
@@ -92,7 +108,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             ParamEnv::reveal_all(),
             instance.into(),
             body,
-            |instance| ensure_no_borrow(tcx, &trace, instance, "unsize this function"),
+            |span, instance| ensure_no_borrow(tcx, &trace, instance, span, "unsize this function"),
         );
     }
 
@@ -146,27 +162,56 @@ fn ensure_no_borrow<'tcx>(
     tcx: TyCtxt<'tcx>,
     trace: &TraceFacts<'tcx>,
     instance: Instance<'tcx>,
+    span: Span,
     action: &str,
 ) {
     let Some(facts) = trace.facts(instance) else {
         return;
     };
 
-    if !facts.borrows.is_empty() {
-        tcx.sess.dcx().span_err(
-            tcx.def_span(instance.def_id()),
-            format!(
-                "cannot {action} because it borrows {}",
-                facts
-                    .borrows
-                    .iter()
-                    .map(|(k, (m, _))| format!(
-                        "{k} {}",
-                        if m.is_mut() { "mutably" } else { "immutably" }
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
+    rustc_middle::ty::print::with_forced_trimmed_paths! {
+        if !facts.borrows.is_empty() {
+            let mut diag = tcx.sess.dcx().struct_err(format!(
+                "cannot {action} because it borrows unabsorbed tokens",
+            ));
+
+            diag.span(span);
+
+            let mut borrow_list = String::new();
+            let mut borrow_strings = Vec::new();
+
+            for (ty, (mutability, _)) in &facts.borrows {
+                borrow_strings.push(format!("{}{ty}", match mutability {
+                    Mutability::Not => "&",
+                    Mutability::Mut => "&mut ",
+                }));
+            }
+
+            borrow_strings.sort_unstable();
+
+            for (i, borrow_string) in borrow_strings.iter().enumerate() {
+                let is_first_line = i == 0;
+                let is_last_line = i == borrow_strings.len() - 1;
+
+                writeln!(
+                    &mut borrow_list,
+                    "{} {borrow_string}{}",
+                    if is_first_line {
+                        "uses"
+                    } else {
+                        "    "
+                    },
+                    if is_last_line {
+                        "."
+                    } else {
+                        ","
+                    }
+                ).unwrap();
+            }
+
+            diag.note(borrow_list);
+
+            diag.emit();
+        }
     }
 }

@@ -282,10 +282,12 @@ pub fn for_each_concrete_unsized_func<'tcx>(
     param_env: ParamEnv<'tcx>,
     instance: MaybeConcretizedFunc<'tcx>,
     body: &Body<'tcx>,
-    mut f: impl FnMut(Instance<'tcx>),
+    mut f: impl FnMut(Span, Instance<'tcx>),
 ) {
     for bb in body.basic_blocks.iter() {
         for stmt in bb.statements.iter() {
+            let span = stmt.source_info.span;
+
             let StatementKind::Assign(stmt) = &stmt.kind else {
                 continue;
             };
@@ -308,7 +310,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                     if let Ok(Some(func)) =
                         try_resolve_instance(tcx, param_env, Instance::new(*def, generics))
                     {
-                        f(func);
+                        f(span, func);
                     }
                 }
                 PointerCoercion::ClosureFnPointer(_) => {
@@ -319,7 +321,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                     if let Ok(Some(func)) =
                         try_resolve_instance(tcx, param_env, Instance::new(*def, generics))
                     {
-                        f(func);
+                        f(span, func);
                     }
                 }
                 PointerCoercion::Unsize => {
@@ -387,7 +389,7 @@ pub fn for_each_concrete_unsized_func<'tcx>(
                                 ),
                             },
                         ) {
-                            f(func);
+                            f(span, func);
                         }
                     }
                 }
