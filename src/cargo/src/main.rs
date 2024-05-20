@@ -262,8 +262,7 @@ fn main() -> anyhow::Result<()> {
             cmd.arg("check")
                 .arg("--target")
                 .arg(target_triple)
-                .arg("--target-dir")
-                .arg(target_dir);
+                .env("CARGO_TARGET_DIR", target_dir);
 
             if let Some(path) = args.manifest.manifest_path {
                 cmd.arg("--path").arg(path);

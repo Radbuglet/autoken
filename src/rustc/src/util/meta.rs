@@ -109,7 +109,9 @@ where
 pub fn get_crate_cache_path(tcx: TyCtxt<'_>, krate: CrateNum) -> PathBuf {
     // TODO: Find a better way
     PathBuf::from_str(&format!(
-        "/Users/riley/Desktop/autoken-tmp/{:x}",
+        "{}/autoken_{}_{:x}.meta",
+        std::env::var("CARGO_TARGET_DIR").unwrap(),
+        tcx.crate_name(krate),
         tcx.stable_crate_id(krate)
     ))
     .unwrap()
