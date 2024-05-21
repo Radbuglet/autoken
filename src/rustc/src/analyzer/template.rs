@@ -3,8 +3,8 @@ use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::{
     mir::{BasicBlock, Local, Terminator, TerminatorKind},
     ty::{
-        fold::RegionFolder, BoundVar, GenericArgsRef, InstanceDef, Mutability, ParamEnv, Region,
-        RegionKind, Ty, TyCtxt, TypeFoldable,
+        fold::RegionFolder, BoundVar, GenericArgsRef, Instance, InstanceDef, Mutability, ParamEnv,
+        Region, RegionKind, Ty, TyCtxt, TypeFoldable,
     },
 };
 use rustc_span::{Span, Symbol};
@@ -249,16 +249,19 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         args: GenericArgsRef<'tcx>,
     ) {
         // Determine what each local borrows
-        let mut borrowing_locals = FxHashMap::<Local, FxHashMap<Ty<'tcx>, Mutability>>::default();
+        let mut borrowing_locals =
+            FxHashMap::<Local, (Instance<'tcx>, FxHashMap<Ty<'tcx>, Mutability>)>::default();
 
         fn add_local_borrow<'tcx>(
-            bs: &mut FxHashMap<Local, FxHashMap<Ty<'tcx>, Mutability>>,
+            bs: &mut FxHashMap<Local, (Instance<'tcx>, FxHashMap<Ty<'tcx>, Mutability>)>,
             local: Local,
             token: Ty<'tcx>,
+            instance: Instance<'tcx>,
             mutability: Mutability,
         ) {
             bs.entry(local)
-                .or_default()
+                .or_insert((instance, FxHashMap::default()))
+                .1
                 .entry(token)
                 .or_insert(Mutability::Not)
                 .upgrade(mutability);
@@ -274,15 +277,16 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                 Ok(None) | Err(_) => continue,
             };
 
-            let Some(callee) = trace.facts(callee) else {
+            let Some(callee_facts) = trace.facts(callee) else {
                 continue;
             };
 
-            for (&borrow_ty, &(borrow_mut, borrow_sym)) in &callee.borrows {
+            for (&borrow_ty, &(borrow_mut, borrow_sym)) in &callee_facts.borrows {
                 add_local_borrow(
                     &mut borrowing_locals,
                     call.prevent_call_local,
                     borrow_ty,
+                    callee,
                     borrow_mut,
                 );
 
@@ -303,6 +307,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
                             &mut borrowing_locals,
                             call.tied_locals[tie_local.as_usize()],
                             borrow_ty,
+                            callee,
                             borrow_mut,
                         );
                     }
@@ -311,69 +316,58 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         }
 
         // Validate borrow overlaps
-        // TODO: These diagnostics desperately need to be improved.
-        overlaps.validate_overlaps(tcx, |first, second| {
-            // Handle yields
-            'yields: {
-                let Some(first) = borrowing_locals.get(&first) else {
-                    break 'yields;
-                };
-
-                if !self.yield_locals.contains(&second) {
-                    break 'yields;
-                }
-
-                let Some((token, mutability)) = first.iter().next() else {
-                    break 'yields;
-                };
-
-                return Some((token.to_string(), *mutability, Mutability::Mut));
-            }
-
-            'yields: {
-                let Some(second) = borrowing_locals.get(&second) else {
-                    break 'yields;
-                };
-
-                if !self.yield_locals.contains(&first) {
-                    break 'yields;
-                }
-
-                let Some((token, mutability)) = second.iter().next() else {
-                    break 'yields;
-                };
-
-                return Some((token.to_string(), Mutability::Mut, *mutability));
-            }
-
-            // Handle regular borrows
-            let first = borrowing_locals.get(&first)?;
-            let second = borrowing_locals.get(&second)?;
-
-            let (first, second, flipped) = if first.len() > second.len() {
-                (first, second, false)
-            } else {
-                (second, first, true)
-            };
-
-            for (token, first_mut) in first {
-                let Some(second_mut) = second.get(token) else {
-                    continue;
-                };
-
-                if !first_mut.is_compatible_with(*second_mut) {
-                    let (first_mut, second_mut) = if flipped {
-                        (second_mut, first_mut)
-                    } else {
-                        (first_mut, second_mut)
+        rustc_middle::ty::print::with_forced_trimmed_paths! {
+            overlaps.validate_overlaps(tcx, |types| {
+                // Handle yields
+                for types in types.orders() {
+                    let Some(first) = borrowing_locals.get(types.left) else {
+                        continue;
                     };
 
-                    return Some((token.to_string(), *first_mut, *second_mut));
-                }
-            }
+                    if !self.yield_locals.contains(types.right) {
+                        continue;
+                    }
 
-            None
-        });
+                    let Some((token, mutability)) = first.1.iter().next() else {
+                        continue;
+                    };
+
+                    return Some((
+                        token.to_string(),
+                        types.map(
+                            (*mutability, first.0.to_string()),
+                            (Mutability::Mut, "`.await`".to_string()),
+                        ),
+                    ));
+                }
+
+                // Handle regular borrows
+                let types = types.map(
+                    borrowing_locals.get(&types.left)?,
+                    borrowing_locals.get(&types.right)?,
+                );
+
+                let types = types.maybe_rev(types.left.1.len() <= types.right.1.len());
+
+                for (token, first_mut) in &types.left.1 {
+                    let Some(second_mut) = types.right.1.get(token) else {
+                        continue;
+                    };
+
+                    if !first_mut.is_compatible_with(*second_mut) {
+                        return Some((
+                            token.to_string(),
+                            types.map(
+                                (*first_mut, types.left.0.to_string()),
+                                (*second_mut, types.right.0.to_string()),
+                            ),
+                        ));
+                    }
+                }
+
+                None
+            })
+        }
 
         // Validate leaked locals
         let mut permitted_leaks = FxHashSet::default();
@@ -388,7 +382,7 @@ impl<'tcx> BodyTemplateFacts<'tcx> {
         overlaps.validate_leaks(tcx, |re, local| {
             let borrows = borrowing_locals.get(&local)?;
 
-            for &borrow in borrows.keys() {
+            for &borrow in borrows.1.keys() {
                 if permitted_leaks.contains(&(re, borrow)) {
                     continue;
                 }

@@ -211,6 +211,8 @@ fn ensure_no_borrow<'tcx>(
 
             diag.note(borrow_list);
 
+            diag.span_note(tcx.def_span(instance.def_id()), format!("{instance} was unsized"));
+
             diag.emit();
         }
     }

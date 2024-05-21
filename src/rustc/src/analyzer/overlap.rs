@@ -14,6 +14,7 @@ use rustc_span::Span;
 use crate::util::{
     hash::{FxHashMap, FxHashSet},
     mir::get_body_with_borrowck_facts_but_sinful,
+    pair::Pair,
     ty::{extract_free_region_list, re_as_vid, MutabilityExt},
 };
 
@@ -182,7 +183,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
     pub fn validate_overlaps(
         &self,
         tcx: TyCtxt<'tcx>,
-        mut are_conflicting: impl FnMut(Local, Local) -> Option<(String, Mutability, Mutability)>,
+        mut are_conflicting: impl FnMut(Pair<Local>) -> Option<(String, Pair<(Mutability, String)>)>,
     ) {
         let dcx = tcx.dcx();
 
@@ -195,10 +196,13 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 let (old_bw, old_bw_span) = self.borrows[&old_bw];
                 let (new_bw, new_bw_span) = self.borrows[&new_bw];
 
-                let Some((conflict, old_bw_mut, new_bw_mut)) = (are_conflicting)(new_bw, old_bw)
-                else {
+                let Some((conflict, borrows)) = (are_conflicting)(Pair::new(old_bw, new_bw)) else {
                     continue;
                 };
+
+                let borrows = borrows.nat();
+                let (old_bw_mut, old_reason) = borrows.left;
+                let (new_bw_mut, new_reason) = borrows.right;
 
                 assert!(!old_bw_mut.is_compatible_with(new_bw_mut));
 
@@ -210,7 +214,7 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 .with_span_label(
                     old_bw_span,
                     format!(
-                        "value first borrowed {} here",
+                        "value first borrowed {}",
                         match old_bw_mut {
                             Mutability::Not => "immutably",
                             Mutability::Mut => "mutably",
@@ -220,13 +224,15 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
                 .with_span_label(
                     new_bw_span,
                     format!(
-                        "value later borrowed {} here",
+                        "value later borrowed {}",
                         match new_bw_mut {
                             Mutability::Not => "immutably",
                             Mutability::Mut => "mutably",
                         }
                     ),
                 )
+                .with_help(format!("first borrow originates from {old_reason}"))
+                .with_help(format!("later borrow originates from {new_reason}"))
                 .emit();
             }
         }
