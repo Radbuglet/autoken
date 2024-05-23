@@ -12,7 +12,9 @@ pub trait TokenSet: sealed::TokenSet {}
 
 // Ref
 pub struct Ref<T: ?Sized> {
-    __autoken_ref_ty_marker: PhantomData<fn() -> T>,
+    // N.B. we intentionally include `T` as a type in this structure to ensure that it inherits all
+    // the auto-traits of the type.
+    __autoken_ref_ty_marker: PhantomData<T>,
 }
 
 impl<T: ?Sized> TokenSet for Ref<T> {}
@@ -20,7 +22,9 @@ impl<T: ?Sized> sealed::TokenSet for Ref<T> {}
 
 // Mut
 pub struct Mut<T: ?Sized> {
-    __autoken_mut_ty_marker: PhantomData<fn() -> T>,
+    // N.B. we intentionally include `T` as a type in this structure to ensure that it inherits all
+    // the auto-traits of the type.
+    __autoken_mut_ty_marker: PhantomData<T>,
 }
 
 impl<T: ?Sized> TokenSet for Mut<T> {}
@@ -28,7 +32,9 @@ impl<T: ?Sized> sealed::TokenSet for Mut<T> {}
 
 // DowngradeRef
 pub struct DowngradeRef<T: TokenSet> {
-    __autoken_downgrade_ty_marker: PhantomData<fn() -> T>,
+    // N.B. we intentionally include `T` as a type in this structure to ensure that it inherits all
+    // the auto-traits of the type.
+    __autoken_downgrade_ty_marker: PhantomData<T>,
 }
 
 impl<T: TokenSet> TokenSet for DowngradeRef<T> {}
@@ -36,7 +42,9 @@ impl<T: TokenSet> sealed::TokenSet for DowngradeRef<T> {}
 
 // Diff
 pub struct Diff<A: TokenSet, B: TokenSet> {
-    __autoken_diff_ty_marker: PhantomData<fn() -> (A, B)>,
+    // N.B. we intentionally include `T` as a type in this structure to ensure that it inherits all
+    // the auto-traits of the type.
+    __autoken_diff_ty_marker: PhantomData<(A, B)>,
 }
 
 impl<A: TokenSet, B: TokenSet> TokenSet for Diff<A, B> {}
@@ -70,25 +78,33 @@ pub unsafe fn absorb<T: TokenSet, R>(f: impl FnOnce() -> R) -> R {
     __autoken_absorb_only::<T, R>(f)
 }
 
-// TODO: Inherit send + sync from tokens.
-pub struct BorrowsMut<'a, T: TokenSet> {
-    _ty: PhantomData<fn() -> (&'a (), T)>,
+pub type BorrowsOne<T> = Borrows<Mut<T>>;
+
+pub struct Borrows<T: TokenSet> {
+    // N.B. we intentionally include `T` as a type in this structure to ensure that it inherits all
+    // the auto-traits of the type.
+    _ty: PhantomData<T>,
 }
 
-impl<T: TokenSet> fmt::Debug for BorrowsMut<'_, T> {
+impl<T: TokenSet> fmt::Debug for Borrows<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowsMut").finish_non_exhaustive()
+        f.debug_struct("Borrows").finish_non_exhaustive()
     }
 }
 
-impl<'a, T: TokenSet> BorrowsMut<'a, T> {
+impl<T: TokenSet> Borrows<T> {
     pub unsafe fn new_unchecked() -> Self {
         Self { _ty: PhantomData }
     }
 
-    pub fn acquire() -> Self {
+    pub fn acquire_ref<'a>() -> &'a Self {
+        tie!('a => set DowngradeRef<T>);
+        &Self { _ty: PhantomData }
+    }
+
+    pub fn acquire_mut<'a>() -> &'a mut Self {
         tie!('a => set T);
-        Self { _ty: PhantomData }
+        unsafe { &mut *(0x1 as *mut Self) }
     }
 
     pub fn absorb<R>(&mut self, f: impl FnOnce() -> R) -> R {
@@ -96,31 +112,6 @@ impl<'a, T: TokenSet> BorrowsMut<'a, T> {
     }
 
     pub fn absorb_ref<R>(&self, f: impl FnOnce() -> R) -> R {
-        unsafe { absorb::<DowngradeRef<T>, R>(f) }
-    }
-}
-
-pub struct BorrowsRef<'a, T: TokenSet> {
-    _ty: PhantomData<fn() -> (&'a (), T)>,
-}
-
-impl<T: TokenSet> fmt::Debug for BorrowsRef<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowsRef").finish_non_exhaustive()
-    }
-}
-
-impl<'a, T: TokenSet> BorrowsRef<'a, T> {
-    pub unsafe fn new_unchecked() -> Self {
-        Self { _ty: PhantomData }
-    }
-
-    pub fn acquire() -> Self {
-        tie!('a => set DowngradeRef<T>);
-        Self { _ty: PhantomData }
-    }
-
-    pub fn absorb<R>(&self, f: impl FnOnce() -> R) -> R {
         unsafe { absorb::<DowngradeRef<T>, R>(f) }
     }
 }
@@ -187,32 +178,12 @@ macro_rules! tie {
     };
 }
 
-// === Brand === //
-
-pub struct Brand<T> {
-    _ty: PhantomData<fn() -> T>,
-}
-
-impl<T> Brand<T> {
-    pub fn acquire_ref<'a>() -> &'a Self {
-        tie!('a => ref T);
-
-        &Self { _ty: PhantomData }
-    }
-
-    pub fn acquire_mut<'a>() -> &'a mut Self {
-        tie!('a => mut T);
-
-        unsafe { &mut *(1usize as *const Self as *mut Self) }
-    }
-}
-
 // === `cap!` === //
 
 #[doc(hidden)]
 pub mod cap_macro_internals {
     pub use {
-        crate::Brand,
+        crate::BorrowsOne,
         std::{cell::Cell, ops::FnOnce, ptr::null_mut, thread::LocalKey, thread_local},
     };
 
@@ -257,16 +228,16 @@ macro_rules! cap {
         f()
     }};
     (ref $ty:ty) => {
-        <$ty>::get($crate::cap_macro_internals::Brand::acquire_ref(), |v| v)
+        <$ty>::get($crate::cap_macro_internals::BorrowsOne::acquire_ref(), |v| v)
     };
     (mut $ty:ty) => {
-        <$ty>::get_mut($crate::cap_macro_internals::Brand::acquire_mut(), |v| v)
+        <$ty>::get_mut($crate::cap_macro_internals::BorrowsOne::acquire_mut(), |v| v)
     };
     (ref $ty:ty => $name:ident in $out:expr) => {
-        <$ty>::get($crate::cap_macro_internals::Brand::acquire_ref(), |$name| $out)
+        <$ty>::get($crate::cap_macro_internals::BorrowsOne::acquire_ref(), |$name| $out)
     };
     (mut $ty:ty => $name:ident in $out:expr) => {
-        <$ty>::get_mut($crate::cap_macro_internals::Brand::acquire_mut(), |$name| $out)
+        <$ty>::get_mut($crate::cap_macro_internals::BorrowsOne::acquire_mut(), |$name| $out)
     };
     ($(
         $(#[$attr:meta])*
@@ -288,14 +259,14 @@ macro_rules! cap {
             }
 
             $vis fn get<'out, R: 'out>(
-                _brand: &'out $crate::cap_macro_internals::Brand<$name>,
+                _borrows: &'out $crate::cap_macro_internals::BorrowsOne<$name>,
                 f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out $ty) -> R,
             ) -> R {
                 f(Self::tls().with(|ptr| unsafe { &*ptr.get().cast() }))
             }
 
             $vis fn get_mut<'out, R: 'out>(
-                _brand: &'out mut $crate::cap_macro_internals::Brand<$name>,
+                _borrows: &'out mut $crate::cap_macro_internals::BorrowsOne<$name>,
                 f: impl $(for<$($lt,)*>)? $crate::cap_macro_internals::FnOnce(&'out mut $ty) -> R,
             ) -> R {
                 f(Self::tls().with(|ptr| unsafe { &mut *ptr.get().cast() }))
