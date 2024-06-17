@@ -1,7 +1,7 @@
 // N.B. these are interface versions, not crate versions! The corresponding userland file is
 // `userland/INTERFACE_VERSION.in` and should be updated in tandem with this one.
 
-const SUPPORTED_RANGE: &str = "^0.1.0";
+const SUPPORTED_RANGE: &str = "^0.2.0";
 const UPGRADE_MESSAGE: &str = "Consider upgrading either the autoken analysis tool or the autoken crate. See https://github.com/radbuglet/autoken for details on both.";
 const DEPRECATED_RANGE: &str = "";
 const DEPRECATION_MESSAGE: &str = "<this message should be unreachable>";
