@@ -205,7 +205,44 @@ error[E0499]: cannot borrow `my_values` as mutable more than once at a time
    |         second mutable borrow occurs here
 ```
 
-**To-Do:** Document unsizing rules.
+What AuToken cannot inject through, however, is dynamically dispatched function calls. AuToken
+assumes that every function or trait member which has been unsized depends on nothing from its
+caller. Hence, if you try to unsize a function which expects a value to be in its context, the
+line will refuse to compile:
+
+```rust
+autoken::cap! {
+    pub MyCap = u32;
+}
+
+fn increment_counter() {
+    *autoken::cap!(mut MyCap) += 1;
+}
+
+fn demo() {
+    // Calling `increment_counter` statically is fine, assuming `MyCap` is in the context.
+    increment_counter();
+
+    // ...but unsizing `increment_counter` is not!
+    let my_func: fn() = increment_counter;
+}
+```
+
+```plain_text
+error: cannot unsize this function because it borrows unabsorbed tokens
+  --> src/main.rs:11:25
+   |
+11 |     let my_func: fn() = increment_counter;
+   |                         ^^^^^^^^^^^^^^^^^
+   |
+   = note: uses &mut MyCap.
+           
+note: increment_counter was unsized
+  --> src/main.rs:4:1
+   |
+4  | fn increment_counter() {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+```
 
 ### Advanced Usage
 
@@ -213,6 +250,8 @@ error[E0499]: cannot borrow `my_values` as mutable more than once at a time
 
 ### Limitations
 
-**To-Do:** Document analysis limitations.
+**To-Do:** Document tool limitations (i.e. input parameters aren't supported yet, you can't upgrade
+to newer versions of `rustc`, you probably shouldn't publish crates written with AuToken, the
+compiler is a bit slow because it duplicates a ton of work).
 
 <!-- cargo-rdme end -->
