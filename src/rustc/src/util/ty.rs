@@ -1,6 +1,6 @@
 use std::hash;
 
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::{infer::TyCtxtInferExt, traits::ObligationCause};
 use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::ty::{
@@ -40,6 +40,61 @@ pub fn is_annotated_ty(def: &AdtDef<'_>, marker: Symbol) -> bool {
     };
 
     true
+}
+
+// === Generics === //
+
+pub fn for_each_universal_regions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: LocalDefId,
+    mut f: impl FnMut(Region<'tcx>),
+) {
+    for arg in GenericArgs::identity_for_item(tcx, did) {
+        if let Some(re) = arg.as_region() {
+            f(re);
+        };
+    }
+
+    for_each_late_bound_region_in_recursive_scope(tcx, did, f);
+}
+
+// Copied from compiler/rustc_borrowck/src/universal_regions.rs:896
+fn for_each_late_bound_region_in_recursive_scope<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut mir_def_id: LocalDefId,
+    mut f: impl FnMut(Region<'tcx>),
+) {
+    let typeck_root_def_id = tcx.typeck_root_def_id(mir_def_id.to_def_id());
+
+    // Walk up the tree, collecting late-bound regions until we hit the typeck root
+    loop {
+        for_each_late_bound_region_in_item(tcx, mir_def_id, &mut f);
+
+        if mir_def_id.to_def_id() == typeck_root_def_id {
+            break;
+        } else {
+            mir_def_id = tcx.local_parent(mir_def_id);
+        }
+    }
+}
+
+// Copied from compiler/rustc_borrowck/src/universal_regions.rs:918
+fn for_each_late_bound_region_in_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_def_id: LocalDefId,
+    mut f: impl FnMut(Region<'tcx>),
+) {
+    if !tcx.def_kind(mir_def_id).is_fn_like() {
+        return;
+    }
+
+    for bound_var in tcx.late_bound_vars(tcx.local_def_id_to_hir_id(mir_def_id)) {
+        let BoundVariableKind::Region(bound_region) = bound_var else {
+            continue;
+        };
+        let liberated_region = Region::new_late_param(tcx, mir_def_id.to_def_id(), bound_region);
+        f(liberated_region);
+    }
 }
 
 // === Signature Parsing === //

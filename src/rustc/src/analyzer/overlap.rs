@@ -6,7 +6,7 @@ use rustc_index::bit_set::BitSet;
 use rustc_macros::{TyDecodable, TyEncodable};
 use rustc_middle::{
     mir::{traversal::reverse_postorder, Local, Location, Statement, Terminator},
-    ty::{GenericArgs, Mutability, Region, TyCtxt},
+    ty::{Mutability, Region, TyCtxt},
 };
 use rustc_mir_dataflow::{Analysis, ResultsVisitor};
 use rustc_span::Span;
@@ -15,7 +15,7 @@ use crate::util::{
     hash::{FxHashMap, FxHashSet},
     mir::get_body_with_borrowck_facts_but_sinful,
     pair::Pair,
-    ty::{extract_free_region_list, re_as_vid, MutabilityExt},
+    ty::{extract_free_region_list, for_each_universal_regions, re_as_vid, MutabilityExt},
 };
 
 // === Analysis === //
@@ -95,19 +95,20 @@ impl<'tcx> BodyOverlapFacts<'tcx> {
 
         // Determine the bijection between universal regions in signature-land and inference-land.
         let mut universal_to_vid = FxHashMap::default();
-        for arg in GenericArgs::identity_for_item(tcx, tcx.typeck_root_def_id(orig_did)) {
-            let Some(re) = arg.as_region() else {
-                continue;
-            };
+        for_each_universal_regions(
+            tcx,
+            tcx.typeck_root_def_id(orig_did).as_local().unwrap(),
+            |re| {
+                universal_to_vid.insert(re, facts.region_inference_context.to_region_vid(re));
+            },
+        );
 
-            universal_to_vid.insert(re, facts.region_inference_context.to_region_vid(re));
-            universal_to_vid.insert(
-                tcx.lifetimes.re_static,
-                facts
-                    .region_inference_context
-                    .to_region_vid(tcx.lifetimes.re_static),
-            );
-        }
+        universal_to_vid.insert(
+            tcx.lifetimes.re_static,
+            facts
+                .region_inference_context
+                .to_region_vid(tcx.lifetimes.re_static),
+        );
 
         // Now, use the region information to determine which locals are leaked
         let mut leaked_locals = FxHashMap::default();
