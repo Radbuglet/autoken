@@ -246,7 +246,168 @@ note: increment_counter was unsized
 
 ### Advanced Usage
 
-**To-Do:** Document the lower-level API.
+Internally, [`cap!`](https://docs.rs/autoken/latest/autoken/macro.cap.html) is not a primitive feature of AuToken. Instead, it is built
+entirely in-userland using `thread_local!` with the help of two custom analysis intrinsics:
+[`tie!`](https://docs.rs/autoken/latest/autoken/macro.tie.html) and [`absorb`](https://docs.rs/autoken/latest/autoken/fn.absorb.html).
+
+`tie!` is a macro which can be used in the body of a function to declare the fact that a lifetime
+in the function's return type is tied to a borrow of some global token type. For example, you
+could write:
+
+```rust
+pub struct MySingleton {
+    ...
+}
+
+pub fn get_singleton<'a>() -> &'a mut MySingleton {
+    autoken::tie!('a => mut MySingleton);
+
+    unimplemented!();
+}
+```
+
+...and no one would be able to write a function which acquires multiple mutable references to
+`MySingleton` simultaneously since doing so would require borrowing the `MySingleton` "token"
+mutably more than once.
+
+```rust
+fn demo() {
+    let singleton_1 = get_singleton();
+    let singleton_2 = get_singleton();
+    let _ = singleton_1;
+}
+```
+
+```plain_text
+error: conflicting borrows on token MySingleton
+  --> src/main.rs:11:23
+   |
+10 |     let singleton_1 = get_singleton();
+   |                       --------------- value first borrowed mutably
+11 |     let singleton_2 = get_singleton();
+   |                       ^^^^^^^^^^^^^^^ value later borrowed mutably
+   |
+   = help: first borrow originates from get_singleton::<'_>
+   = help: later borrow originates from get_singleton::<'_>
+```
+
+In effect, you could think of `autoken::tie!` as introducing a new virtual parameter to your
+function indicating exclusive/shared access to a given contextual resource. The code above, for
+example, could be logically desugared as:
+
+```rust
+pub struct MySingleton {
+    ...
+}
+
+pub fn get_singleton<'a>(access_perms: &'a mut Token<MySingleton>) -> &'a mut MySingleton {
+    //                                   ^^ this is what the `'a` means in `tie!('a => mut MySingleton)`
+    //                                                ^^^^^^^^^^^ and this is what the `MySingleton` means.
+    unimplemented!();
+}
+
+fn demo(access_perms: &mut Token<MySingleton>) {
+    //                ^^^^^^^^^^^^^^^^^^^^^^^ The existence of this parameter is inferred from the
+    //                                        call graph. Note that its lifetime is anonymous since
+    //                                        it wasn't explicitly tied to anything.
+    let singleton_1 = get_singleton(access_perms);
+    let singleton_2 = get_singleton(access_perms);
+    let _ = singleton_1;
+}
+```
+
+```plain_text
+error[E0499]: cannot borrow `*access_perms` as mutable more than once at a time
+  --> src/main.rs:18:37
+   |
+17 |     let singleton_1 = get_singleton(access_perms);
+   |                                     ------------ first mutable borrow occurs here
+18 |     let singleton_2 = get_singleton(access_perms);
+   |                                     ^^^^^^^^^^^^ second mutable borrow occurs here
+19 |     let _ = singleton_1;
+   |             ----------- first borrow later used here
+```
+
+But how do we ensure that these tokens actually come from somewhere like a `cap!` block? This
+is where the second mechanism comes in: `absorb`.
+
+If `absorb` didn't exist, any attempt at running code involving a `tie!` directive would end in
+this compile-time error:
+
+```rust
+struct MySingleton {}
+
+fn get_singleton<'a>() -> &'a mut MySingleton {
+    autoken::tie!('a => mut MySingleton);
+    unimplemented!();
+}
+
+fn main() {
+    get_singleton();
+}
+```
+
+```plain_text
+error: cannot use this main function because it borrows unabsorbed tokens
+ --> src/main.rs:8:1
+  |
+8 | fn main() {
+  | ^^^^^^^^^
+  |
+  = note: uses &mut MySingleton.
+```
+
+This is because `main` functions, `extern` functions, and unsized functions/methods are not
+permitted to request any tokens. Hence, in order to call a function with a `tie!` directive, we
+must somehow get rid of that request for a token. We can do that with `absorb`.
+
+`absorb` absorbs the existence of a token's borrow, hiding it from its caller. In this case, if
+we wanted to give our main function the ability to call `get_singleton`, we could wrap the call
+in an `absorb` call like so:
+
+```rust
+struct MySingleton {}
+
+fn get_singleton<'a>() -> &'a mut MySingleton {
+    autoken::tie!('a => mut MySingleton);
+    unimplemented!();
+}
+
+fn main() {
+    unsafe {
+        autoken::absorb::<autoken::Mut<MySingleton>, ()>(|| {
+            get_singleton();
+        });
+    }
+}
+```
+
+This function is obviously `unsafe` since the power to hide borrows could easily break other safe
+abstractions such as `cap!`:
+
+```rust
+autoken::cap! {
+    pub MyCap = Vec<u32>;
+}
+
+fn demo() {
+    let first_three = &autoken::cap!(ref MyCap)[0..3];
+
+    // This compiles because we don't see the mutable borrow of `MyCap` here!
+    unsafe {
+        autoken::absorb::<autoken::Mut<MyCap>, _>(|| {
+            autoken::cap!(mut MyCap).push(3);
+        });
+    }
+    eprintln!("The first three elements are: {first_three:?}");
+}
+```
+
+These primitives are all that is required to implement a context-passing mechanism like `cap!`:
+the fetch form of `cap!` uses `tie!` to declare the fact that the reference it returns is tied
+to some context item defined outside of the function and the binding form of `cap!` uses absorb
+to indicate that borrows inside its block don't affect its caller. Feel free to read the macro's
+source code for all the gory details!
 
 ### Limitations
 
