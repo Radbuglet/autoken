@@ -95,7 +95,7 @@
 //!
 //! And that it! Have fun!
 //!
-//! ## Basic Usage
+//! ## High-Level Usage
 //!
 //! The easiest way to use AuToken is through the [`cap!`](crate::cap) macro. `cap!` allows users to
 //! define, provide, and fetch a new implicitly-passed context item sometimes called a "capability."
@@ -251,7 +251,7 @@
 //!    |                         ^^^^^^^^^^^^^^^^^
 //!    |
 //!    = note: uses &mut MyCap.
-//!            
+//!
 //! note: increment_counter was unsized
 //!   --> src/main.rs:4:1
 //!    |
@@ -259,7 +259,46 @@
 //!    | ^^^^^^^^^^^^^^^^^^^^^^
 //! ```
 //!
-//! ## Advanced Usage
+//! If, for some reason, you need to "smuggle" access to a `cap!` past a dynamic dispatch boundary,
+//! you can use the [`Borrows`](crate:Borrows) object and its alias [`BorrowsOne`](crate:BorrowsOne).
+//!
+//! `Borrows` is an object representing a borrow of a set of capabilities. If you have an mutable
+//! reference to it, you are effectively borrowing that entire set of capabilities mutably. You can
+//! create a `Borrows` object from the surrounding implicit `Borrows` context like so:
+//!
+//! ```rust
+//! # autoken::cap! {
+//! #     pub MyCap = u32;
+//! # }
+//! #
+//! # fn increment_counter() {
+//! #     *autoken::cap!(mut MyCap) += 1;
+//! # }
+//! fn demo_1() {
+//!     let borrows = autoken::BorrowsOne::<MyCap>::acquire_mut();
+//!     let mut increment = || {
+//!         borrows.absorb(|| {
+//!             increment_counter();
+//!         });
+//!     };
+//!     let increment_dyn: &mut dyn FnMut() = &mut increment;
+//!
+//!     increment_dyn();
+//! }
+//!
+//! fn demo_2() {
+//!     let increment = |token: &mut autoken::BorrowsOne<MyCap>| {
+//!         token.absorb(|| {
+//!             increment_counter();
+//!         });
+//!     };
+//!     let increment: fn(&mut autoken::BorrowsOne<MyCap>) = increment;
+//!
+//!     increment(autoken::BorrowsOne::<MyCap>::acquire_mut());
+//! }
+//! ```
+//!
+//! ## Low-Level Usage
 //!
 //! Internally, [`cap!`](crate::cap) is not a primitive feature of AuToken. Instead, it is built
 //! entirely in-userland using `thread_local!` with the help of two custom analysis intrinsics:
@@ -439,12 +478,206 @@
 //! to indicate that borrows inside its block don't affect its caller. Feel free to read the macro's
 //! source code for all the gory details!
 //!
+//! ## Semantics of Generics
+//!
+//! AuToken takes a ["substitution failure is not an error"](https://en.wikipedia.org/wiki/Substitution_failure_is_not_an_error)
+//! approach to handling generics. That is, rather than checking that all possible substitutions for
+//! a generic parameter are valid as the function is first defined, it checks only the substitutions
+//! that are actually used. As an example, this function, by itself, passes AuToken's validation:
+//!
+//! ```rust
+//! fn my_func<T, V>() {
+//!     let a = autoken::BorrowsOne::<T>::acquire_mut();
+//!     let b = autoken::BorrowsOne::<V>::acquire_mut();
+//!     let _ = (a, b);
+//! }
+//! ```
+//!
+//! In most scenarios, this function type-checks:
+//!
+//! ```rust
+//! # fn my_func<T, V>() {
+//! #     let a = autoken::BorrowsOne::<T>::acquire_mut();
+//! #     let b = autoken::BorrowsOne::<V>::acquire_mut();
+//! #     let _ = (a, b);
+//! # }
+//! fn demo_works() {
+//!     my_func::<u32, i32>();  // Ok!
+//! }
+//! ```
+//!
+//! However, if you happen to substitute `T` and `V` such that `T = V`...
+//!
+//! ```rust
+//! # fn my_func<T, V>() {
+//! #     let a = autoken::BorrowsOne::<T>::acquire_mut();
+//! #     let b = autoken::BorrowsOne::<V>::acquire_mut();
+//! #     let _ = (a, b);
+//! # }
+//! fn demo_breaks() {
+//!     my_func::<u32, u32>();
+//! }
+//! ```
+//!
+//! ...a scary compiler error pops out!
+//!
+//! ```plain_text
+//! error: conflicting borrows on token u32
+//!  --> src/main.rs:5:13
+//!   |
+//! 4 |     let a = autoken::BorrowsOne::<T>::acquire_mut();
+//!   |             --------------------------------------- value first borrowed mutably
+//! 5 |     let b = autoken::BorrowsOne::<V>::acquire_mut();
+//!   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ value later borrowed mutably
+//!   |
+//!   = help: first borrow originates from Borrows::<Mut<u32>>::acquire_mut::<'_>
+//!   = help: later borrow originates from Borrows::<Mut<u32>>::acquire_mut::<'_>
+//! ```
+//!
+//! Generic dispatches, too, have some weird generic behavior. In this case, the body of `my_func`
+//! makes it such that the provided closure cannot borrow the `u32` token mutably.
+//!
+//! ```rust
+//! fn my_func(f: impl FnOnce()) {
+//!     let v = autoken::BorrowsOne::<u32>::acquire_mut();
+//!     f();
+//!     let _ = v;
+//! }
+//!
+//! fn demo_works() {
+//!     my_func(|| {
+//!         let _ = autoken::BorrowsOne::<i32>::acquire_mut();
+//!     });
+//! }
+//!
+//! fn demo_breaks() {
+//!     my_func(|| {
+//!         let _ = autoken::BorrowsOne::<u32>::acquire_mut();
+//!     });
+//! }
+//! ```
+//!
+//! ```plain_text
+//! error: conflicting borrows on token u32
+//!  --> src/main.rs:3:5
+//!   |
+//! 2 |     let v = autoken::BorrowsOne::<u32>::acquire_mut();
+//!   |             ----------------------------------------- value first borrowed mutably
+//! 3 |     f();
+//!   |     ^^^ value later borrowed mutably
+//!   |
+//!   = help: first borrow originates from Borrows::<Mut<u32>>::acquire_mut::<'_>
+//!   = help: later borrow originates from demo_breaks::{closure#0}
+//! ```
+//!
+//! Even bare generic dispatch can bite you in some scenarios. In this case, any implementation of
+//! `MyTrait` which ties `'a` to any token mutably will fail to compile if passed to `my_func`.
+//!
+//! ```rust
+//! trait MyTrait {
+//!    fn run<'a>(self) -> &'a ();
+//! }
+//!
+//! fn my_func(f: impl MyTrait, g: impl MyTrait) {
+//!    let a = f.run();
+//!    let b = g.run();
+//!    let _ = (a, b);
+//! }
+//!
+//! fn demo_works() {
+//!     struct Works;
+//!
+//!     impl MyTrait for Works {
+//!         fn run<'a>(self) -> &'a () {
+//!             &()
+//!         }
+//!     }
+//!
+//!     my_func(Works, Works);
+//! }
+//!
+//! fn demo_breaks() {
+//!     struct Breaks;
+//!
+//!     impl MyTrait for Breaks {
+//!         fn run<'a>(self) -> &'a () {
+//!             autoken::tie!('a => mut u32);
+//!             &()
+//!         }
+//!     }
+//!
+//!     my_func(Breaks, Breaks);
+//! }
+//! ```
+//!
+//! ```plain_text
+//! error: conflicting borrows on token u32
+//!  --> src/main.rs:7:13
+//!  |
+//! 6 |     let a = f.run();
+//!  |             ------- value first borrowed mutably
+//! 7 |     let b = g.run();
+//!  |             ^^^^^^^ value later borrowed mutably
+//!  |
+//!  = help: first borrow originates from <Breaks as MyTrait>::run::<'_>
+//!  = help: later borrow originates from <Breaks as MyTrait>::run::<'_>
+//! ```
+//!
+//! Even just unsizing functions can introduce restrictions on which values can be substituted into
+//! a generic parameter. In this case, `my_func`'s unsizing of the provided closure implies a
+//! restriction that the provided closure can't borrow any tokens whatsoever!
+//!
+//! ```rust
+//! fn my_func(mut f: impl FnMut()) {
+//!     let f: &mut dyn FnMut() = &mut f;
+//! }
+//!
+//! fn demo_works() {
+//!     my_func(|| {
+//!         eprintln!("Everything is okay!");
+//!     });
+//! }
+//!
+//! fn demo_breaks() {
+//!     my_func(|| {
+//!         eprintln!("Uh oh...");
+//!         autoken::BorrowsOne::<u32>::acquire_mut();
+//!     });
+//! }
+//! ```
+//!
+//! ```plain_text
+//! error: cannot unsize this function because it borrows unabsorbed tokens
+//!   --> src/main.rs:2:31
+//!    |
+//! 2  |     let f: &mut dyn FnMut() = &mut f;
+//!    |                               ^^^^^^
+//!    |
+//!    = note: uses &mut u32.
+//!
+//! note: demo_breaks::{closure#0} was unsized
+//!   --> src/main.rs:12:13
+//!    |
+//! 12 |     my_func(|| {
+//!    |             ^^
+//! ```
+//!
+//! These semantic versioning foot-guns are quite scary (and the poor diagnostics for them certainly
+//! don't help!) but this level of flexibility with generics also allows all sorts of powerful patterns
+//! to be implemented generically in AuToken. The big open question in AuToken's design is how to
+//! remove these foot-guns without also blunting AuToken's expressiveness.
+//!
+//! ## Neat Recipes
+//!
+//! TODO
+//!
 //! ## Limitations
 //!
 //! **To-Do:** Document tool limitations (i.e. input parameters aren't supported yet, you can't upgrade
 //! to newer versions of `rustc`, you probably shouldn't publish crates written with AuToken, the
 //! compiler is a bit slow because it duplicates a ton of work).
 //!
+//! **To-Do:** Breaks semver and how we might fix this in an actual language feature.
 
 use std::{fmt, marker::PhantomData};
 
