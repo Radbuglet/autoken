@@ -53,7 +53,7 @@ error: conflicting borrows on token MyCap
    = help: later borrow originates from Borrows::<Mut<MyCap>>::acquire_mut::<'_>
 ```
 
-### Installation
+## Installation
 
 AuToken is both a custom compiler plugin called `cargo-autoken` and a regular cargo crate called
 `autoken` whose documentation you are currently reading. It is possible to compile projects
@@ -72,7 +72,7 @@ cargo install -Z bindeps --path src/cargo
 
 Now that `cargo-autoken` is installed, let's set up a project.
 
-#### Project Setup
+### Project Setup
 
 AuToken requires a very specific version of the Rust compiler to work. Let's pin our project to
 that version by creating a `rust-toolchain.toml` file in your project's root directory.
@@ -106,7 +106,7 @@ run-unchecked:
 
 And that it! Have fun!
 
-### High-Level Usage
+## High-Level Usage
 
 The easiest way to use AuToken is through the [`cap!`](https://docs.rs/autoken/latest/autoken/macro.cap.html) macro. `cap!` allows users to
 define, provide, and fetch a new implicitly-passed context item sometimes called a "capability."
@@ -276,7 +276,7 @@ fn demo_2() {
 }
 ```
 
-### Low-Level Usage
+## Low-Level Usage
 
 Internally, [`cap!`](https://docs.rs/autoken/latest/autoken/macro.cap.html) is not a primitive feature of AuToken. Instead, it is built
 entirely in-userland using `thread_local!` with the help of two custom analysis intrinsics:
@@ -441,7 +441,7 @@ to some context item defined outside of the function and the binding form of `ca
 to indicate that borrows inside its block don't affect its caller. Feel free to read the macro's
 source code for all the gory details!
 
-### Semantics of Generics
+## Semantics of Generics
 
 AuToken takes a ["substitution failure is not an error"](https://en.wikipedia.org/wiki/Substitution_failure_is_not_an_error)
 approach to handling generics. That is, rather than checking that all possible substitutions for
@@ -566,12 +566,12 @@ fn demo_breaks() {
 ```plain_text
 error: conflicting borrows on token u32
  --> src/main.rs:7:13
- |
+  |
 6 |     let a = f.run();
- |             ------- value first borrowed mutably
+  |             ------- value first borrowed mutably
 7 |     let b = g.run();
- |             ^^^^^^^ value later borrowed mutably
- |
+  |             ^^^^^^^ value later borrowed mutably
+  |
  = help: first borrow originates from <Breaks as MyTrait>::run::<'_>
  = help: later borrow originates from <Breaks as MyTrait>::run::<'_>
 ```
@@ -620,14 +620,14 @@ don't help!) but this level of flexibility with generics also allows all sorts o
 to be implemented generically in AuToken. The big open question in AuToken's design is how to
 remove these foot-guns without also blunting AuToken's expressiveness.
 
-### Neat Recipes
+## Neat Recipes
 
 One of the coolest uses of AuToken, in my slightly biased opinion, is integrating it with the
  [`generational_arena`](https://docs.rs/generational-arena/latest/generational_arena/) crate.
-This crate implements what is essentially a `HashMap` from numeric handles to values but
-considerably more efficient. Since numeric handles are freely copyable, they can serve as ad hoc
-shared mutable references. Their only issue is that, in order to dereference them, you must carry
-around the arena mapping those handles to their values.
+This crate implements what is essentially a `HashMap` from numeric handles to values but in a way
+which is considerably more efficient. Since numeric handles are freely copyable, they can serve
+as ad hoc shared mutable references. Their only issue is that, in order to dereference them, you
+must carry around a reference to the arena mapping those handles to their values.
 
 This is where AuToken comes in. Since `Deref` implementations can tie their output to a token
 borrow, we can implement a version of those handles which acts like a smart pointer like so:
@@ -683,8 +683,8 @@ impl<T: Pointee> Deref for Handle<T> {
     type Target = T;
 
     fn deref<'a>(&'a self) -> &'a T {
-        // We'll explain what `unsafe` means in a bit. The TLDR is that it's a workaround for a
-        // difficult-to-fix analysis bug in AuToken.
+        // The `unsafe` keyword is admittedly a bit weird. The TLDR is that it's a workaround for
+        // a difficult-to-fix analysis bug in AuToken.
         autoken::tie!(unsafe 'a => ref T::Cap);
         &T::arena()[self.handle]
     }
@@ -836,7 +836,7 @@ Value: 3
 
 Neat, huh?
 
-### Limitations
+## Limitations
 
 AuToken is held together with duct-tape and dreams.
 
@@ -947,12 +947,13 @@ Here's what that means to you:
 
 All in all, I would use this tool as a playground for exploring the design implications of adding
 a context passing feature to the Rust compiler since there's no better way to explore the
-effects of a potential language extension than to play around with it.
+effects of a potential language extension than to play around with it. Please be responsible and
+refrain from using this in production.
 
-### Special Thanks
+## Special Thanks
 
 I owe so much to the wonderful folks of the [`#dark-arts` channel](https://discord.gg/rust-lang-community)
 of the "Rust Programming Language Community" Discord server and of the [rust-lang Zulip chat](https://rust-lang.zulipchat.com/).
-Thank you all, so much, for your help!
+Thank you all, so very much, for your help!
 
 <!-- cargo-rdme end -->
