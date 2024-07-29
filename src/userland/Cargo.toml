@@ -10,3 +10,6 @@ edition = "2021"
 
 [build-dependencies]
 semver = "1.0.20"
+
+[dev-dependencies]
+generational-arena = "0.2.9"

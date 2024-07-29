@@ -1,7 +1,7 @@
 #![allow(rustdoc::redundant_explicit_links)] // (cargo-rdme needs this)
 //! A rust-lang compiler tool adding support for zero-cost borrow-aware context passing.
 //!
-//! ```no_run
+//! ```ignore
 //! use autoken::{cap, CapTarget};
 //!
 //! cap! {
@@ -189,7 +189,7 @@
 //!
 //! ...while this code fails to compile because both closures need to capture `my_cap`:
 //!
-//! ```compile_fail
+//! ```ignore
 //! # fn call_two(a: impl FnOnce(), b: impl FnOnce()) {
 //! #     a();
 //! #     b();
@@ -358,7 +358,7 @@
 //! function indicating exclusive/shared access to a given contextual resource. The code above, for
 //! example, could be logically desugared as:
 //!
-//! ```compile_fail
+//! ```ignore
 //! # use std::marker::PhantomData;
 //! #
 //! # pub struct Token<T: ?Sized>(PhantomData<T>);
@@ -403,7 +403,7 @@
 //! If `absorb` didn't exist, any attempt at running code involving a `tie!` directive would end in
 //! this compile-time error:
 //!
-//! ```no_run
+//! ```ignore
 //! struct MySingleton {}
 //!
 //! fn get_singleton<'a>() -> &'a mut MySingleton {
@@ -434,7 +434,7 @@
 //! we wanted to give our main function the ability to call `get_singleton`, we could wrap the call
 //! in an `absorb` call like so:
 //!
-//! ```no_run
+//! ```ignore
 //! struct MySingleton {}
 //!
 //! fn get_singleton<'a>() -> &'a mut MySingleton {
@@ -669,7 +669,403 @@
 //!
 //! ## Neat Recipes
 //!
-//! TODO
+//! One of the coolest uses of AuToken, in my slightly biased opinion, is integrating it with th
+//!  [`generational_arena`](https://docs.rs/generational-arena/latest/generational_arena/) crate.
+//! This crate implements what is essentially a `HashMap` from numeric handles to values but
+//! considerably more efficient. Since numeric handles are freely copyable, they can serve as ad hoc
+//! shared mutable references. Their only issue is that, in order to dereference them, you must carry
+//! around the arena mapping those handles to their values.
+//!
+//! This is where AuToken comes in. Since `Deref` implementations can tie their output to a token
+//! borrow, we can implement a version of those handles which acts like a smart pointer like so:
+//!
+//! ```rust
+//! use generational_arena::Arena;
+//!
+//! use std::{
+//!     marker::PhantomData,
+//!     ops::{Deref, DerefMut},
+//! };
+//!
+//! // Extracts the capability containing the arena used by a given `Pointee`
+//! type PointeeCap<T> = <T as Pointee>::Cap;
+//!
+//! // A trait implemented by all objects that have an arena that can be pointed into by a `Handle.`
+//! trait Pointee: Sized {
+//!     type Cap;
+//!
+//!     fn arena<'a>() -> &'a Arena<Self>;
+//!
+//!     fn arena_mut<'a>() -> &'a mut Arena<Self>;
+//! }
+//!
+//! // A smart pointer which is `Copy`, `Deref`, `DerefMut`, and has a `destroy()` method! 🙀
+//! struct Handle<T: Pointee> {
+//!     _ty: PhantomData<fn(T) -> T>,
+//!     handle: generational_arena::Index,
+//! }
+//!
+//! impl<T: Pointee> Copy for Handle<T> {}
+//!
+//! impl<T: Pointee> Clone for Handle<T> {
+//!     fn clone(&self) -> Self {
+//!         *self
+//!     }
+//! }
+//!
+//! impl<T: Pointee> Handle<T> {
+//!     pub fn new(value: T) -> Self {
+//!         Self {
+//!             _ty: PhantomData,
+//!             handle: T::arena_mut().insert(value),
+//!         }
+//!     }
+//!
+//!     pub fn destroy(self) {
+//!         T::arena_mut().remove(self.handle);
+//!     }
+//! }
+//!
+//! impl<T: Pointee> Deref for Handle<T> {
+//!     type Target = T;
+//!
+//!     fn deref<'a>(&'a self) -> &'a T {
+//!         // We'll explain what `unsafe` means in a bit. The TLDR is that it's a workaround for a
+//!         // difficult-to-fix analysis bug in AuToken.
+//!         autoken::tie!(unsafe 'a => ref T::Cap);
+//!         &T::arena()[self.handle]
+//!     }
+//! }
+//!
+//! impl<T: Pointee> DerefMut for Handle<T> {
+//!     fn deref_mut<'a>(&'a mut self) -> &'a mut T {
+//!         autoken::tie!(unsafe 'a => mut T::Cap);
+//!         &mut T::arena_mut()[self.handle]
+//!     }
+//! }
+//! ```
+//!
+//! Here's how we can use it!
+//!
+//! ```rust
+//! # use generational_arena::Arena;
+//! #
+//! # use std::{
+//! #     marker::PhantomData,
+//! #     ops::{Deref, DerefMut},
+//! # };
+//! #
+//! # // Extracts the capability containing the arena used by a given `Pointee`
+//! # type PointeeCap<T> = <T as Pointee>::Cap;
+//! #
+//! # // A trait implemented by all objects that have an arena that can be pointed into by a `Handle.`
+//! # trait Pointee: Sized {
+//! #     type Cap;
+//! #
+//! #     fn arena<'a>() -> &'a Arena<Self>;
+//! #
+//! #     fn arena_mut<'a>() -> &'a mut Arena<Self>;
+//! # }
+//! #
+//! # // A smart pointer which is `Copy`, `Deref`, `DerefMut`, and has a `destroy()` method! 🙀
+//! # struct Handle<T: Pointee> {
+//! #     _ty: PhantomData<fn(T) -> T>,
+//! #     handle: generational_arena::Index,
+//! # }
+//! #
+//! # impl<T: Pointee> Copy for Handle<T> {}
+//! #
+//! # impl<T: Pointee> Clone for Handle<T> {
+//! #     fn clone(&self) -> Self {
+//! #         *self
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> Handle<T> {
+//! #     pub fn new(value: T) -> Self {
+//! #         Self {
+//! #             _ty: PhantomData,
+//! #             handle: T::arena_mut().insert(value),
+//! #         }
+//! #     }
+//! #
+//! #     pub fn destroy(self) {
+//! #         T::arena_mut().remove(self.handle);
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> Deref for Handle<T> {
+//! #     type Target = T;
+//! #
+//! #     fn deref<'a>(&'a self) -> &'a T {
+//! #         // We'll explain what `unsafe` means in a bit. The TLDR is that it's a workaround for a
+//! #         // difficult-to-fix analysis bug in AuToken.
+//! #         autoken::tie!(unsafe 'a => ref T::Cap);
+//! #         &T::arena()[self.handle]
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> DerefMut for Handle<T> {
+//! #     fn deref_mut<'a>(&'a mut self) -> &'a mut T {
+//! #         autoken::tie!(unsafe 'a => mut T::Cap);
+//! #         &mut T::arena_mut()[self.handle]
+//! #     }
+//! # }
+//! // First, let's implement `Pointee` on `Vec<u32>`. This could be turned into a simple decl-macro.
+//! const _: () = {
+//!     autoken::cap! {
+//!         pub Cap = Arena<Vec<u32>>;
+//!     }
+//!
+//!     impl Pointee for Vec<u32> {
+//!         type Cap = Cap;
+//!
+//!         fn arena<'a>() -> &'a Arena<Self> {
+//!             autoken::tie!('a => ref Cap);
+//!             autoken::cap!(ref Cap)
+//!         }
+//!
+//!         fn arena_mut<'a>() -> &'a mut Arena<Self> {
+//!             autoken::tie!('a => mut Cap);
+//!             autoken::cap!(mut Cap)
+//!         }
+//!     }
+//! };
+//!
+//! // Now, we can start using the handle as if it were any other smart pointer.
+//! fn do_something(mut f: Handle<Vec<u32>>) {
+//!     f.push(4);
+//!     do_something_else(f);
+//!     f.push(5);
+//! }
+//!
+//! fn do_something_else(f: Handle<Vec<u32>>) {
+//!     eprintln!("Values: {:?}", &*f);
+//! }
+//!
+//! fn main() {
+//!     // ...all we have to do to call these methods is inject the right arena into the context!
+//!     autoken::cap! {
+//!         PointeeCap<Vec<u32>>: &mut Arena::new()
+//!     =>
+//!         let handle = Handle::new(vec![1, 2, 3]);
+//!         do_something(handle);
+//!         handle.destroy();
+//!     }
+//! }
+//! ```
+//!
+//! Let's use this newfound power to implement the borrow-checker's arch-nemesis: the linked list.
+//!
+//! ```rust
+//! // This feature allows us to use the `self: Handle<Self>` syntax, which is convenient but not
+//! // required whatsoever.
+//! #![feature(arbitrary_self_types)]
+//!
+//! # use generational_arena::Arena;
+//! #
+//! # use std::{
+//! #     marker::PhantomData,
+//! #     ops::{Deref, DerefMut},
+//! # };
+//! #
+//! # // Extracts the capability containing the arena used by a given `Pointee`
+//! # type PointeeCap<T> = <T as Pointee>::Cap;
+//! #
+//! # // A trait implemented by all objects that have an arena that can be pointed into by a `Handle.`
+//! # trait Pointee: Sized {
+//! #     type Cap;
+//! #
+//! #     fn arena<'a>() -> &'a Arena<Self>;
+//! #
+//! #     fn arena_mut<'a>() -> &'a mut Arena<Self>;
+//! # }
+//! #
+//! # // A smart pointer which is `Copy`, `Deref`, `DerefMut`, and has a `destroy()` method! 🙀
+//! # struct Handle<T: Pointee> {
+//! #     _ty: PhantomData<fn(T) -> T>,
+//! #     handle: generational_arena::Index,
+//! # }
+//! #
+//! # impl<T: Pointee> Copy for Handle<T> {}
+//! #
+//! # impl<T: Pointee> Clone for Handle<T> {
+//! #     fn clone(&self) -> Self {
+//! #         *self
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> Handle<T> {
+//! #     pub fn new(value: T) -> Self {
+//! #         Self {
+//! #             _ty: PhantomData,
+//! #             handle: T::arena_mut().insert(value),
+//! #         }
+//! #     }
+//! #
+//! #     pub fn destroy(self) {
+//! #         T::arena_mut().remove(self.handle);
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> Deref for Handle<T> {
+//! #     type Target = T;
+//! #
+//! #     fn deref<'a>(&'a self) -> &'a T {
+//! #         // We'll explain what `unsafe` means in a bit. The TLDR is that it's a workaround for a
+//! #         // difficult-to-fix analysis bug in AuToken.
+//! #         autoken::tie!(unsafe 'a => ref T::Cap);
+//! #         &T::arena()[self.handle]
+//! #     }
+//! # }
+//! #
+//! # impl<T: Pointee> DerefMut for Handle<T> {
+//! #     fn deref_mut<'a>(&'a mut self) -> &'a mut T {
+//! #         autoken::tie!(unsafe 'a => mut T::Cap);
+//! #         &mut T::arena_mut()[self.handle]
+//! #     }
+//! # }
+//! #
+//! # macro_rules! pointee {
+//! #     ($($ty:ty),*$(,)?) => {$(
+//! #         const _: () = {
+//! #             autoken::cap! {
+//! #                 pub Cap = Arena<$ty>;
+//! #             }
+//! #
+//! #             impl Pointee for $ty {
+//! #                 type Cap = Cap;
+//! #
+//! #                 fn arena<'a>() -> &'a Arena<Self> {
+//! #                     autoken::tie!('a => ref Cap);
+//! #                     autoken::cap!(ref Cap)
+//! #                 }
+//! #
+//! #                 fn arena_mut<'a>() -> &'a mut Arena<Self> {
+//! #                     autoken::tie!('a => mut Cap);
+//! #                     autoken::cap!(mut Cap)
+//! #                 }
+//! #             }
+//! #         };
+//! #     )*};
+//! # }
+//! struct Node {
+//!     value: u32,
+//!     prev: Option<Handle<Self>>,
+//!     next: Option<Handle<Self>>,
+//! }
+//!
+//! pointee!(Node);
+//!
+//! impl Node {
+//!     pub fn new(value: u32) -> Self {
+//!         Self {
+//!             value,
+//!             prev: None,
+//!             next: None,
+//!         }
+//!     }
+//!
+//!     pub fn remove(mut self: Handle<Self>) {
+//!         if let Some(mut prev) = self.prev {
+//!             prev.next = self.next;
+//!         }
+//!
+//!         if let Some(mut next) = self.next {
+//!             next.prev = self.prev;
+//!         }
+//!     }
+//!
+//!     pub fn insert_right(mut self: Handle<Self>, mut next: Handle<Self>) {
+//!         next.remove();
+//!
+//!         if let Some(mut old_next) = self.next {
+//!             old_next.prev = Some(next);
+//!         }
+//!
+//!         next.next = self.next;
+//!         next.prev = Some(self);
+//!         self.next = Some(next);
+//!     }
+//!
+//!     pub fn iter(self: Handle<Self>) -> impl Iterator<Item = Handle<Self>> {
+//!         let mut state = Some(self);
+//!
+//!         std::iter::from_fn(move || {
+//!             let curr = state?;
+//!             state = curr.next;
+//!             Some(curr)
+//!         })
+//!     }
+//! }
+//!
+//! fn main() {
+//!     autoken::cap! {
+//!         PointeeCap<Node>: &mut Arena::new()
+//!     =>
+//!         let first = Handle::new(Node::new(1));
+//!         let second = Handle::new(Node::new(2));
+//!         let third = Handle::new(Node::new(3));
+//!
+//!         first.insert_right(second);
+//!         second.insert_right(third);
+//!
+//!         for node in first.iter() {
+//!             eprintln!("Value: {}", node.value);
+//!         }
+//!
+//!         second.remove();
+//!
+//!         for node in first.iter() {
+//!             eprintln!("Value: {}", node.value);
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! ```plain_text
+//! Value: 1
+//! Value: 2
+//! Value: 3
+//! Value: 1
+//! Value: 3
+//! ```
+//!
+//! Neat, huh?
+//!
+//! Plenty of other crates can benefit from this type of context-passing. In my game engine [Crucible](https://github.com/Radbuglet/crucible/blob/452f0f259084b63d61e700bd0cef69ca594f4af2/src/util/bevy-autoken/src/lib.rs),
+//! for example, I used AuToken to extend [`bevy_ecs`](https://docs.rs/bevy_ecs/latest/bevy_ecs/) with
+//! the ability to take smart-pointer handles to entities' individual components. This is unbelievably
+//! helpful given the sheer number of components I find myself defining! Here's an [actual function](https://github.com/Radbuglet/crucible/blob/452f0f259084b63d61e700bd0cef69ca594f4af2/src/client/client-entry/src/main_loop.rs#L287-L305)
+//! from Crucible with its full list of accessed components written out in full:
+//!
+//! ```ignore
+//! #[allow(clippy::type_complexity)]
+//! fn render_app(
+//!     _cx: PhantomData<(
+//!         &AssetManager,
+//!         &BlockMaterialRegistry,
+//!         &ChunkVoxelData,
+//!         &GfxContext,
+//!         &MaterialVisualDescriptor,
+//!         &VirtualCamera,
+//!         &WorldVoxelData,
+//!         &mut CameraManager,
+//!         &mut ChunkVoxelMesh,
+//!         &mut GlobalRenderer,
+//!         &mut Viewport,
+//!         &mut ViewportManager,
+//!         &mut ViewportRenderer,
+//!         &mut WorldVoxelMesh,
+//!     )>,
+//!     engine_root: Entity,
+//!     window_id: WindowId,
+//! ) {
+//!     ...code involving accesses of all of those types...
+//! }
+//! ```
+//!
+//! I shudder at the thought of having to pass view queries for each of these components manually.
 //!
 //! ## Limitations
 //!
