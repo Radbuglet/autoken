@@ -1,5 +1,5 @@
 #![allow(rustdoc::redundant_explicit_links)] // (cargo-rdme needs this)
-//! A rust-lang compiler tool adding support for zero-cost borrow-aware context passing.
+//! A rust-lang compiler tool adding support for automated borrow-aware context passing.
 //!
 //! ```ignore
 //! autoken::cap! {

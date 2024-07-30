@@ -10,7 +10,7 @@ N.B. This README is generated from the crate documentation of `src/userland` and
 
 <!-- cargo-rdme start -->
 
-A rust-lang compiler tool adding support for zero-cost borrow-aware context passing.
+A rust-lang compiler tool adding support for automated borrow-aware context passing.
 
 ```rust
 autoken::cap! {
