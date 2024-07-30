@@ -13,18 +13,18 @@ N.B. This README is generated from the crate documentation of `src/userland` and
 A rust-lang compiler tool adding support for zero-cost borrow-aware context passing.
 
 ```rust
-use autoken::{cap, CapTarget};
-
-cap! {
+autoken::cap! {
     pub MyCap = Vec<u32>;
 }
 
 fn main() {
     let mut my_vec = vec![1, 2, 3, 4];
 
-    MyCap::provide(&mut my_vec, || {
+    autoken::cap! {
+        MyCap: &mut my_vec
+    =>
         do_something();
-    });
+    }
 }
 
 fn do_something() {
@@ -32,25 +32,29 @@ fn do_something() {
 }
 
 fn with_indirection() {
-    let my_vec = cap!(ref MyCap);
+    let my_vec = autoken::cap!(ref MyCap);
     let first_three = &my_vec[0..3];
-    cap!(mut MyCap).push(5);
+    add_number(5);
     eprintln!("The first three elements were {first_three:?}");
+}
+
+fn add_number(number: u32) {
+    autoken::cap!(mut MyCap).push(number);
 }
 ```
 
 ```plain_text
 error: conflicting borrows on token MyCap
-  --> src/main.rs:23:5
+  --> src/main.rs:22:5
    |
-20 |     let my_vec = cap!(ref MyCap);
-   |                  --------------- value first borrowed immutably
-...
-23 |     cap!(mut MyCap).push(5);
-   |     ^^^^^^^^^^^^^^^ value later borrowed mutably
+20 |     let my_vec = autoken::cap!(ref MyCap);
+   |                  ------------------------ value first borrowed immutably
+21 |     let first_three = &my_vec[0..3];
+22 |     add_number(5);
+   |     ^^^^^^^^^^^^^ value later borrowed mutably
    |
    = help: first borrow originates from Borrows::<Mut<MyCap>>::acquire_ref::<'_>
-   = help: later borrow originates from Borrows::<Mut<MyCap>>::acquire_mut::<'_>
+   = help: later borrow originates from add_number
 ```
 
 ## Installation
@@ -123,7 +127,11 @@ From there, we can define functions that depend on that value.
 
 ```rust
 fn add_number(value: u32) {
+    // This form of `cap!` fetches a reference to the value from the function call context.
     autoken::cap!(mut MyCap).push(value);
+
+    // You can call other functions depending on this context without having to explicitly
+    // forward it.
     eprintln!("The list is now {:?}, skip a few, {:?}", first_n_numbers(2), last_number());
 }
 
@@ -132,7 +140,7 @@ fn last_number() -> Option<u32> {
 }
 
 fn first_n_numbers<'a>(count: usize) -> &'a [u32] {
-    // Declares the fact that `'a` depends on a borrow of `MyCap`.
+    // This directive, meanwhile, declares the fact that `'a` depends on a borrow of `MyCap`.
     autoken::tie!('a => ref MyCap);
 
     &autoken::cap!(ref MyCap)[0..count]
@@ -249,7 +257,7 @@ you can use the [`Borrows`](crate:Borrows) object and its alias [`BorrowsOne`](c
 
 `Borrows` is an object representing a borrow of a set of capabilities. If you have an mutable
 reference to it, you are effectively borrowing that entire set of capabilities mutably. You can
-create a `Borrows` object from the surrounding implicit `Borrows` context like so:
+create a `Borrows` object from the surrounding implicit capability context like so:
 
 ```rust
 fn demo_1() {
@@ -298,7 +306,7 @@ pub fn get_singleton<'a>() -> &'a mut MySingleton {
 }
 ```
 
-...and no one would be able to write a function which acquires multiple mutable references to
+...and no one would be able to use `get_singleton` to acquire multiple mutable references to
 `MySingleton` simultaneously since doing so would require borrowing the `MySingleton` "token"
 mutably more than once.
 
@@ -946,9 +954,9 @@ Here's what that means to you:
 - This crate does not support `#[no_std]` environments.
 
 All in all, I would use this tool as a playground for exploring the design implications of adding
-a context passing feature to the Rust compiler since there's no better way to explore the
-effects of a potential language extension than to play around with it. Please be responsible and
-refrain from using this in production.
+a context passing feature to the Rust programming language since there's no better way to explore
+the effects of a potential language extension than to play around with it. You probably shouldn't
+be using this in production.
 
 ## Special Thanks
 
