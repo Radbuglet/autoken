@@ -531,8 +531,9 @@ error: conflicting borrows on token u32
   = help: later borrow originates from demo_breaks::{closure#0}
 ```
 
-Even bare generic dispatch can bite you in some scenarios. In this case, any implementation of
-`MyTrait` which ties `'a` to any token mutably will fail to compile if passed to `my_func`.
+Even bare generic dispatch can introduce restrictions on type parameters substitutions. In this
+case, any implementation of `MyTrait` which ties `'a` to any token mutably will fail to compile
+if passed to `my_func`.
 
 ```rust
 trait MyTrait {
@@ -584,9 +585,8 @@ error: conflicting borrows on token u32
  = help: later borrow originates from <Breaks as MyTrait>::run::<'_>
 ```
 
-Even just unsizing functions can introduce restrictions on which values can be substituted into
-a generic parameter. In this case, `my_func`'s unsizing of the provided closure implies a
-restriction that the provided closure can't borrow any tokens whatsoever!
+Same goes with just unsizing functions. In this case, `my_func`'s unsizing of the provided closure
+implies a restriction that the provided closure can't borrow any tokens whatsoever!
 
 ```rust
 fn my_func(mut f: impl FnMut()) {
@@ -623,19 +623,19 @@ note: demo_breaks::{closure#0} was unsized
    |             ^^
 ```
 
-These semantic versioning foot-guns are quite scary (and the poor diagnostics for them certainly
-don't help!) but this level of flexibility with generics also allows all sorts of powerful patterns
-to be implemented generically in AuToken. The big open question in AuToken's design is how to
-remove these foot-guns without also blunting AuToken's expressiveness.
+While the former two are merely semantic versioning foot-guns, the latter are genuine
+semantic-versioning *breakers* since they make what used to be non-breaking changes in today's Rust
+into breaking changes. At the same time, this level of flexibility with generics allows all
+sorts of powerful patterns to be implemented generically in AuToken. Hence, the big open question
+in AuToken's design is how to remove these foot-guns without also blunting its expressiveness.
 
 ## Neat Recipes
 
-One of the coolest uses of AuToken, in my slightly biased opinion, is integrating it with the
- [`generational_arena`](https://docs.rs/generational-arena/latest/generational_arena/) crate.
-This crate implements what is essentially a `HashMap` from numeric handles to values but in a way
-which is considerably more efficient. Since numeric handles are freely copyable, they can serve
-as ad hoc shared mutable references. Their only issue is that, in order to dereference them, you
-must carry around a reference to the arena mapping those handles to their values.
+One of the coolest uses of AuToken, in my opinion, is integrating it with the [`generational_arena`](https://docs.rs/generational-arena/latest/generational_arena/)
+crate. This crate implements what is essentially a `HashMap` from numeric handles to values but
+in a way which is considerably more efficient. Since numeric handles are freely copyable, they
+can serve as ad hoc shared mutable references. Their only issue is that, in order to dereference
+them, you must carry around a reference to the arena mapping those handles to their values.
 
 This is where AuToken comes in. Since `Deref` implementations can tie their output to a token
 borrow, we can implement a version of those handles which acts like a smart pointer like so:
@@ -950,13 +950,15 @@ Here's what that means to you:
   section for details).
 - This tool emits diagnostics which are just plain awful—especially if you work with generic code.
 - Tying tokens to lifetimes appearing in the input position is potentially unsound. The tool
-  should warn you of most of these cases and there are escape hatches but it's still pretty goofy.
+  should warn you of most of these cases and there are escape hatches (see: the `unsafe` keyword
+  in `tie!` that showed up in the ["Neat Recipes"](#neat-recipes) example) but it's still pretty
+  goofy.
 - This crate does not support `#[no_std]` environments.
 
-All in all, I would use this tool as a playground for exploring the design implications of adding
-a context passing feature to the Rust programming language since there's no better way to explore
-the effects of a potential language extension than to play around with it. You probably shouldn't
-be using this in production.
+All in all, I would mainly use this tool as just a playground for exploring the design implications
+of adding a context passing feature to the Rust programming language since there's no better way
+to explore the effects of a potential language extension than to play around with it. You probably
+shouldn't be using this in production.
 
 ## Special Thanks
 
